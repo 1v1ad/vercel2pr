@@ -8,15 +8,16 @@ datasource db {
 }
 
 model User {
-  id        Int      @id @default(autoincrement())
-  vk_id     String   @unique
-  firstName String
-  lastName  String
-  avatar    String
-  balance   Int      @default(0)
-  ref_by    String?  // VK ID пригласившего, если есть
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id           Int           @id @default(autoincrement())
+  vk_id        String        @unique
+  firstName    String
+  lastName     String
+  avatar       String
+  balance      Int           @default(0)
+  ref_by       String?       // VK ID пригласившего, если есть
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  transactions Transaction[] // Добавлено!
 }
 
 model Transaction {
