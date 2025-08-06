@@ -1,9 +1,10 @@
 const express = require('express');
-const cors = require('cors');
+const cors    = require('cors');
 
 const app = express();
+
 app.use(cors());
-app.use(express.json()); // Обязательно для JSON POST
+app.use(express.json());               // ← НУЖНО до роутов!
 
 app.use('/api/auth', require('./src/routes/auth'));
 app.use('/api/user', require('./src/routes/user'));
