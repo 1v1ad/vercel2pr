@@ -9,21 +9,18 @@ import userRouter from './routes/user.js';
 
 const app = express();
 
-// ───────── middlewares
 app.use(helmet());
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGIN,   // Netlify-домен
+  origin: process.env.ALLOWED_ORIGIN,
   credentials: true
 }));
 app.use(express.json());
 app.use(morgan('tiny'));
 
-// ───────── routes
 app.use('/api/auth',  authRouter);
 app.use('/api/user',  userRouter);
 
-app.get('/', (_, res) => res.send('OK'));   // health-check
+app.get('/', (_, res) => res.send('OK'));
 
-// ───────── start
-const PORT = process.env.PORT || 10000;     // на Render = 10000
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`API ready on :${PORT}`));
