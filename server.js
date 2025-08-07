@@ -28,19 +28,19 @@ app.use(cors({
   allowedHeaders: ['Content-Type','Authorization']
 }));
 
-const signJWT = (payload) => jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
+const signJWT = (p) => jwt.sign(p, JWT_SECRET, { expiresIn: '30d' });
 
-function auth(req, res, next) {
+function auth(req, _res, next) {
   const token = req.cookies.token || req.headers.authorization?.split(' ')[1];
-  if (!token) return res.sendStatus(401);
+  if (!token) return _res.sendStatus(401);
   try { req.user = jwt.verify(token, JWT_SECRET); next(); }
-  catch { return res.sendStatus(401); }
+  catch { return _res.sendStatus(401); }
 }
 
-// ─── VK ID OIDC endpoints (discovery + fallback) ───
+// ── VK ID OIDC endpoints ───────────────────────────────────────────────────
 const ISSUER = 'https://id.vk.com';
-let TOKEN_ENDPOINT = null;
-let USERINFO_ENDPOINT = null;
+let TOKEN_ENDPOINT = `${ISSUER}/oauth2/token`;
+let USERINFO_ENDPOINT = `${ISSUER}/oauth2/userinfo`;
 
 async function resolveVkIdEndpoints() {
   try {
@@ -48,32 +48,29 @@ async function resolveVkIdEndpoints() {
       timeout: 6000, validateStatus: () => true, headers: { Accept: 'application/json' }
     });
     if (d.status >= 200 && d.status < 300 && d.data) {
-      TOKEN_ENDPOINT = d.data.token_endpoint || null;
-      USERINFO_ENDPOINT = d.data.userinfo_endpoint || null;
-      console.log('OIDC discovery OK:', { token_endpoint: TOKEN_ENDPOINT, userinfo_endpoint: USERINFO_ENDPOINT });
-    } else {
-      console.warn('OIDC discovery FAILED:', d.status);
+      TOKEN_ENDPOINT = d.data.token_endpoint || TOKEN_ENDPOINT;
+      USERINFO_ENDPOINT = d.data.userinfo_endpoint || USERINFO_ENDPOINT;
+      console.log('OIDC discovery OK:', { TOKEN_ENDPOINT, USERINFO_ENDPOINT });
+      return;
     }
+    console.warn('OIDC discovery FAILED:', d.status);
   } catch (e) {
     console.warn('OIDC discovery error:', e.message);
   }
-  if (!TOKEN_ENDPOINT)   TOKEN_ENDPOINT   = `${ISSUER}/oauth2/token`;
-  if (!USERINFO_ENDPOINT) USERINFO_ENDPOINT = `${ISSUER}/oauth2/userinfo`;
-  console.log('Using VK ID endpoints:', { TOKEN_ENDPOINT, USERINFO_ENDPOINT });
+  console.log('Using VK ID endpoints (fallback):', { TOKEN_ENDPOINT, USERINFO_ENDPOINT });
 }
 resolveVkIdEndpoints();
 
-// ─── tech ───
+// ── Health & callback (callback оставляем на всякий) ───────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// SDK редиректит сюда с ?device_id=...  — сохраняем в httpOnly cookie
 app.get('/api/auth/vk/callback', (req, res) => {
-  const deviceId = req.query.device_id || req.query.deviceId || req.query.deviceid || '';
+  const deviceId = req.query.device_id || req.query.deviceId || '';
   if (deviceId) {
     res.cookie('vk_device_id', String(deviceId), {
       httpOnly: true, sameSite: 'none', secure: true, maxAge: 10 * 60 * 1000
     });
-    console.log('VK device_id captured');
+    console.log('VK device_id captured via callback');
   } else {
     console.warn('VK callback without device_id');
   }
@@ -81,39 +78,42 @@ app.get('/api/auth/vk/callback', (req, res) => {
   res.end('<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>OK</title><p>OK</p>');
 });
 
-// ─── обмен кода ───
+// ── Основной обмен: code -> token -> userinfo ──────────────────────────────
 app.post('/api/auth/vk', async (req, res) => {
-  const { code } = req.body || {};
+  const { code, device_id: deviceIdBody, deviceId: deviceIdBodyCamel } = req.body || {};
   if (!code) return res.status(400).json({ error: 'no_code' });
 
-  if (!TOKEN_ENDPOINT || !USERINFO_ENDPOINT) await resolveVkIdEndpoints();
+  // берём device_id из тела, если нет — из куки (как запасной)
+  const deviceId = deviceIdBody || deviceIdBodyCamel || req.cookies.vk_device_id || '';
+  if (!deviceId) console.warn('No device_id supplied (body or cookie) — token request may fail');
 
-  const deviceId = req.cookies.vk_device_id; // ← берём из куки, выставленной в callback
-  if (!deviceId) console.warn('No vk_device_id cookie — token request may fail');
-
+  // 1) token
   const form = new URLSearchParams({
     grant_type: 'authorization_code',
     client_id: String(VK_CLIENT_ID),
     client_secret: String(VK_CLIENT_SECRET),
     redirect_uri: String(REDIRECT_URI),
     code: String(code),
-    ...(deviceId ? { device_id: String(deviceId) } : {})   // ← ВАЖНО
+    ...(deviceId ? { device_id: String(deviceId) } : {})
   });
 
-  // 1) token
-  let tokenResp = await axios.post(TOKEN_ENDPOINT, form.toString(), {
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-    timeout: 8000, validateStatus: () => true
-  }).catch(e => ({ status: e?.response?.status || 500, data: e?.response?.data, config: e?.config }));
-
-  if (tokenResp.status === 404) {
-    const alt = TOKEN_ENDPOINT.endsWith('/token') ? `${ISSUER}/oauth2/auth` : `${ISSUER}/oauth2/token`;
-    console.warn('TOKEN 404, try alt:', alt);
-    TOKEN_ENDPOINT = alt;
+  let tokenResp;
+  try {
     tokenResp = await axios.post(TOKEN_ENDPOINT, form.toString(), {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
       timeout: 8000, validateStatus: () => true
-    }).catch(e => ({ status: e?.response?.status || 500, data: e?.response?.data, config: e?.config }));
+    });
+    if (tokenResp.status === 404) {
+      const alt = TOKEN_ENDPOINT.endsWith('/token') ? `${ISSUER}/oauth2/auth` : `${ISSUER}/oauth2/token`;
+      console.warn('TOKEN 404, trying alt:', alt);
+      tokenResp = await axios.post(alt, form.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+        timeout: 8000, validateStatus: () => true
+      });
+    }
+  } catch (e) {
+    console.error('TOKEN REQUEST FAILED:', { status: e?.response?.status, url: e?.config?.url, data: e?.response?.data });
+    return res.status(502).json({ error: 'vk_access_token_failed' });
   }
 
   if (tokenResp.status < 200 || tokenResp.status >= 300 || tokenResp.data?.error) {
@@ -128,24 +128,27 @@ app.post('/api/auth/vk', async (req, res) => {
   }
 
   // 2) userinfo
-  const uinfoUrl = new URL(USERINFO_ENDPOINT);
-  uinfoUrl.searchParams.set('client_id', String(VK_CLIENT_ID)); // VK ID иногда требует
-  const infoResp = await axios.get(uinfoUrl.toString(), {
-    headers: { Authorization: `Bearer ${token.access_token}`, Accept: 'application/json' },
-    timeout: 8000, validateStatus: () => true
-  }).catch(e => ({ status: e?.response?.status || 500, data: e?.response?.data, config: e?.config }));
-
-  if (infoResp.status === 404) {
-    const alt = USERINFO_ENDPOINT.endsWith('/userinfo') ? `${ISSUER}/oauth2/user_info` : `${ISSUER}/oauth2/userinfo`;
-    console.warn('USERINFO 404, try alt:', alt);
-    USERINFO_ENDPOINT = alt;
-    const altUrl = new URL(USERINFO_ENDPOINT);
-    altUrl.searchParams.set('client_id', String(VK_CLIENT_ID));
-    const r2 = await axios.get(altUrl.toString(), {
+  let infoResp;
+  try {
+    const uinfo = new URL(USERINFO_ENDPOINT);
+    uinfo.searchParams.set('client_id', String(VK_CLIENT_ID)); // иногда требуется VK ID
+    infoResp = await axios.get(uinfo.toString(), {
       headers: { Authorization: `Bearer ${token.access_token}`, Accept: 'application/json' },
       timeout: 8000, validateStatus: () => true
-    }).catch(e => ({ status: e?.response?.status || 500, data: e?.response?.data, config: e?.config }));
-    Object.assign(infoResp, r2);
+    });
+    if (infoResp.status === 404) {
+      const alt = USERINFO_ENDPOINT.endsWith('/userinfo') ? `${ISSUER}/oauth2/user_info` : `${ISSUER}/oauth2/userinfo`;
+      console.warn('USERINFO 404, trying alt:', alt);
+      const altUrl = new URL(alt);
+      altUrl.searchParams.set('client_id', String(VK_CLIENT_ID));
+      infoResp = await axios.get(altUrl.toString(), {
+        headers: { Authorization: `Bearer ${token.access_token}`, Accept: 'application/json' },
+        timeout: 8000, validateStatus: () => true
+      });
+    }
+  } catch (e) {
+    console.error('USERINFO REQUEST FAILED:', { status: e?.response?.status, url: e?.config?.url, data: e?.response?.data });
+    return res.status(502).json({ error: 'vk_userinfo_failed' });
   }
 
   if (infoResp.status < 200 || infoResp.status >= 300 || !infoResp.data) {
@@ -185,7 +188,7 @@ app.post('/api/auth/vk', async (req, res) => {
   res.json({ ok: true });
 });
 
-// API
+// ── API ─────────────────────────────────────────────────────────────────────
 app.get('/api/me', auth, async (req, res) => {
   const me = await prisma.user.findUnique({
     where: { vk_id: req.user.id },
