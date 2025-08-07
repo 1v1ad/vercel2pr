@@ -11,7 +11,7 @@ const {
   FRONTEND_ORIGIN,
   VK_CLIENT_ID,
   VK_CLIENT_SECRET,
-  REDIRECT_URI, // должен совпадать с redirectUrl на фронте и в "Доверенных Redirect URI"
+  REDIRECT_URI,
   JWT_SECRET
 } = process.env;
 
@@ -21,118 +21,174 @@ app.set('trust proxy', 1);
 
 app.use(express.json());
 app.use(cookieParser());
+
+// CORS под Netlify
 app.use(cors({
   origin: FRONTEND_ORIGIN,
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 const signJWT = (payload) => jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
-const auth = (req, res, next) => {
+
+function auth(req, res, next) {
   const token = req.cookies.token || req.headers.authorization?.split(' ')[1];
   if (!token) return res.sendStatus(401);
-  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
-  catch { return res.sendStatus(401); }
-};
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.sendStatus(401);
+  }
+}
 
-// Health
+// health
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// Заглушка для VK redirect (просто 200 OK)
+// заглушка для редиректа (должна существовать и отдавать 200)
 app.get('/api/auth/vk/callback', (_req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.end('<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>OK</title><p>OK</p>');
 });
 
-// === Главный роут обмена кода ===
-// Теперь используем новый VK ID OIDC endpoint: https://id.vk.com/oauth2/token
+// ===== обмен кода =====
 app.post('/api/auth/vk', async (req, res) => {
   const { code } = req.body || {};
   if (!code) return res.status(400).json({ error: 'no_code' });
 
+  // вспомогательный логгер ошибок axios
+  const logAxiosError = (label, err) => {
+    const s = err?.response?.status;
+    const u = err?.config?.url;
+    const d = err?.response?.data;
+    console.error(`${label} FAILED:`, { status: s, url: u, data: d });
+  };
+
   try {
-    // 1) Обмен code -> access_token (OIDC)
+    // 1) OIDC токен от VK ID: https://id.vk.com/oauth2/token
     const form = new URLSearchParams({
       grant_type: 'authorization_code',
       client_id: String(VK_CLIENT_ID),
       client_secret: String(VK_CLIENT_SECRET),
       redirect_uri: String(REDIRECT_URI),
-      code: String(code)
+      code: String(code),
     });
 
-    const tokenResp = await axios.post('https://id.vk.com/oauth2/token', form, {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      timeout: 8000
-    });
-    const t = tokenResp.data;
-    if (t.error) {
-      console.error('VK token error:', t);
-      return res.status(502).json({ error: 'vk_exchange_failed', details: t });
+    let token;
+    try {
+      const tokenResp = await axios.post(
+        'https://id.vk.com/oauth2/token',
+        form.toString(),
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'application/json',
+          },
+          timeout: 8000,
+          validateStatus: () => true, // сами проверим код
+        }
+      );
+
+      if (tokenResp.status < 200 || tokenResp.status >= 300) {
+        console.error('TOKEN ENDPOINT ERROR:', {
+          status: tokenResp.status,
+          url: tokenResp.config?.url,
+          data: tokenResp.data,
+        });
+        return res.status(502).json({ error: 'vk_exchange_failed', details: tokenResp.data });
+      }
+
+      token = tokenResp.data;
+    } catch (e) {
+      logAxiosError('TOKEN REQUEST', e);
+      return res.status(502).json({ error: 'vk_exchange_failed' });
     }
-    if (!t?.access_token) {
-      console.error('VK token missing fields:', t);
+
+    if (token?.error) {
+      console.error('TOKEN ERROR (body):', token);
+      return res.status(502).json({ error: 'vk_exchange_failed', details: token });
+    }
+    if (!token?.access_token) {
+      console.error('TOKEN MISSING FIELDS:', token);
       return res.status(502).json({ error: 'vk_access_token_failed' });
     }
 
-    // 2) Профиль пользователя через user_info (OIDC)
-    //   Вернёт: sub (id), given_name, family_name, name, picture, email (если доступ разрешён)
-    const infoResp = await axios.get('https://id.vk.com/oauth2/user_info', {
-      headers: { Authorization: `Bearer ${t.access_token}` },
-      timeout: 8000
-    });
-    const u = infoResp.data || {};
-    if (!u?.sub) {
-      console.error('VK user_info missing sub:', u);
+    // 2) userinfo у VK ID — именно /oauth2/userinfo (НЕ user_info)
+    let info;
+    try {
+      const infoResp = await axios.get('https://id.vk.com/oauth2/userinfo', {
+        headers: { Authorization: `Bearer ${token.access_token}`, 'Accept': 'application/json' },
+        timeout: 8000,
+        validateStatus: () => true,
+      });
+
+      if (infoResp.status < 200 || infoResp.status >= 300) {
+        console.error('USERINFO ENDPOINT ERROR:', {
+          status: infoResp.status,
+          url: infoResp.config?.url,
+          data: infoResp.data,
+        });
+        return res.status(502).json({ error: 'vk_userinfo_failed', details: infoResp.data });
+      }
+
+      info = infoResp.data;
+    } catch (e) {
+      logAxiosError('USERINFO REQUEST', e);
       return res.status(502).json({ error: 'vk_userinfo_failed' });
     }
 
-    const vkId = Number(u.sub) || parseInt(u.sub, 10) || u.sub;
+    if (!info?.sub) {
+      console.error('USERINFO MISSING sub:', info);
+      return res.status(502).json({ error: 'vk_userinfo_failed' });
+    }
+
+    const vkId = Number(info.sub) || parseInt(info.sub, 10) || info.sub;
 
     await prisma.user.upsert({
       where: { vk_id: vkId },
       update: {
-        first_name: u.given_name || u.name || null,
-        last_name:  u.family_name || null,
-        avatar:     u.picture || null,
-        email:      u.email || null
+        first_name: info.given_name || info.name || null,
+        last_name:  info.family_name || null,
+        avatar:     info.picture || null,
+        email:      info.email || null,
       },
       create: {
         vk_id:      vkId,
-        first_name: u.given_name || u.name || '',
-        last_name:  u.family_name || '',
-        avatar:     u.picture || null,
-        email:      u.email || null
+        first_name: info.given_name || info.name || '',
+        last_name:  info.family_name || '',
+        avatar:     info.picture || null,
+        email:      info.email || null,
       }
     });
 
-    // 3) JWT cookie (кросс-домен)
+    // JWT-кука (кросс-домен)
     res.cookie('token', signJWT({ id: vkId }), {
       httpOnly: true,
       sameSite: 'none',
       secure: true,
-      maxAge: 30 * 24 * 3600 * 1000
+      maxAge: 30 * 24 * 3600 * 1000,
     });
 
     res.json({ ok: true });
   } catch (e) {
-    const data = e?.response?.data;
-    console.error('VK auth exception:', data || e.message || e);
-    res.status(500).json({ error: 'vk_exchange_failed', details: data });
+    // общий перехват, если что-то пошло не так
+    console.error('VK auth exception (outer):', e?.response?.data || e.message || e);
+    res.status(500).json({ error: 'vk_exchange_failed' });
   }
 });
 
-// Текущий пользователь для lobby.html
+// текущий пользователь
 app.get('/api/me', auth, async (req, res) => {
   const me = await prisma.user.findUnique({
     where: { vk_id: req.user.id },
-    select: { vk_id: true, first_name: true, last_name: true, avatar: true, email: true, created_at: true }
+    select: { vk_id: true, first_name: true, last_name: true, avatar: true, email: true, created_at: true },
   });
   if (!me) return res.sendStatus(404);
   res.json(me);
 });
 
-// Выход
+// logout
 app.post('/api/logout', (_req, res) => {
   res.clearCookie('token', { httpOnly: true, sameSite: 'none', secure: true });
   res.json({ ok: true });
