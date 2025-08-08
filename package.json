@@ -7,7 +7,7 @@
     "dev": "nodemon server.js",
     "build": "echo \"no build step\"",
     "start": "node server.js",
-    "postinstall": "prisma generate && (prisma migrate deploy || prisma db push)"
+    "postinstall": "prisma generate && (prisma migrate deploy || prisma db push --accept-data-loss)"
   },
   "dependencies": {
     "@prisma/client": "^5.16.1",
