@@ -1,3 +1,4 @@
+// backend/src/routes/auth.js
 const router = require('express').Router();
 const axios = require('axios');
 const { PrismaClient } = require('@prisma/client');
@@ -9,14 +10,16 @@ const prisma = new PrismaClient();
 const {
   VK_CLIENT_ID,
   VK_CLIENT_SECRET,
-  REDIRECT_URI,
+  REDIRECT_URI, // должен совпадать с VK настройками: https://<твой фронт>/vk-callback.html
 } = process.env;
 
-// fallback device_id, если не пришёл с фронта
+// fallback на случай отсутствия device_id
 function fallbackDeviceId(ua = '') {
   return crypto.createHash('sha256').update(ua).digest('hex');
 }
 
+// POST /api/auth/vk/exchange
+// body: { code, code_verifier?, device_id? }
 router.post('/vk/exchange', async (req, res) => {
   try {
     const { code, code_verifier, device_id } = req.body || {};
@@ -31,24 +34,29 @@ router.post('/vk/exchange', async (req, res) => {
       code
     };
 
-    // если фронт прислал PKCE — добавляем
+    // Если пришёл PKCE — добавляем
     if (code_verifier) {
       params.code_verifier = code_verifier;
+    }
+
+    // Если пришёл device_id (или подставим fallback) — прокинем его тоже
+    // Виджет VK One Tap обычно присылает device_id и без PKCE.
+    if (device_id || !code_verifier) {
       params.device_id = device_id || fallbackDeviceId(req.headers['user-agent'] || '');
     }
 
-    // запрос токена у VK
+    // Обмен кода на access_token / user_id
     const tokenResp = await axios.get('https://oauth.vk.com/access_token', {
       params,
-      timeout: 12000
+      timeout: 15000
     });
 
     const { access_token, user_id } = tokenResp.data || {};
     if (!access_token || !user_id) {
-      return res.status(401).json({ error: 'access_token or user_id not received' });
+      return res.status(401).json({ error: 'access_token or user_id not received', detail: tokenResp.data });
     }
 
-    // запрос данных пользователя
+    // Подтягиваем профиль пользователя
     const userResp = await axios.get('https://api.vk.com/method/users.get', {
       params: {
         user_ids: user_id,
@@ -56,15 +64,15 @@ router.post('/vk/exchange', async (req, res) => {
         access_token,
         v: '5.199'
       },
-      timeout: 12000
+      timeout: 15000
     });
 
     const info = userResp.data?.response?.[0];
     if (!info) {
-      return res.status(500).json({ error: 'VK users.get failed' });
+      return res.status(502).json({ error: 'VK users.get failed', detail: userResp.data });
     }
 
-    // апсерт в БД
+    // Апсерт пользователя в БД
     const user = await prisma.user.upsert({
       where: { vk_id: String(user_id) },
       update: {
@@ -80,14 +88,16 @@ router.post('/vk/exchange', async (req, res) => {
       }
     });
 
-    // установка cookie
+    // Выдаём сессию (HttpOnly cookie)
     const token = sign({ uid: user.id, vk: user.vk_id });
     setSessionCookie(res, token);
 
-    res.json({ ok: true });
+    return res.json({ ok: true });
   } catch (e) {
-    console.error('vk/exchange error:', e?.response?.data || e.message);
-    res.status(500).json({ error: 'vk_exchange_failed', detail: e?.response?.data || e.message });
+    const detail = e?.response?.data || e.message || String(e);
+    console.error('vk/exchange error:', detail);
+    // Пробросим чуть больше деталей в dev, но без лишнего в прод
+    return res.status(500).json({ error: 'vk_exchange_failed', detail });
   }
 });
 
