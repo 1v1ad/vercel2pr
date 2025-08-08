@@ -1,4 +1,3 @@
-// backend/src/routes/auth.js
 const router = require('express').Router();
 const axios = require('axios');
 const { PrismaClient } = require('@prisma/client');
@@ -10,39 +9,60 @@ const prisma = new PrismaClient();
 const {
   VK_CLIENT_ID,
   VK_CLIENT_SECRET,
-  REDIRECT_URI, // https://sweet-twilight-63a9b6.netlify.app/vk-callback.html
+  FRONTEND_ORIGIN,            // https://sweet-twilight-63a9b6.netlify.app
+  REDIRECT_URI_BACKEND        // https://vercel2pr.onrender.com/api/auth/vk/callback
 } = process.env;
 
-function fallbackDeviceId(ua = '') {
-  return crypto.createHash('sha256').update(ua).digest('hex');
+function randomState() {
+  return crypto.randomBytes(16).toString('hex');
 }
 
-// POST /api/auth/vk/exchange
-// body: { code, device_id? }
-router.post('/vk/exchange', async (req, res) => {
+// 1) Старт авторизации: редиректим пользователя на VK OAuth
+//    GET /api/auth/vk/start
+router.get('/vk/start', async (req, res) => {
   try {
-    const { code, device_id } = req.body || {};
-    if (!code) return res.status(400).json({ error: 'code is required' });
-
-    const params = {
+    const state = randomState();
+    // Можно сохранять state в сессию/куку и сверять в callback (anti-CSRF)
+    const params = new URLSearchParams({
       client_id: VK_CLIENT_ID,
-      client_secret: VK_CLIENT_SECRET,
-      redirect_uri: REDIRECT_URI,
-      code,
-      // device_id желательно прокинуть, если его дал виджет
-      device_id: device_id || fallbackDeviceId(req.headers['user-agent'] || '')
-    };
+      redirect_uri: REDIRECT_URI_BACKEND,
+      response_type: 'code',
+      scope: 'offline',
+      state
+    });
+    const url = `https://oauth.vk.com/authorize?${params.toString()}`;
+    return res.redirect(url);
+  } catch (e) {
+    console.error('vk/start error:', e);
+    return res.status(500).send('vk_start_failed');
+  }
+});
 
+// 2) Callback от VK: приходят ?code=...
+//    GET /api/auth/vk/callback
+router.get('/vk/callback', async (req, res) => {
+  try {
+    const { code /*, state*/ } = req.query;
+    if (!code) return res.status(400).send('missing code');
+
+    // Меняем code → access_token
     const tokenResp = await axios.get('https://oauth.vk.com/access_token', {
-      params,
-      timeout: 15000
+      params: {
+        client_id: VK_CLIENT_ID,
+        client_secret: VK_CLIENT_SECRET,
+        redirect_uri: REDIRECT_URI_BACKEND,
+        code
+      },
+      timeout: 12000
     });
 
     const { access_token, user_id } = tokenResp.data || {};
     if (!access_token || !user_id) {
-      return res.status(401).json({ error: 'access_token or user_id not received', detail: tokenResp.data });
+      console.error('vk/callback token resp:', tokenResp.data);
+      return res.redirect(`${FRONTEND_ORIGIN}/?err=invalid_token`);
     }
 
+    // Берём профиль
     const userResp = await axios.get('https://api.vk.com/method/users.get', {
       params: {
         user_ids: user_id,
@@ -50,14 +70,16 @@ router.post('/vk/exchange', async (req, res) => {
         access_token,
         v: '5.199'
       },
-      timeout: 15000
+      timeout: 12000
     });
 
     const info = userResp.data?.response?.[0];
     if (!info) {
-      return res.status(502).json({ error: 'VK users.get failed', detail: userResp.data });
+      console.error('vk users.get failed:', userResp.data);
+      return res.redirect(`${FRONTEND_ORIGIN}/?err=users_get_failed`);
     }
 
+    // upsert в БД
     const user = await prisma.user.upsert({
       where: { vk_id: String(user_id) },
       update: {
@@ -73,15 +95,20 @@ router.post('/vk/exchange', async (req, res) => {
       }
     });
 
+    // Ставим сессионную куку
     const token = sign({ uid: user.id, vk: user.vk_id });
-    setSessionCookie(res, token); // HttpOnly; SameSite=None; Secure
+    setSessionCookie(res, token); // HttpOnly; SameSite=None; Secure внутри
 
-    return res.json({ ok: true });
+    // В лобби
+    return res.redirect(`${FRONTEND_ORIGIN}/lobby.html`);
   } catch (e) {
     const detail = e?.response?.data || e.message || String(e);
-    console.error('vk/exchange error:', detail);
-    return res.status(500).json({ error: 'vk_exchange_failed', detail });
+    console.error('vk/callback error:', detail);
+    return res.redirect(`${FRONTEND_ORIGIN}/?err=vk_exchange_failed`);
   }
 });
+
+// 3) Health для «пробуждения» инстанса
+router.get('/health', (req, res) => res.json({ ok: true, t: Date.now() }));
 
 module.exports = router;
