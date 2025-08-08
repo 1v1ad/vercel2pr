@@ -1,0 +1,15 @@
+name: vkid-auth
+services:
+  - name: api
+    dockerfile: Dockerfile
+    ports:
+      - port: 3001
+        protocol: http
+    env:
+      - key: NODE_ENV
+        value: production
+    healthcheck:
+      path: /
+      interval: 30s
+      timeout: 5s
+      grace_period: 20s
