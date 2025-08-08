@@ -30,14 +30,14 @@ app.use(cors({
 
 const signJWT = (p) => jwt.sign(p, JWT_SECRET, { expiresIn: '30d' });
 
-function auth(req, _res, next) {
+function auth(req, res, next) {
   const token = req.cookies.token || req.headers.authorization?.split(' ')[1];
-  if (!token) return _res.sendStatus(401);
+  if (!token) return res.sendStatus(401);
   try { req.user = jwt.verify(token, JWT_SECRET); next(); }
-  catch { return _res.sendStatus(401); }
+  catch { return res.sendStatus(401); }
 }
 
-// ── VK ID OIDC endpoints ───────────────────────────────────────────────────
+// ── VK ID OIDC endpoints ──
 const ISSUER = 'https://id.vk.com';
 let TOKEN_ENDPOINT = `${ISSUER}/oauth2/token`;
 let USERINFO_ENDPOINT = `${ISSUER}/oauth2/userinfo`;
@@ -61,42 +61,49 @@ async function resolveVkIdEndpoints() {
 }
 resolveVkIdEndpoints();
 
-// ── Health & callback (callback оставляем на всякий) ───────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
+// На всякий: сохраняем device_id из callback (не обязательно)
 app.get('/api/auth/vk/callback', (req, res) => {
   const deviceId = req.query.device_id || req.query.deviceId || '';
   if (deviceId) {
     res.cookie('vk_device_id', String(deviceId), {
-      httpOnly: true, sameSite: 'none', secure: true, maxAge: 10 * 60 * 1000
+      httpOnly: true, sameSite: 'none', secure: true, maxAge: 10*60*1000
     });
     console.log('VK device_id captured via callback');
-  } else {
-    console.warn('VK callback without device_id');
   }
   res.setHeader('Content-Type','text/html; charset=utf-8');
   res.end('<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>OK</title><p>OK</p>');
 });
 
-// ── Основной обмен: code -> token -> userinfo ──────────────────────────────
+// ── обмен code → token → userinfo ──
 app.post('/api/auth/vk', async (req, res) => {
-  const { code, device_id: deviceIdBody, deviceId: deviceIdBodyCamel } = req.body || {};
+  const {
+    code,
+    device_id: deviceIdBody,
+    deviceId: deviceIdBodyCamel,
+    code_verifier: verifierBody,
+    verifier: verifierAlt,
+    pkce_verifier: verifierAlt2
+  } = req.body || {};
   if (!code) return res.status(400).json({ error: 'no_code' });
 
-  // берём device_id из тела, если нет — из куки (как запасной)
-  const deviceId = deviceIdBody || deviceIdBodyCamel || req.cookies.vk_device_id || '';
-  if (!deviceId) console.warn('No device_id supplied (body or cookie) — token request may fail');
+  const device_id = deviceIdBody || deviceIdBodyCamel || req.cookies.vk_device_id || '';
+  const code_verifier = verifierBody || verifierAlt || verifierAlt2 || '';
 
-  // 1) token
+  if (!TOKEN_ENDPOINT || !USERINFO_ENDPOINT) await resolveVkIdEndpoints();
+
   const form = new URLSearchParams({
     grant_type: 'authorization_code',
     client_id: String(VK_CLIENT_ID),
     client_secret: String(VK_CLIENT_SECRET),
     redirect_uri: String(REDIRECT_URI),
     code: String(code),
-    ...(deviceId ? { device_id: String(deviceId) } : {})
+    ...(device_id ? { device_id: String(device_id) } : {}),
+    ...(code_verifier ? { code_verifier: String(code_verifier) } : {}) // ← PKCE!
   });
 
+  // 1) token
   let tokenResp;
   try {
     tokenResp = await axios.post(TOKEN_ENDPOINT, form.toString(), {
@@ -131,7 +138,7 @@ app.post('/api/auth/vk', async (req, res) => {
   let infoResp;
   try {
     const uinfo = new URL(USERINFO_ENDPOINT);
-    uinfo.searchParams.set('client_id', String(VK_CLIENT_ID)); // иногда требуется VK ID
+    uinfo.searchParams.set('client_id', String(VK_CLIENT_ID));
     infoResp = await axios.get(uinfo.toString(), {
       headers: { Authorization: `Bearer ${token.access_token}`, Accept: 'application/json' },
       timeout: 8000, validateStatus: () => true
@@ -188,7 +195,7 @@ app.post('/api/auth/vk', async (req, res) => {
   res.json({ ok: true });
 });
 
-// ── API ─────────────────────────────────────────────────────────────────────
+// API
 app.get('/api/me', auth, async (req, res) => {
   const me = await prisma.user.findUnique({
     where: { vk_id: req.user.id },
