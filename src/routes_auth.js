@@ -1,142 +1,134 @@
-// src/routes_auth.js
-// VK OAuth + JWT через Prisma
-// Требуемые ENV:
-// - VK_CLIENT_ID
-// - VK_CLIENT_SECRET
-// - VK_REDIRECT_URI        (пример: https://vercel2pr.onrender.com/api/auth/vk/callback)
-// - FRONTEND_URL           (пример: https://sweet-twilight-63a9b6.netlify.app)
-// - JWT_SECRET
-//
-// Зависимости: axios, jsonwebtoken, @prisma/client
-//
-// Маршруты:
-//   GET  /api/auth/vk/start      — редирект на VK OAuth (response_type=code)
-//   GET  /api/auth/vk/callback   — обмен кода на токен VK, апсерт пользователя, редирект на фронт с token
-//   GET  /api/auth/me            — вернуть профиль по Bearer JWT (для фронта)
-
+// VK OAuth + JWT через Prisma/pg совместимо (мы используем наш db.js на pg)
+// ENV: VK_CLIENT_ID, VK_CLIENT_SECRET, VK_REDIRECT_URI, FRONTEND_URL, JWT_SECRET
 import express from 'express';
 import axios from 'axios';
-import jwt from 'jsonwebtoken';
-import prisma from './db.js';
+import crypto from 'crypto';
+import { createCodeVerifier, createCodeChallenge } from './pkce.js';
+import { signSession } from './jwt.js';
+import { upsertUser, logEvent } from './db.js';
 
 const router = express.Router();
 
-function signAppToken(user) {
-  return jwt.sign(
-    { uid: user.id, vk_id: user.vk_id },
-    process.env.JWT_SECRET,
-    { expiresIn: '30d' }
-  );
-}
-
-function bearer(req) {
-  const h = req.headers.authorization || '';
-  return h.startsWith('Bearer ') ? h.slice(7) : null;
-}
-
-/**
- * GET /api/auth/vk/start
- * Редиректим пользователя на VK OAuth
- */
-router.get('/vk/start', (req, res) => {
-  const { VK_CLIENT_ID, VK_REDIRECT_URI } = process.env;
-  if (!VK_CLIENT_ID || !VK_REDIRECT_URI) {
-    return res.status(500).send('VK OAuth not configured');
+function getenv() {
+  const env = process.env;
+  const clientId     = env.VK_CLIENT_ID;
+  const clientSecret = env.VK_CLIENT_SECRET;
+  const redirectUri  = env.VK_REDIRECT_URI || env.REDIRECT_URI;
+  const frontendUrl  = env.FRONTEND_URL  || env.CLIENT_URL;
+  if (!clientId || !clientSecret || !redirectUri || !frontendUrl) {
+    throw new Error('VK OAuth not configured');
   }
+  return { clientId, clientSecret, redirectUri, frontendUrl };
+}
 
-  const url = new URL('https://oauth.vk.com/authorize');
-  url.searchParams.set('client_id', VK_CLIENT_ID);
-  url.searchParams.set('redirect_uri', VK_REDIRECT_URI);
-  url.searchParams.set('response_type', 'code');
-  url.searchParams.set('display', 'page');
-  // при необходимости можно добавить scope, например offline:
-  // url.searchParams.set('scope', 'offline');
-  url.searchParams.set('v', '5.199');
+function firstIp(req) {
+  const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
+  return ipHeader.split(',')[0].trim();
+}
 
-  return res.redirect(302, url.toString());
-});
-
-/**
- * GET /api/auth/vk/callback?code=...
- * Обмен кода на токен VK, апсерт пользователя, редирект на FRONTEND_URL?token=...
- */
-router.get('/vk/callback', async (req, res) => {
+// Шаг 1: редирект на VK ID (PKCE)
+router.get('/vk/start', async (req, res) => {
   try {
-    const code = req.query.code;
-    if (!code) return res.status(400).send('Missing code');
+    const { clientId, redirectUri } = getenv();
+    const state        = crypto.randomBytes(16).toString('hex');
+    const codeVerifier = createCodeVerifier();
+    const codeChallenge = createCodeChallenge(codeVerifier);
 
-    const { VK_CLIENT_ID, VK_CLIENT_SECRET, VK_REDIRECT_URI, FRONTEND_URL } = process.env;
+    res.cookie('vk_state', state,              { httpOnly:true, sameSite:'lax',  secure:true, path:'/', maxAge: 10*60*1000 });
+    res.cookie('vk_code_verifier', codeVerifier,{ httpOnly:true, sameSite:'lax',  secure:true, path:'/', maxAge: 10*60*1000 });
 
-    // 1) обмен кода на access_token
-    const tokenResp = await axios.get('https://oauth.vk.com/access_token', {
-      params: {
-        client_id: VK_CLIENT_ID,
-        client_secret: VK_CLIENT_SECRET,
-        redirect_uri: VK_REDIRECT_URI,
-        code,
-      },
-    });
-    const { access_token, user_id } = tokenResp.data || {};
-    if (!access_token || !user_id) return res.status(401).send('VK token exchange failed');
+    await logEvent({ user_id:null, event_type:'auth_start', payload:null, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
-    // 2) базовая инфа о пользователе
-    const infoResp = await axios.get('https://api.vk.com/method/users.get', {
-      params: { user_ids: user_id, fields: 'photo_200', v: '5.199', access_token },
-    });
-    const u = infoResp.data?.response?.[0];
-    const firstName = u?.first_name || '';
-    const lastName = u?.last_name || '';
-    const avatar = u?.photo_200 || '';
+    const u = new URL('https://id.vk.com/authorize');
+    u.searchParams.set('response_type', 'code');
+    u.searchParams.set('client_id', clientId);
+    u.searchParams.set('redirect_uri', redirectUri);
+    u.searchParams.set('state', state);
+    u.searchParams.set('code_challenge', codeChallenge);
+    u.searchParams.set('code_challenge_method', 'S256');
+    u.searchParams.set('scope', 'vkid.personal_info');
 
-    // 3) апсерт пользователя в БД
-    const user = await prisma.user.upsert({
-      where: { vk_id: String(user_id) },
-      update: { firstName, lastName, avatar },
-      create: { vk_id: String(user_id), firstName, lastName, avatar, balance: 0 },
-    });
-
-    // 4) выдаём JWT и редиректим на фронт
-    const token = signAppToken(user);
-    const redirectUrl = new URL(FRONTEND_URL || 'http://localhost:5173');
-    // Если нужен строгий путь, можно так:
-    // redirectUrl.pathname = '/lobby';
-    redirectUrl.searchParams.set('token', token);
-    return res.redirect(302, redirectUrl.toString());
+    return res.redirect(u.toString());
   } catch (e) {
-    console.error('VK callback error:', e?.response?.data || e?.message || e);
-    return res.status(500).send('Auth failed');
+    console.error('vk/start error:', e.message);
+    return res.status(500).send('auth start failed');
   }
 });
 
-/**
- * GET /api/auth/me  — профиль по Bearer JWT
- */
-router.get('/me', async (req, res) => {
+// Шаг 2: callback от VK → обмен кода на токен → апсерт юзера → кука sid → редирект на фронт (?logged=1)
+router.get('/vk/callback', async (req, res) => {
+  const { code, state } = req.query;
   try {
-    const t = bearer(req);
-    if (!t) return res.status(401).json({ error: 'No token' });
-
-    let decoded;
-    try {
-      decoded = jwt.verify(t, process.env.JWT_SECRET);
-    } catch {
-      return res.status(401).json({ error: 'Invalid token' });
+    const savedState  = req.cookies['vk_state'];
+    const codeVerifier = req.cookies['vk_code_verifier'];
+    if (!code || !state || !savedState || savedState !== state || !codeVerifier) {
+      return res.status(400).send('Invalid state');
     }
 
-    const user = await prisma.user.findUnique({
-      where: { id: decoded.uid },
-      select: {
-        id: true, vk_id: true, firstName: true, lastName: true,
-        avatar: true, balance: true, createdAt: true, updatedAt: true
-      },
+    res.clearCookie('vk_state', { path:'/' });
+    res.clearCookie('vk_code_verifier', { path:'/' });
+
+    const { clientId, clientSecret, redirectUri, frontendUrl } = getenv();
+
+    // 1) Пытаемся id.vk.com (PKCE)
+    let tokenData = null;
+    try {
+      const resp = await axios.post(
+        'https://id.vk.com/oauth2/auth',
+        new URLSearchParams({
+          grant_type: 'authorization_code',
+          client_id: clientId,
+          client_secret: clientSecret,
+          redirect_uri: redirectUri,
+          code_verifier: codeVerifier,
+          code
+        }),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
+      );
+      tokenData = resp.data;
+    } catch (e) {
+      // 2) Фолбэк на старый oauth.vk.com
+      const resp = await axios.get('https://oauth.vk.com/access_token', {
+        params: { client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri, code },
+        timeout: 10000
+      });
+      tokenData = resp.data;
+    }
+
+    const accessToken = tokenData?.access_token;
+    if (!accessToken) return res.status(401).send('token exchange failed');
+
+    // Инфо о пользователе (не критично)
+    let first_name = '', last_name = '', avatar = '';
+    try {
+      const u = await axios.get('https://api.vk.com/method/users.get', {
+        params: { access_token: accessToken, v: '5.199', fields: 'photo_200,first_name,last_name' },
+        timeout: 10000
+      });
+      const r = u.data?.response?.[0];
+      if (r) { first_name = r.first_name || ''; last_name = r.last_name || ''; avatar = r.photo_200 || ''; }
+    } catch {}
+
+    const vk_id = String(tokenData?.user_id || tokenData?.user?.id || 'unknown');
+    const user = await upsertUser({ vk_id, first_name, last_name, avatar });
+
+    await logEvent({ user_id:user.id, event_type:'auth_success', payload:null, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
+
+    const sessionJwt = signSession({ uid: user.id, vk_id: user.vk_id });
+    res.cookie('sid', sessionJwt, {
+      httpOnly: true,
+      sameSite: 'none',
+      secure: true,
+      path: '/',
+      maxAge: 30 * 24 * 3600 * 1000
     });
 
-    if (!user) return res.status(404).json({ error: 'User not found' });
-
-    res.json({ user });
+    const url = new URL(frontendUrl);
+    url.searchParams.set('logged', '1');
+    return res.redirect(url.toString());
   } catch (e) {
-    console.error('ME error:', e);
-    res.status(500).json({ error: 'Internal error' });
+    console.error('vk/callback error:', e?.response?.data || e?.message);
+    return res.status(500).send('auth callback failed');
   }
 });
 
