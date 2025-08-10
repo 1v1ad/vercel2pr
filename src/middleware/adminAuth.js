@@ -1,7 +1,7 @@
-// src/middleware/adminAuth.js
-const jwt = require('jsonwebtoken');
+// src/middleware/adminAuth.js (ESM)
+import jwt from 'jsonwebtoken';
 
-module.exports = function adminAuth(req, res, next){
+export default function adminAuth(req, res, next){
   try {
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : null;
@@ -9,7 +9,7 @@ module.exports = function adminAuth(req, res, next){
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     if(!decoded || decoded.role !== 'admin') return res.status(401).json({ error: 'Invalid token' });
     next();
-  } catch (e) {
+  } catch {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-};
+}
