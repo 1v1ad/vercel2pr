@@ -1,99 +1,119 @@
-import express from 'express';
-import axios from 'axios';
-import { createCodeVerifier, createCodeChallenge } from './pkce.js';
-import { signSession } from './jwt.js';
-import { upsertUser } from './db.js';
-import crypto from 'crypto';
-
+// backend/src/routes_auth.js
+const express = require('express');
+const axios = require('axios');
+const jwt = require('jsonwebtoken');
+const db = require('./db');
 const router = express.Router();
 
-function setTempCookie(res, name, value){
-  res.cookie(name, value, { httpOnly:true, sameSite:'lax', secure:true, path:'/', maxAge:10*60*1000 });
+// Функция чтения ENV с подстраховкой названий
+function getenv() {
+    const env = process.env;
+    const clientId     = env.VK_CLIENT_ID;
+    const clientSecret = env.VK_CLIENT_SECRET;
+    const redirectUri  = env.VK_REDIRECT_URI || env.REDIRECT_URI;
+    const frontendUrl  = env.FRONTEND_URL || env.CLIENT_URL;
+
+    for (const [k, v] of Object.entries({
+        VK_CLIENT_ID: clientId,
+        VK_CLIENT_SECRET: clientSecret,
+        VK_REDIRECT_URI: redirectUri,
+        FRONTEND_URL: frontendUrl,
+    })) {
+        if (!v) throw new Error(`Missing env ${k}`);
+    }
+
+    return { clientId, clientSecret, redirectUri, frontendUrl };
 }
-function clearTempCookie(res, name){ res.clearCookie(name, { path:'/' }); }
 
-function getenv(){
-  const req = ['VK_CLIENT_ID','VK_CLIENT_SECRET','VK_REDIRECT_URI','FRONTEND_URL'];
-  for (const k of req) if (!process.env[k]) throw new Error('Missing env ' + k);
-  return {
-    clientId: process.env.VK_CLIENT_ID,
-    clientSecret: process.env.VK_CLIENT_SECRET,
-    redirectUri: process.env.VK_REDIRECT_URI,
-    frontendUrl: process.env.FRONTEND_URL
-  };
-}
+// ====== 1. Старт авторизации ======
+router.get('/vk/start', async (req, res) => {
+    try {
+        const { clientId, redirectUri } = getenv();
 
-function randomHex(len=32){ return crypto.randomBytes(len).toString('hex'); }
+        // Генерим случайные state + PKCE verifier
+        const state = Math.random().toString(36).substring(2);
+        const codeVerifier = Math.random().toString(36).substring(2) + Math.random().toString(36).substring(2);
 
-router.get('/vk/start', async (req,res)=>{
-  try{
-    const { clientId, redirectUri } = getenv();
-    const state = randomHex(16);
-    const verifier = createCodeVerifier();
-    const challenge = createCodeChallenge(verifier);
-    setTempCookie(res, 'vk_state', state);
-    setTempCookie(res, 'vk_code_verifier', verifier);
+        // Сохраняем временные куки для коллбэка
+        res.cookie('vk_state', state, { httpOnly: true, sameSite: 'lax', secure: true, path: '/', maxAge: 300000 });
+        res.cookie('vk_code_verifier', codeVerifier, { httpOnly: true, sameSite: 'lax', secure: true, path: '/', maxAge: 300000 });
 
-    const u = new URL('https://id.vk.com/authorize');
-    u.searchParams.set('response_type','code');
-    u.searchParams.set('client_id', clientId);
-    u.searchParams.set('redirect_uri', redirectUri);
-    u.searchParams.set('state', state);
-    u.searchParams.set('code_challenge', challenge);
-    u.searchParams.set('code_challenge_method', 'S256');
-    u.searchParams.set('scope','vkid.personal_info');
-    return res.redirect(u.toString());
-  }catch(e){ console.error('vk/start', e); res.status(500).send('auth start failed'); }
+        // Собираем URL авторизации VK One Tap
+        const authUrl = `https://id.vk.com/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}&code_challenge=${codeVerifier}&code_challenge_method=plain&scope=openid,profile`;
+
+        res.redirect(authUrl);
+    } catch (err) {
+        console.error('vk/start Error:', err.message);
+        res.status(500).send('auth start failed');
+    }
 });
 
-router.get('/vk/callback', async (req,res)=>{
-  const { code, state, device_id } = req.query;
-  if (!code || !state) return res.status(400).send('Bad callback');
-  const savedState = req.cookies['vk_state'];
-  const verifier = req.cookies['vk_code_verifier'];
-  if (!savedState || !verifier || savedState !== state) return res.status(400).send('Invalid state');
-  clearTempCookie(res,'vk_state'); clearTempCookie(res,'vk_code_verifier');
+// ====== 2. Callback ======
+router.get('/vk/callback', async (req, res) => {
+    try {
+        const { clientId, clientSecret, redirectUri, frontendUrl } = getenv();
+        const { code, state } = req.query;
+        const cookieState = req.cookies.vk_state;
+        const codeVerifier = req.cookies.vk_code_verifier;
 
-  const { clientId, clientSecret, redirectUri, frontendUrl } = getenv();
-  let tokenData = null;
-  try{
-    const resp = await axios.post('https://id.vk.com/oauth2/auth',
-      new URLSearchParams({
-        grant_type:'authorization_code',
-        code, client_id:clientId, client_secret:clientSecret,
-        redirect_uri:redirectUri, code_verifier:verifier, device_id:device_id||''
-      }).toString(),
-      { headers:{'Content-Type':'application/x-www-form-urlencoded'}, timeout:10000 });
-    tokenData = resp.data;
-  }catch(err){
-    console.warn('id.vk.com exchange failed, fallback', err?.response?.data || err?.message);
-    const resp = await axios.get('https://oauth.vk.com/access_token', {
-      params:{ client_id:clientId, client_secret:clientSecret, redirect_uri:redirectUri, code, code_verifier:verifier, device_id:device_id||'' },
-      timeout:10000
-    });
-    tokenData = resp.data;
-  }
+        if (!code || !state || state !== cookieState) {
+            return res.status(400).send('Invalid state or code');
+        }
 
-  const accessToken = tokenData.access_token;
-  let first_name='', last_name='', avatar='';
-  try{
-    const u = await axios.get('https://api.vk.com/method/users.get', {
-      params:{ access_token:accessToken, v:'5.199', fields:'photo_200,first_name,last_name' }, timeout:10000
-    });
-    const r = u.data?.response?.[0];
-    if (r){ first_name=r.first_name||''; last_name=r.last_name||''; avatar=r.photo_200||''; }
-  }catch(e){ console.warn('users.get failed', e?.response?.data || e?.message); }
+        // Обмениваем код на токен
+        const tokenResp = await axios.get('https://id.vk.com/oauth2/auth', {
+            params: {
+                grant_type: 'authorization_code',
+                code,
+                client_id: clientId,
+                client_secret: clientSecret,
+                redirect_uri: redirectUri,
+                code_verifier: codeVerifier
+            }
+        });
 
-  const vk_id = String(tokenData.user_id || (tokenData?.user?.id || 'unknown'));
-  const user = await upsertUser({ vk_id, first_name, last_name, avatar });
+        const accessToken = tokenResp.data.access_token;
+        const userInfo = tokenResp.data.user;
 
-  const jwt = signSession({ uid:user.id, vk_id:user.vk_id });
-  res.cookie('sid', jwt, { httpOnly:true, sameSite:'lax', secure:true, path:'/', maxAge:30*24*3600*1000 });
+        if (!accessToken || !userInfo) {
+            return res.status(400).send('Token exchange failed');
+        }
 
-  // back to frontend (index will redirect to /lobby.html)
-  const url = new URL(frontendUrl);
-  url.searchParams.set('logged','1');
-  return res.redirect(url.toString());
+        // Сохраняем/обновляем пользователя
+        let user = await db.user.findUnique({ where: { vk_id: String(userInfo.id) } });
+        if (!user) {
+            user = await db.user.create({
+                data: {
+                    vk_id: String(userInfo.id),
+                    firstName: userInfo.first_name || '',
+                    lastName: userInfo.last_name || '',
+                    avatar: userInfo.avatar || ''
+                }
+            });
+        }
+
+        // Генерим сессию
+        const sessionJwt = jwt.sign({ uid: user.id }, process.env.JWT_SECRET, { expiresIn: '30d' });
+
+        // Кука для фронта (FIX: SameSite none)
+        res.cookie('sid', sessionJwt, {
+            httpOnly: true,
+            sameSite: 'none',  // <--- ключевая правка для кросс-доменной работы
+            secure: true,
+            path: '/',
+            maxAge: 30 * 24 * 3600 * 1000
+        });
+
+        // Чистим временные куки
+        res.clearCookie('vk_state');
+        res.clearCookie('vk_code_verifier');
+
+        // Редиректим на фронт
+        res.redirect(`${frontendUrl}/lobby.html`);
+    } catch (err) {
+        console.error('vk/callback Error:', err.response?.data || err.message);
+        res.status(500).send('auth callback failed');
+    }
 });
 
-export default router;
+module.exports = router;
