@@ -1,4 +1,4 @@
-// src/routes/admin.js (ESM)
+// src/routes/admin.js
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import { PrismaClient } from '@prisma/client';
@@ -23,7 +23,7 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// всё ниже — под защитой
+// Всё ниже — под защитой
 router.use(adminAuth);
 
 // GET /api/admin/metrics
