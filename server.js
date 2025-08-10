@@ -2,9 +2,9 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 
-// твой существующий роут авторизации
+// авторизация VK
 import authRouter from './src/routes_auth.js';
-// наш админ-роут на Prisma
+// админка (Prisma)
 import adminRouter from './src/routes/admin.js';
 
 const app = express();
@@ -17,13 +17,13 @@ app.use(cors({
 
 app.use(express.json());
 
-// пользовательская авторизация/логика
+// VK OAuth
 app.use('/api/auth', authRouter);
 
-// админка
+// Admin
 app.use('/api/admin', adminRouter);
 
-// health
+// Health
 app.get('/api/health', (_req, res) => res.json({ ok: true, time: new Date() }));
 
 const PORT = process.env.PORT || 3001;
