@@ -1,10 +1,11 @@
 // src/routes_auth.js
-const express = require('express');
-const axios = require('axios');
+import express from 'express';
+import axios from 'axios';
+import db from './db.js';
+import { generateCodeChallenge, generateCodeVerifier } from './pkce.js';
+import { signJwt } from './jwt.js';
+
 const router = express.Router();
-const db = require('./db');
-const { generateCodeChallenge, generateCodeVerifier } = require('./pkce');
-const { signJwt } = require('./jwt');
 
 const CLIENT_ID = process.env.VK_CLIENT_ID;
 const CLIENT_SECRET = process.env.VK_CLIENT_SECRET;
@@ -16,7 +17,6 @@ const pkceStore = {};
 // Старт авторизации
 router.get('/vk/start', async (req, res) => {
   try {
-    // Берём IP корректно
     const ipHeader = req.headers['x-forwarded-for'] || req.ip || '';
     const ip = ipHeader.split(',')[0].trim();
 
@@ -49,7 +49,6 @@ router.get('/vk/callback', async (req, res) => {
       return res.status(400).send('No PKCE data found');
     }
 
-    // Обмен кода на токен
     const tokenResp = await axios.post('https://id.vk.com/oauth2/token', null, {
       params: {
         grant_type: 'authorization_code',
@@ -63,14 +62,12 @@ router.get('/vk/callback', async (req, res) => {
 
     const { access_token } = tokenResp.data;
 
-    // Получаем профиль
     const userInfo = await axios.get('https://id.vk.com/oauth2/userinfo', {
       headers: { Authorization: `Bearer ${access_token}` }
     });
 
     const { sub: vk_id, given_name, family_name, picture } = userInfo.data;
 
-    // Сохраняем в базе пользователя (если новый)
     let user = await db.getUserByVkId(vk_id);
     if (!user) {
       await db.createUser({
@@ -83,7 +80,6 @@ router.get('/vk/callback', async (req, res) => {
       user = await db.getUserByVkId(vk_id);
     }
 
-    // JWT
     const token = signJwt({ id: user.id, vk_id: user.vk_id });
 
     res.redirect(`/lobby.html?token=${token}`);
@@ -93,4 +89,4 @@ router.get('/vk/callback', async (req, res) => {
   }
 });
 
-module.exports = router;
+export default router;
