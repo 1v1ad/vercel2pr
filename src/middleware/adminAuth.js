@@ -1,4 +1,4 @@
-// src/middleware/adminAuth.js (ESM)
+// src/middleware/adminAuth.js
 import jwt from 'jsonwebtoken';
 
 export default function adminAuth(req, res, next){
