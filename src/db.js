@@ -1,79 +1,55 @@
-import dotenv from 'dotenv';
-import pkg from 'pg';
-dotenv.config();
-const { Pool } = pkg;
+// src/db.js
+// Единая точка доступа к БД через Prisma (PostgreSQL/Neon).
+// ESM-версия. Экспортируем singleton-клиент и утилиты.
 
-// Neon: sslmode=require in connection string
-const ssl = (process.env.DATABASE_URL && process.env.DATABASE_URL.includes('sslmode=require'))
-  ? { rejectUnauthorized: false }
-  : false;
+// Убедись, что в package.json есть:
+//   "dependencies": { "@prisma/client": "...", ... },
+//   "devDependencies": { "prisma": "..." },
+// и скрипт "postinstall": "prisma generate"
+// ENV: DATABASE_URL=postgresql://... (Neon)
 
-export const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl });
+import { PrismaClient } from '@prisma/client';
 
-export async function ensureTables() {
-  const client = await db.connect();
-  try {
-    await client.query(`create table if not exists users (
-      id serial primary key,
-      vk_id varchar(64) unique not null,
-      first_name text,
-      last_name text,
-      avatar text,
-      balance integer default 0,
-      ref_by varchar(64),
-      created_at timestamp default now(),
-      updated_at timestamp default now()
-    );`);
+let prisma;
+/**
+ * Делаем singleton, чтобы не плодить коннекты при hot-reload/перезапусках.
+ */
+if (!globalThis.__PRISMA__) {
+  globalThis.__PRISMA__ = new PrismaClient();
+}
+prisma = globalThis.__PRISMA__;
 
-    await client.query(`create table if not exists transactions (
-      id serial primary key,
-      user_id integer references users(id) on delete cascade,
-      type varchar(32) not null,
-      amount integer not null,
-      meta jsonb,
-      created_at timestamp default now()
-    );`);
-
-    await client.query(`create table if not exists events (
-      id serial primary key,
-      user_id integer references users(id) on delete set null,
-      event_type varchar(64) not null,
-      payload jsonb,
-      ip text,        -- text: чтобы не падать на нескольких IP в x-forwarded-for
-      ua text,
-      created_at timestamp default now()
-    );`);
-  } finally {
-    client.release();
-  }
+/**
+ * Совместимость с прежним API "pg":
+ * query(sql, params) — выполняет сырой SQL (осторожно! проверяй входные данные).
+ * Используем $queryRawUnsafe, чтобы поддержать массив params как в pg.
+ *
+ * Пример:
+ *   const rows = await query('SELECT * FROM "User" WHERE vk_id = $1', [vkId]);
+ */
+export async function query(sql, params = []) {
+  // Prisma понимает массив параметров "как есть"
+  return prisma.$queryRawUnsafe(sql, ...(params || []));
 }
 
-export async function upsertUser({ vk_id, first_name, last_name, avatar }) {
-  const q = `insert into users (vk_id, first_name, last_name, avatar)
-    values ($1,$2,$3,$4)
-    on conflict (vk_id) do update set
-      first_name = excluded.first_name,
-      last_name  = excluded.last_name,
-      avatar     = excluded.avatar,
-      updated_at = now()
-    returning *;`;
-  const { rows } = await db.query(q, [vk_id, first_name, last_name, avatar]);
-  return rows[0];
+/**
+ * Транзакция-обёртка (опционально):
+ *   await tx(async (p) => {
+ *     await p.user.update({ ... });
+ *     await p.transaction.create({ ... });
+ *   })
+ */
+export async function tx(fn) {
+  return prisma.$transaction(async (p) => fn(p));
 }
 
-export async function getUserByVkId(vk_id) {
-  const { rows } = await db.query('select * from users where vk_id = $1', [vk_id]);
-  return rows[0] || null;
+/**
+ * Корректное закрытие соединения (обычно не нужно на Render, но полезно в тестах).
+ */
+export async function close() {
+  await prisma.$disconnect();
 }
 
-export async function getUserById(id) {
-  const { rows } = await db.query('select * from users where id = $1', [id]);
-  return rows[0] || null;
-}
-
-export async function logEvent({ user_id, event_type, payload, ip, ua }) {
-  await db.query(
-    'insert into events (user_id, event_type, payload, ip, ua) values ($1,$2,$3,$4,$5)',
-    [user_id || null, event_type, payload || null, ip || null, ua || null]
-  );
-}
+// Экспортируем сам клиент (и как default, и по имени)
+export { prisma };
+export default prisma;
