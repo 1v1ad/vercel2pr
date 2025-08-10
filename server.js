@@ -4,7 +4,7 @@ import cors from 'cors';
 
 // твой существующий роут авторизации
 import authRouter from './src/routes_auth.js';
-// новый админ-роут (Prisma)
+// наш админ-роут на Prisma
 import adminRouter from './src/routes/admin.js';
 
 const app = express();
@@ -14,6 +14,7 @@ app.use(cors({
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
+
 app.use(express.json());
 
 // пользовательская авторизация/логика
