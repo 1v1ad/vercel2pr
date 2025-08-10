@@ -12,4 +12,4 @@ module.exports = function adminAuth(req, res, next){
   } catch (e) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-}
+};
