@@ -26,7 +26,7 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// All routes below require admin auth
+// Все ниже — под защитой
 router.use(adminAuth);
 
 // GET /api/admin/metrics
@@ -41,10 +41,7 @@ router.get('/metrics', async (req, res) => {
         _count: { userId: true }
       }).then(arr => arr.length),
       prisma.user.aggregate({ _sum: { balance: true } }),
-      prisma.transaction.groupBy({
-        by: ['type'],
-        _sum: { amount: true }
-      })
+      prisma.transaction.groupBy({ by: ['type'], _sum: { amount: true } })
     ]);
 
     const sumByType = Object.fromEntries(txAgg.map(x => [x.type, x._sum.amount || 0]));
@@ -53,7 +50,7 @@ router.get('/metrics', async (req, res) => {
       newUsers7d,
       active24h,
       totalBalance: balanceAgg._sum.balance || 0,
-      txCount: Object.values(sumByType).reduce((a,b)=>a + (b?1:0), 0),
+      txCount: await prisma.transaction.count(),
       depositsSum: sumByType['deposit'] || 0,
       withdrawsSum: sumByType['withdraw'] || 0,
       winSum: sumByType['win'] || 0,
@@ -65,7 +62,7 @@ router.get('/metrics', async (req, res) => {
   }
 });
 
-// GET /api/admin/users?limit=100&q=search
+// GET /api/admin/users?limit=100&q=...
 router.get('/users', async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || '100', 10), 500);
@@ -92,7 +89,7 @@ router.get('/users', async (req, res) => {
   }
 });
 
-// GET /api/admin/transactions?limit=200&type=deposit|withdraw|...
+// GET /api/admin/transactions?limit=200&type=...
 router.get('/transactions', async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || '200', 10), 1000);
