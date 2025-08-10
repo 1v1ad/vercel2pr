@@ -1,8 +1,8 @@
-// src/routes/admin.js
-const express = require('express');
-const jwt = require('jsonwebtoken');
-const { PrismaClient } = require('@prisma/client');
-const adminAuth = require('../middleware/adminAuth');
+// src/routes/admin.js (ESM)
+import express from 'express';
+import jwt from 'jsonwebtoken';
+import { PrismaClient } from '@prisma/client';
+import adminAuth from '../middleware/adminAuth.js';
 
 const prisma = new PrismaClient();
 const router = express.Router();
@@ -12,12 +12,9 @@ router.post('/login', async (req, res) => {
   try {
     const { password } = req.body || {};
     const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
-    if (!ADMIN_PASSWORD) {
-      return res.status(500).json({ error: 'ADMIN_PASSWORD not set' });
-    }
-    if (!password || password !== ADMIN_PASSWORD) {
-      return res.status(401).json({ error: 'Invalid password' });
-    }
+    if (!ADMIN_PASSWORD) return res.status(500).json({ error: 'ADMIN_PASSWORD not set' });
+    if (!password || password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Invalid password' });
+
     const token = jwt.sign({ role: 'admin' }, process.env.JWT_SECRET, { expiresIn: '12h' });
     res.json({ token });
   } catch (e) {
@@ -26,13 +23,13 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// Все ниже — под защитой
+// всё ниже — под защитой
 router.use(adminAuth);
 
 // GET /api/admin/metrics
-router.get('/metrics', async (req, res) => {
+router.get('/metrics', async (_req, res) => {
   try {
-    const [usersCount, newUsers7d, active24h, balanceAgg, txAgg] = await Promise.all([
+    const [usersCount, newUsers7d, active24h, balanceAgg, txAgg, txCount] = await Promise.all([
       prisma.user.count(),
       prisma.user.count({ where: { createdAt: { gte: new Date(Date.now() - 7*24*3600*1000) } } }),
       prisma.transaction.groupBy({
@@ -41,7 +38,8 @@ router.get('/metrics', async (req, res) => {
         _count: { userId: true }
       }).then(arr => arr.length),
       prisma.user.aggregate({ _sum: { balance: true } }),
-      prisma.transaction.groupBy({ by: ['type'], _sum: { amount: true } })
+      prisma.transaction.groupBy({ by: ['type'], _sum: { amount: true } }),
+      prisma.transaction.count(),
     ]);
 
     const sumByType = Object.fromEntries(txAgg.map(x => [x.type, x._sum.amount || 0]));
@@ -50,7 +48,7 @@ router.get('/metrics', async (req, res) => {
       newUsers7d,
       active24h,
       totalBalance: balanceAgg._sum.balance || 0,
-      txCount: await prisma.transaction.count(),
+      txCount,
       depositsSum: sumByType['deposit'] || 0,
       withdrawsSum: sumByType['withdraw'] || 0,
       winSum: sumByType['win'] || 0,
@@ -94,7 +92,6 @@ router.get('/transactions', async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || '200', 10), 1000);
     const type = (req.query.type || '').trim();
-
     const where = type ? { type } : {};
 
     const items = await prisma.transaction.findMany({
@@ -110,4 +107,4 @@ router.get('/transactions', async (req, res) => {
   }
 });
 
-module.exports = router;
+export default router;
