@@ -1,25 +1,28 @@
-// server.js (ESM)
+// server.js
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 
-import authRouter from './src/routes/auth.js';
-import userRouter from './src/routes/user.js';
+// ВАЖНО: у тебя файл авторизации называется routes_auth.js и лежит в /src
+import authRouter from './src/routes_auth.js';
+
+// Админ-роут из /src/routes/admin.js
 import adminRouter from './src/routes/admin.js';
 
 const app = express();
 
 app.use(cors({
-  origin: process.env.FRONTEND_URL,
+  origin: process.env.FRONTEND_URL,           // https://sweet-twilight-63a9b6.netlify.app
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 app.use(express.json());
 
-// Роуты
+// Авторизация пользователей (как было)
 app.use('/api/auth', authRouter);
-app.use('/api/user', userRouter);
+
+// Админка (новое)
 app.use('/api/admin', adminRouter);
 
 // Healthcheck
