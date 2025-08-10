@@ -1,4 +1,3 @@
-// src/routes/admin.js
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import { PrismaClient } from '@prisma/client';
@@ -23,7 +22,7 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// Всё ниже — под защитой
+// всё ниже — только для админа
 router.use(adminAuth);
 
 // GET /api/admin/metrics
@@ -51,8 +50,8 @@ router.get('/metrics', async (_req, res) => {
       txCount,
       depositsSum: sumByType['deposit'] || 0,
       withdrawsSum: sumByType['withdraw'] || 0,
-      winSum: sumByType['win'] || 0,
-      loseSum: sumByType['lose'] || 0,
+      winSum:      sumByType['win'] || 0,
+      loseSum:     sumByType['lose'] || 0,
     });
   } catch (e) {
     console.error(e);
