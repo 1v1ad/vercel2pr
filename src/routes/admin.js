@@ -1,107 +1,114 @@
+// VK OAuth + JWT через Prisma
+// ENV: VK_CLIENT_ID, VK_CLIENT_SECRET, VK_REDIRECT_URI, FRONTEND_URL, JWT_SECRET
 import express from 'express';
+import axios from 'axios';
 import jwt from 'jsonwebtoken';
-import { PrismaClient } from '@prisma/client';
-import adminAuth from '../middleware/adminAuth.js';
+import prisma from './db.js';
 
-const prisma = new PrismaClient();
 const router = express.Router();
 
-// POST /api/admin/login  { password }
-router.post('/login', async (req, res) => {
-  try {
-    const { password } = req.body || {};
-    const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
-    if (!ADMIN_PASSWORD) return res.status(500).json({ error: 'ADMIN_PASSWORD not set' });
-    if (!password || password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Invalid password' });
+function signAppToken(user) {
+  return jwt.sign({ uid: user.id, vk_id: user.vk_id }, process.env.JWT_SECRET, { expiresIn: '30d' });
+}
+function bearer(req) {
+  const h = req.headers.authorization || '';
+  return h.startsWith('Bearer ') ? h.slice(7) : null;
+}
 
-    const token = jwt.sign({ role: 'admin' }, process.env.JWT_SECRET, { expiresIn: '12h' });
-    res.json({ token });
+/**
+ * GET /api/auth/vk/start
+ * Редиректит пользователя на VK OAuth c response_type=code
+ */
+router.get('/vk/start', (req, res) => {
+  const { VK_CLIENT_ID, VK_REDIRECT_URI } = process.env;
+  if (!VK_CLIENT_ID || !VK_REDIRECT_URI) return res.status(500).send('VK OAuth not configured');
+
+  const url = new URL('https://oauth.vk.com/authorize');
+  url.searchParams.set('client_id', VK_CLIENT_ID);
+  url.searchParams.set('redirect_uri', VK_REDIRECT_URI);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('display', 'page');
+  url.searchParams.set('scope', ''); // при необходимости: 'offline'
+  url.searchParams.set('v', '5.199');
+
+  return res.redirect(302, url.toString());
+});
+
+/**
+ * GET /api/auth/vk/callback?code=...
+ * Обмен кода на токен VK, апсерт пользователя, редирект на FRONTEND_URL?token=...
+ */
+router.get('/vk/callback', async (req, res) => {
+  try {
+    const code = req.query.code;
+    if (!code) return res.status(400).send('Missing code');
+
+    const { VK_CLIENT_ID, VK_CLIENT_SECRET, VK_REDIRECT_URI, FRONTEND_URL } = process.env;
+
+    // 1) обмен кода на access_token
+    const tokenResp = await axios.get('https://oauth.vk.com/access_token', {
+      params: {
+        client_id: VK_CLIENT_ID,
+        client_secret: VK_CLIENT_SECRET,
+        redirect_uri: VK_REDIRECT_URI,
+        code,
+      },
+    });
+    const { access_token, user_id } = tokenResp.data || {};
+    if (!access_token || !user_id) return res.status(401).send('VK token exchange failed');
+
+    // 2) базовая инфа
+    const infoResp = await axios.get('https://api.vk.com/method/users.get', {
+      params: { user_ids: user_id, fields: 'photo_200', v: '5.199', access_token },
+    });
+    const u = infoResp.data?.response?.[0];
+    const firstName = u?.first_name || '';
+    const lastName = u?.last_name || '';
+    const avatar = u?.photo_200 || '';
+
+    // 3) апсерт пользователя
+    const user = await prisma.user.upsert({
+      where: { vk_id: String(user_id) },
+      update: { firstName, lastName, avatar },
+      create: { vk_id: String(user_id), firstName, lastName, avatar, balance: 0 },
+    });
+
+    // 4) наш JWT и редирект на фронт
+    const token = signAppToken(user);
+    const redirectUrl = new URL(process.env.FRONTEND_URL || 'http://localhost:5173');
+    // redirectUrl.pathname = '/lobby'; // если нужно строго в /lobby — раскомментируй
+    redirectUrl.searchParams.set('token', token);
+    return res.redirect(302, redirectUrl.toString());
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Internal error' });
+    console.error('VK callback error:', e?.response?.data || e?.message || e);
+    return res.status(500).send('Auth failed');
   }
 });
 
-// всё ниже — только для админа
-router.use(adminAuth);
-
-// GET /api/admin/metrics
-router.get('/metrics', async (_req, res) => {
+/**
+ * GET /api/auth/me  — профиль по Bearer JWT
+ */
+router.get('/me', async (req, res) => {
   try {
-    const [usersCount, newUsers7d, active24h, balanceAgg, txAgg, txCount] = await Promise.all([
-      prisma.user.count(),
-      prisma.user.count({ where: { createdAt: { gte: new Date(Date.now() - 7*24*3600*1000) } } }),
-      prisma.transaction.groupBy({
-        by: ['userId'],
-        where: { createdAt: { gte: new Date(Date.now() - 24*3600*1000) } },
-        _count: { userId: true }
-      }).then(arr => arr.length),
-      prisma.user.aggregate({ _sum: { balance: true } }),
-      prisma.transaction.groupBy({ by: ['type'], _sum: { amount: true } }),
-      prisma.transaction.count(),
-    ]);
+    const t = bearer(req);
+    if (!t) return res.status(401).json({ error: 'No token' });
 
-    const sumByType = Object.fromEntries(txAgg.map(x => [x.type, x._sum.amount || 0]));
-    res.json({
-      usersCount,
-      newUsers7d,
-      active24h,
-      totalBalance: balanceAgg._sum.balance || 0,
-      txCount,
-      depositsSum: sumByType['deposit'] || 0,
-      withdrawsSum: sumByType['withdraw'] || 0,
-      winSum:      sumByType['win'] || 0,
-      loseSum:     sumByType['lose'] || 0,
+    let decoded;
+    try {
+      decoded = jwt.verify(t, process.env.JWT_SECRET);
+    } catch {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.uid },
+      select: { id: true, vk_id: true, firstName: true, lastName: true, avatar: true, balance: true, createdAt: true, updatedAt: true },
     });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    res.json({ user });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Internal error' });
-  }
-});
-
-// GET /api/admin/users?limit=100&q=...
-router.get('/users', async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit || '100', 10), 500);
-    const q = (req.query.q || '').trim();
-
-    const where = q ? {
-      OR: [
-        { vk_id: { contains: q } },
-        { firstName: { contains: q, mode: 'insensitive' } },
-        { lastName: { contains: q, mode: 'insensitive' } },
-      ]
-    } : {};
-
-    const items = await prisma.user.findMany({
-      where,
-      orderBy: { id: 'desc' },
-      take: limit,
-    });
-
-    res.json({ items });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Internal error' });
-  }
-});
-
-// GET /api/admin/transactions?limit=200&type=...
-router.get('/transactions', async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit || '200', 10), 1000);
-    const type = (req.query.type || '').trim();
-    const where = type ? { type } : {};
-
-    const items = await prisma.transaction.findMany({
-      where,
-      orderBy: { id: 'desc' },
-      take: limit,
-    });
-
-    res.json({ items });
-  } catch (e) {
-    console.error(e);
+    console.error('ME error:', e);
     res.status(500).json({ error: 'Internal error' });
   }
 });
