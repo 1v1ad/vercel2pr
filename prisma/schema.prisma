@@ -13,7 +13,7 @@ model User {
   firstName    String
   lastName     String
   avatar       String
-  balance      Int           @default(0)
+  balance      Int           @default(0)     // храним в копейках
   ref_by       String?
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
@@ -23,10 +23,14 @@ model User {
 model Transaction {
   id        Int      @id @default(autoincrement())
   userId    Int
-  type      String
-  amount    Int
+  type      String                       // deposit | withdraw | win | lose | bonus
+  amount    Int                          // копейки
   meta      String?
   createdAt DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([type])
+  @@index([createdAt])
 }
