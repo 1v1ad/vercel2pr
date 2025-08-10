@@ -1,4 +1,4 @@
-// src/routes_auth.js — VK ID (id.vk.com) с PKCE + кука sid
+// src/routes_auth.js — VK ID (PKCE) + надёжный фолбэк на oauth.vk.com
 // ENV: VK_CLIENT_ID, VK_CLIENT_SECRET, VK_REDIRECT_URI, FRONTEND_URL, JWT_SECRET
 import express from 'express';
 import axios from 'axios';
@@ -30,7 +30,7 @@ function signSession(payload) {
   return jwt.sign(payload, process.env.JWT_SECRET, { algorithm: 'HS256', expiresIn: '30d' });
 }
 
-// 1) Старт: редирект на id.vk.com с PKCE
+// ================== START ==================
 router.get('/vk/start', async (req, res) => {
   try {
     const { VK_CLIENT_ID, VK_REDIRECT_URI } = mustEnv();
@@ -60,12 +60,12 @@ router.get('/vk/start', async (req, res) => {
   }
 });
 
-// 2) Callback: POST /oauth2/token (а не /auth), логируем ответ VK при ошибке
+// ================ CALLBACK =================
 router.get('/vk/callback', async (req, res) => {
   const startedAt = Date.now();
   try {
     const { VK_CLIENT_ID, VK_CLIENT_SECRET, VK_REDIRECT_URI, FRONTEND_URL } = mustEnv();
-    const { code, state } = req.query;
+    const { code, state, type } = req.query;
 
     const savedState   = req.cookies['vk_state'];
     const codeVerifier = req.cookies['vk_code_verifier'];
@@ -75,39 +75,62 @@ router.get('/vk/callback', async (req, res) => {
     res.clearCookie('vk_state', { path:'/' });
     res.clearCookie('vk_code_verifier', { path:'/' });
 
-    // === ВАЖНО: правильный endpoint ===
-    // Документация VK ID: обмен кода на токен идёт через /oauth2/token
-    let tokenData;
+    let tokenData = null;
+    let accessToken = null;
+    let userId = null;
+
+    // ---- Попытка №1 — VK ID /oauth2/token (PKCE)
     try {
       const tokenResp = await axios.post(
         'https://id.vk.com/oauth2/token',
         new URLSearchParams({
           grant_type: 'authorization_code',
           client_id: VK_CLIENT_ID,
-          client_secret: VK_CLIENT_SECRET,    // для web-клиента (confidential) секрет уместен
+          client_secret: VK_CLIENT_SECRET,
           redirect_uri: VK_REDIRECT_URI,
           code_verifier: codeVerifier,
           code
         }),
         { headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' }, timeout: 12000 }
       );
-      tokenData = tokenResp.data;
+      tokenData   = tokenResp.data;
+      accessToken = tokenData?.access_token;
+      userId      = tokenData?.user_id || tokenData?.user?.id;
     } catch (err) {
-      // логируем, но не светим всё пользователю
       const status = err.response?.status;
       const body   = err.response?.data;
-      console.error('VK ID token error:', { status, body, tookMs: Date.now() - startedAt });
-      return res.status(500).send('token exchange failed'); // краткий текст пользователю
+      console.error('VK ID token error (try1 /oauth2/token):', { status, body, tookMs: Date.now() - startedAt });
     }
 
-    const accessToken = tokenData?.access_token;
-    const userId      = tokenData?.user_id || tokenData?.user?.id;
+    // ---- Попытка №2 — старый oauth.vk.com/access_token (для code_v2 + PKCE)
     if (!accessToken || !userId) {
-      console.error('VK ID token response unexpected:', tokenData);
-      return res.status(401).send('token exchange failed');
+      try {
+        const tokenResp2 = await axios.get('https://oauth.vk.com/access_token', {
+          params: {
+            client_id: VK_CLIENT_ID,
+            client_secret: VK_CLIENT_SECRET,
+            redirect_uri: VK_REDIRECT_URI,
+            code,
+            code_verifier: codeVerifier, // важно для code_v2
+            type: type || 'code_v2'      // если ВК прислал type=code_v2 — передадим
+          },
+          timeout: 12000,
+        });
+        tokenData   = tokenResp2.data;
+        accessToken = tokenData?.access_token;
+        userId      = tokenData?.user_id;
+      } catch (err2) {
+        const status = err2.response?.status;
+        const body   = err2.response?.data;
+        console.error('VK token error (try2 oauth/access_token):', { status, body, tookMs: Date.now() - startedAt });
+      }
     }
 
-    // Инфо о пользователе (опционально)
+    if (!accessToken || !userId) {
+      return res.status(500).send('token exchange failed');
+    }
+
+    // --- Инфо о пользователе (не критично)
     let first_name = '', last_name = '', avatar = '';
     try {
       const info = await axios.get('https://api.vk.com/method/users.get', {
