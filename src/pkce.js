@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-export function base64url(input){
+function base64url(input){
   return Buffer.from(input).toString('base64').replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
 }
 export function createCodeVerifier(){ return base64url(crypto.randomBytes(64)); }

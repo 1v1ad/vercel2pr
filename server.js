@@ -11,26 +11,33 @@ dotenv.config();
 const app = express();
 
 const FRONTEND_URL = process.env.FRONTEND_URL;
+
 app.use(cors({
   origin: FRONTEND_URL,
   credentials: true,
   methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 app.use(express.json());
 app.use(cookieParser());
 
+// Health
 app.get('/health', (_, res) => res.status(200).send('ok'));
+
+// Auth routes
 app.use('/api/auth', authRouter);
 
+// Session info for frontend
 app.get('/api/me', async (req, res) => {
   try {
     const token = req.cookies['sid'];
     if (!token) return res.status(401).json({ ok:false });
+
     const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
     const user = await getUserById(payload.uid);
     if (!user) return res.status(401).json({ ok:false });
+
     res.json({
       ok: true,
       user: {
@@ -42,16 +49,22 @@ app.get('/api/me', async (req, res) => {
         balance: user.balance ?? 0
       }
     });
-  } catch {
+  } catch (e) {
     res.status(401).json({ ok:false });
   }
 });
 
+// Client events (analytics)
 app.post('/api/events', async (req, res) => {
   try {
     const { type, payload } = req.body || {};
     if (!type) return res.status(400).json({ ok:false, error: 'type required' });
+
+    // First IP only (Render adds chain of proxies)
+    const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
+    const ip = ipHeader.split(',')[0].trim();
     let userId = null;
+
     const token = req.cookies['sid'];
     if (token) {
       try {
@@ -59,13 +72,15 @@ app.post('/api/events', async (req, res) => {
         userId = p.uid || null;
       } catch {}
     }
+
     await logEvent({
       user_id: userId,
-      event_type: String(type).slice(0,64),
+      event_type: String(type).slice(0, 64),
       payload: payload || null,
-      ip: (req.headers['x-forwarded-for'] || req.ip || '').toString().slice(0,64),
-      ua: (req.headers['user-agent'] || '').slice(0,256),
+      ip,
+      ua: (req.headers['user-agent'] || '').slice(0, 256),
     });
+
     res.json({ ok:true });
   } catch (e) {
     console.error('events error', e);
@@ -73,12 +88,14 @@ app.post('/api/events', async (req, res) => {
   }
 });
 
+// Root
 app.get('/', (_, res) => res.send('VK Auth backend up'));
 
 const PORT = process.env.PORT || 3001;
-ensureTables().then(()=>{
-  app.listen(PORT, ()=>console.log('API on :' + PORT));
-}).catch((e)=>{
+
+ensureTables().then(() => {
+  app.listen(PORT, () => console.log(`API on :${PORT}`));
+}).catch((e) => {
   console.error('DB init failed', e);
   process.exit(1);
 });
