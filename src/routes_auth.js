@@ -1,4 +1,4 @@
-// src/routes_auth.js — VK ID (id.vk.com) с PKCE + куки sid
+// src/routes_auth.js — VK ID (id.vk.com) с PKCE + кука sid
 // ENV: VK_CLIENT_ID, VK_CLIENT_SECRET, VK_REDIRECT_URI, FRONTEND_URL, JWT_SECRET
 import express from 'express';
 import axios from 'axios';
@@ -39,8 +39,8 @@ router.get('/vk/start', async (req, res) => {
     const codeVerifier  = createCodeVerifier();
     const codeChallenge = createCodeChallenge(codeVerifier);
 
-    res.cookie('vk_state', state,               { httpOnly:true, sameSite:'lax',  secure:true, path:'/', maxAge: 10*60*1000 });
-    res.cookie('vk_code_verifier', codeVerifier,{ httpOnly:true, sameSite:'lax',  secure:true, path:'/', maxAge: 10*60*1000 });
+    res.cookie('vk_state', state,                { httpOnly:true, sameSite:'lax',  secure:true, path:'/', maxAge: 10*60*1000 });
+    res.cookie('vk_code_verifier', codeVerifier, { httpOnly:true, sameSite:'lax',  secure:true, path:'/', maxAge: 10*60*1000 });
 
     await logEvent({ user_id:null, event_type:'auth_start', payload:null, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
@@ -60,8 +60,9 @@ router.get('/vk/start', async (req, res) => {
   }
 });
 
-// 2) Callback: обмен кода на токен VK ID → апсерт юзера → кука sid → редирект на фронт
+// 2) Callback: POST /oauth2/token (а не /auth), логируем ответ VK при ошибке
 router.get('/vk/callback', async (req, res) => {
+  const startedAt = Date.now();
   try {
     const { VK_CLIENT_ID, VK_CLIENT_SECRET, VK_REDIRECT_URI, FRONTEND_URL } = mustEnv();
     const { code, state } = req.query;
@@ -74,29 +75,39 @@ router.get('/vk/callback', async (req, res) => {
     res.clearCookie('vk_state', { path:'/' });
     res.clearCookie('vk_code_verifier', { path:'/' });
 
-    // обмен PKCE на id.vk.com
-    const resp = await axios.post(
-      'https://id.vk.com/oauth2/auth',
-      new URLSearchParams({
-        grant_type: 'authorization_code',
-        client_id: VK_CLIENT_ID,
-        client_secret: VK_CLIENT_SECRET,
-        redirect_uri: VK_REDIRECT_URI,
-        code_verifier: codeVerifier,
-        code
-      }),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
-    );
+    // === ВАЖНО: правильный endpoint ===
+    // Документация VK ID: обмен кода на токен идёт через /oauth2/token
+    let tokenData;
+    try {
+      const tokenResp = await axios.post(
+        'https://id.vk.com/oauth2/token',
+        new URLSearchParams({
+          grant_type: 'authorization_code',
+          client_id: VK_CLIENT_ID,
+          client_secret: VK_CLIENT_SECRET,    // для web-клиента (confidential) секрет уместен
+          redirect_uri: VK_REDIRECT_URI,
+          code_verifier: codeVerifier,
+          code
+        }),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' }, timeout: 12000 }
+      );
+      tokenData = tokenResp.data;
+    } catch (err) {
+      // логируем, но не светим всё пользователю
+      const status = err.response?.status;
+      const body   = err.response?.data;
+      console.error('VK ID token error:', { status, body, tookMs: Date.now() - startedAt });
+      return res.status(500).send('token exchange failed'); // краткий текст пользователю
+    }
 
-    const tokenData   = resp.data;
     const accessToken = tokenData?.access_token;
     const userId      = tokenData?.user_id || tokenData?.user?.id;
     if (!accessToken || !userId) {
-      console.error('VK ID token exchange failed:', tokenData);
+      console.error('VK ID token response unexpected:', tokenData);
       return res.status(401).send('token exchange failed');
     }
 
-    // инфо о пользователе (не критично)
+    // Инфо о пользователе (опционально)
     let first_name = '', last_name = '', avatar = '';
     try {
       const info = await axios.get('https://api.vk.com/method/users.get', {
@@ -110,7 +121,6 @@ router.get('/vk/callback', async (req, res) => {
     }
 
     const user = await upsertUser({ vk_id: String(userId), first_name, last_name, avatar });
-
     await logEvent({ user_id:user.id, event_type:'auth_success', payload:null, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
     const sid = signSession({ uid: user.id, vk_id: user.vk_id });
@@ -120,7 +130,7 @@ router.get('/vk/callback', async (req, res) => {
     redirect.searchParams.set('logged', '1');
     return res.redirect(302, redirect.toString());
   } catch (e) {
-    console.error('vk/callback error:', e?.response?.data || e.message);
+    console.error('vk/callback fatal:', e?.response?.data || e.message);
     return res.status(500).send('token exchange failed');
   }
 });
