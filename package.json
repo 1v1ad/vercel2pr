@@ -1,7 +1,7 @@
 {
   "name": "vk-auth-backend",
   "version": "1.0.0",
-  "description": "Backend с VK ID авторизацией, Prisma и админкой",
+  "description": "Backend с VK ID авторизацией, Prisma и админкой (стейджинг)",
   "main": "server.js",
   "type": "module",
   "scripts": {
