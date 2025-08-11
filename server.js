@@ -2,66 +2,38 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import cookieParser from 'cookie-parser';
-
-import { ensureTables } from './src/db.js';
-import authRouter from './src/routes_auth.js';
-import adminRouter from './src/modules/admin/router.js'; // за флагом ниже
 
 const app = express();
 
-const FRONTEND_URL = process.env.FRONTEND_URL || '';
-const PORT = process.env.PORT || 3001;
+// CORS: добавь сюда домены фронта
+app.use(cors({
+  origin: [
+    process.env.CORS_ORIGIN || '*'
+  ],
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','X-Admin-Password']
+}));
 
-// CORS
-const allowedOrigins = new Set(
-  FRONTEND_URL
-    ? FRONTEND_URL.split(',').map(s => s.trim()).filter(Boolean)
-    : []
-);
-allowedOrigins.add('http://localhost:3000');
-allowedOrigins.add('http://127.0.0.1:3000');
-
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      return cb(null, allowedOrigins.has(origin));
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-  })
-);
-
-app.use(cookieParser());
 app.use(express.json());
 
-// Healthcheck
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, time: new Date().toISOString() });
-});
+// Health
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-// Авторизация (стабильно, как сейчас)
-app.use('/api/auth', authRouter);
-
-// ✅ Админка только по фиче-флагу
-if (process.env.FEATURE_ADMIN === 'true') {
+// Фича-флаг для админки
+if ((process.env.FEATURE_ADMIN || '').toLowerCase() === 'true') {
+  const { default: adminRouter } = await import('./src/modules/admin/router.js');
   app.use('/api/admin', adminRouter);
+} else {
+  console.log('FEATURE_ADMIN is disabled');
 }
 
-// Корень
-app.get('/', (_req, res) => res.send('Backend is up'));
+// Глобальная обработка ошибок
+app.use((err, _req, res, _next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal Server Error' });
+});
 
-// Старт
-ensureTables()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`API listening on http://0.0.0.0:${PORT}`);
-      console.log(`Admin module: ${process.env.FEATURE_ADMIN === 'true' ? 'ENABLED' : 'disabled'}`);
-    });
-  })
-  .catch((err) => {
-    console.error('DB init failed:', err);
-    process.exit(1);
-  });
+const port = process.env.PORT || 3001;
+app.listen(port, () => {
+  console.log(`Server listening on port ${port}`);
+});

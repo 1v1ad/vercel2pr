@@ -1,70 +1,57 @@
-// src/modules/admin/router.js
 import { Router } from 'express';
+import adminAuth from '../../middleware/adminAuth.js';
 import prisma from '../../lib/prisma.js';
-import { requireAdmin, signAdmin } from '../../middleware/adminAuth.js';
 
-const r = Router();
+const router = Router();
 
-// POST /api/admin/login  { password }
-r.post('/login', async (req, res) => {
-  try {
-    const { password } = req.body || {};
-    if (!password || password !== process.env.ADMIN_PASSWORD) {
-      return res.status(401).json({ error: 'bad creds' });
-    }
-    const token = signAdmin({ role: 'admin' });
-    return res.json({ token });
-  } catch (e) {
-    console.error('admin/login error:', e);
-    return res.status(500).json({ error: 'internal' });
-  }
+// Все админ-маршруты защищаем
+router.use(adminAuth);
+
+// Статус
+router.get('/health', async (_req, res) => {
+  // Простая проверка подключения к БД
+  await prisma.$queryRaw`SELECT 1`;
+  res.json({ ok: true, time: new Date().toISOString() });
 });
 
-// GET /api/admin/stats/overview
-r.get('/stats/overview', requireAdmin, async (_req, res) => {
-  try {
-    const since24h = new Date(Date.now() - 24 * 3600 * 1000);
-    const [totalUsers, totalEvents, last24hAuth] = await Promise.all([
-      prisma.user.count(),
-      prisma.event.count(),
-      prisma.event.count({
-        where: {
-          event_type: 'auth_success',
-          created_at: { gte: since24h },
-        },
-      }),
-    ]);
-    res.json({ totalUsers, totalEvents, last24hAuth });
-  } catch (e) {
-    console.error('stats/overview error:', e);
-    res.status(500).json({ error: 'internal' });
-  }
+// Список пользователей (пагинация через ?skip=&take=)
+router.get('/users', async (req, res) => {
+  const take = Math.min(parseInt(req.query.take ?? '50', 10), 200);
+  const skip = parseInt(req.query.skip ?? '0', 10);
+  const users = await prisma.user.findMany({
+    take,
+    skip,
+    orderBy: { id: 'desc' }
+  });
+  const total = await prisma.user.count();
+  res.json({ total, take, skip, items: users });
 });
 
-// GET /api/admin/events?type=auth_success&page=1&limit=50
-r.get('/events', requireAdmin, async (req, res) => {
-  try {
-    const page = Math.max(parseInt(req.query.page || '1', 10), 1);
-    const limit = Math.min(parseInt(req.query.limit || '50', 10), 200);
-    const skip = (page - 1) * limit;
-    const type = (req.query.type || '').trim();
-    const where = type ? { event_type: type } : {};
-
-    const [items, count] = await Promise.all([
-      prisma.event.findMany({
-        where,
-        orderBy: { id: 'desc' },
-        skip,
-        take: limit,
-      }),
-      prisma.event.count({ where }),
-    ]);
-
-    res.json({ items, count, page, limit });
-  } catch (e) {
-    console.error('events list error:', e);
-    res.status(500).json({ error: 'internal' });
-  }
+// Список транзакций
+router.get('/transactions', async (req, res) => {
+  const take = Math.min(parseInt(req.query.take ?? '50', 10), 200);
+  const skip = parseInt(req.query.skip ?? '0', 10);
+  const tx = await prisma.transaction.findMany({
+    take,
+    skip,
+    orderBy: { id: 'desc' },
+    include: { user: { select: { id: true, vk_id: true, firstName: true, lastName: true } } }
+  });
+  const total = await prisma.transaction.count();
+  res.json({ total, take, skip, items: tx });
 });
 
-export default r;
+// Простая агрегированная сводка
+router.get('/summary', async (_req, res) => {
+  const [users, txs] = await Promise.all([
+    prisma.user.count(),
+    prisma.transaction.findMany({ select: { type: true, amount: true } })
+  ]);
+  const byType = txs.reduce((acc, t) => {
+    acc[t.type] = (acc[t.type] ?? 0) + t.amount;
+    return acc;
+  }, {});
+  res.json({ users, volumeByType: byType });
+});
+
+export default router;

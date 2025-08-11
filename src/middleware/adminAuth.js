@@ -1,18 +1,13 @@
-// src/middleware/adminAuth.js
-import jwt from 'jsonwebtoken';
+// Простая проверка секретного пароля администратора.
+// 1) Фича-флаг должен быть включён
+// 2) В заголовке X-Admin-Password должен прийти пароль, равный ADMIN_PASSWORD
+export default function adminAuth(req, res, next) {
+  const feature = (process.env.FEATURE_ADMIN || '').toLowerCase() === 'true';
+  if (!feature) return res.status(403).json({ error: 'Admin feature disabled' });
 
-export function signAdmin(payload) {
-  return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '12h' });
-}
-
-export function requireAdmin(req, res, next) {
-  try {
-    const h = req.headers.authorization || '';
-    const token = h.startsWith('Bearer ') ? h.slice(7) : null;
-    if (!token) return res.status(401).json({ error: 'no token' });
-    jwt.verify(token, process.env.JWT_SECRET);
-    return next();
-  } catch {
-    return res.status(401).json({ error: 'bad token' });
+  const header = req.get('X-Admin-Password');
+  if (!header || header !== process.env.ADMIN_PASSWORD) {
+    return res.status(401).json({ error: 'Unauthorized' });
   }
+  return next();
 }

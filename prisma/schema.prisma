@@ -1,36 +1,31 @@
-// prisma/schema.prisma
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "sqlite"
   url      = env("DATABASE_URL")
 }
 
 model User {
-  id         Int      @id @default(autoincrement()) @map("id")
-  vk_id      String   @unique                       @map("vk_id")
-  first_name String   @default("")                  @map("first_name")
-  last_name  String   @default("")                  @map("last_name")
-  avatar     String   @default("")                  @map("avatar")
-  balance    BigInt   @default(0)                   @map("balance")
-  created_at DateTime @default(now())               @map("created_at")
-  updated_at DateTime @default(now())               @map("updated_at")
-
-  @@map("users")
+  id           Int           @id @default(autoincrement())
+  vk_id        String        @unique
+  firstName    String
+  lastName     String
+  avatar       String
+  balance      Int           @default(0)
+  ref_by       String?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  transactions Transaction[]
 }
 
-model Event {
-  id         Int      @id @default(autoincrement()) @map("id")
-  user_id    Int?                                        @map("user_id")
-  event_type String                                       @map("event_type")
-  payload    Json?
-  ip         String?
-  ua         String?
-  created_at DateTime @default(now())                     @map("created_at")
-
-  @@index([user_id])
-  @@index([event_type])
-  @@map("events")
+model Transaction {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  type      String   // deposit, withdraw, win, lose, bonus
+  amount    Int
+  meta      String?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id])
 }
