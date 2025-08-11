@@ -27,6 +27,12 @@ app.get('/health', (_, res) => res.status(200).send('ok'));
 
 // Auth routes
 app.use('/api/auth', authRouter);
+// === Admin feature (optional) ===
+if ((process.env.FEATURE_ADMIN || '').toLowerCase() === 'true') {
+  const { default: adminRouter } = await import('./src/routes_admin.js');
+  app.use('/api/admin', adminRouter);
+}
+
 
 // Session info for frontend
 app.get('/api/me', async (req, res) => {
