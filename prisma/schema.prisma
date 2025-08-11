@@ -1,3 +1,4 @@
+// prisma/schema.prisma
 generator client {
   provider = "prisma-client-js"
 }
@@ -7,28 +8,27 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Отражаем существующие таблицы (имена и поля под вашу БД)
 model User {
   id         Int      @id @default(autoincrement()) @map("id")
-  vk_id      String   @unique @map("vk_id")
-  first_name String   @default("") @map("first_name")
-  last_name  String   @default("") @map("last_name")
-  avatar     String   @default("") @map("avatar")
-  balance    BigInt   @default(0)  @map("balance")
-  created_at DateTime @default(now()) @map("created_at")
-  updated_at DateTime @default(now()) @map("updated_at")
+  vk_id      String   @unique                       @map("vk_id")
+  first_name String   @default("")                  @map("first_name")
+  last_name  String   @default("")                  @map("last_name")
+  avatar     String   @default("")                  @map("avatar")
+  balance    BigInt   @default(0)                   @map("balance")
+  created_at DateTime @default(now())               @map("created_at")
+  updated_at DateTime @default(now())               @map("updated_at")
 
   @@map("users")
 }
 
 model Event {
-  id         Int       @id @default(autoincrement()) @map("id")
-  user_id    Int?      @map("user_id")
-  event_type String    @map("event_type")
+  id         Int      @id @default(autoincrement()) @map("id")
+  user_id    Int?                                        @map("user_id")
+  event_type String                                       @map("event_type")
   payload    Json?
   ip         String?
   ua         String?
-  created_at DateTime  @default(now()) @map("created_at")
+  created_at DateTime @default(now())                     @map("created_at")
 
   @@index([user_id])
   @@index([event_type])
