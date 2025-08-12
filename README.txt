@@ -1,22 +1,23 @@
-Админ-патч v3 (стабильный)
-Файлы:
-- server.js
-- src/middleware_admin.js
-- src/routes_admin.js
-- src/routes_health.js
+Полный патч backend (auth + admin + health)
 
-ENV на Render (Dashboard → Environment):
+- server.js — монтирует: /api/auth, /api/admin, /api/health
+- src/routes_auth.js — маршруты VK: GET /api/auth/vk/start и GET /api/auth/vk/callback (PKCE в HttpOnly куке)
+- src/routes_admin.js — summary/users/events
+- src/middleware_admin.js — проверка X-Admin-Password
+- src/routes_health.js — проверка окружения
+
+ENV (Render → Environment):
+FRONTEND_URL=https://sweet-twilight-63a9b6.netlify.app
 FEATURE_ADMIN=true
 ADMIN_PASSWORD=<пароль для админки>
-FRONTEND_URL=https://sweet-twilight-63a9b6.netlify.app
-JWT_SECRET=<если используется>
-DATABASE_URL=<если используется>
-VK_CLIENT_ID=...
-VK_CLIENT_SECRET=...
+JWT_SECRET=<длинная строка>
+COOKIE_SECRET=<длинная строка для подписывания временных кук>
+VK_CLIENT_ID=<из VK>
+VK_CLIENT_SECRET=<из VK>
 VK_REDIRECT_URI=https://vercel2pr.onrender.com/api/auth/vk/callback
-PORT=3001  # можно любой
+PORT=3001
 
-Проверка после деплоя:
-1) https://vercel2pr.onrender.com/api/health  → ok:true и флаги.
-2) curl https://vercel2pr.onrender.com/api/admin/summary -H "X-Admin-Password: <пароль>" → 200 JSON.
-3) В админке (на фронте): Backend=https://vercel2pr.onrender.com, Пароль=<тот же> → «Проверка».
+Тесты:
+1) /api/health — ok:true
+2) /api/auth/vk/start — открывает страницу VK
+3) /api/admin/summary — 200 JSON при заголовке X-Admin-Password

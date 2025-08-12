@@ -1,9 +1,10 @@
-// server.js — CORS + admin routes + health
+// server.js — mounts auth + admin + health
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import adminRouter from './src/routes_admin.js';
 import healthRouter from './src/routes_health.js';
+import authRouter from './src/routes_auth.js';
 
 const app = express();
 
@@ -12,7 +13,6 @@ app.use(express.json());
 
 const FRONT = process.env.FRONTEND_URL;
 
-// CORS: важны credentials и разрешение нашего заголовка
 app.use(cors({
   origin: [FRONT],
   credentials: true,
@@ -24,20 +24,13 @@ app.use(cors({
   ]
 }));
 
-// Health и версия
 app.use('/api/health', healthRouter);
-
-// Админ
+app.use('/api/auth', authRouter);
 if (process.env.FEATURE_ADMIN === 'true') {
   app.use('/api/admin', adminRouter);
-} else {
-  console.log('FEATURE_ADMIN is not true — admin routes disabled');
 }
 
-// здоровье
-app.get('/', (_req, res) => res.json({ ok:true, ts: Date.now() }));
+app.get('/', (_req,res)=>res.json({ok:true, ts:Date.now()}));
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log('API on', PORT, 'FRONT=', FRONT, 'FEATURE_ADMIN=', process.env.FEATURE_ADMIN);
-});
+app.listen(PORT, ()=>console.log('API on', PORT));
