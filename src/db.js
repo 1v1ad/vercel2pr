@@ -10,9 +10,14 @@ const ssl = (process.env.DATABASE_URL && process.env.DATABASE_URL.includes('sslm
 
 export const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl });
 
-export async function ensureTables() {
-  const client = await db.connect();
-  try {
+\1
+    await client.query(`ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS country_code text,
+  ADD COLUMN IF NOT EXISTS country_name text;`);
+
+await client.query(`ALTER TABLE events
+  ADD COLUMN IF NOT EXISTS country_code text;`);
+
     await client.query(`create table if not exists users (
       id serial primary key,
       vk_id varchar(64) unique not null,
@@ -71,9 +76,21 @@ export async function getUserById(id) {
   return rows[0] || null;
 }
 
-export async function logEvent({ user_id, event_type, payload, ip, ua }) {
+export async function logEvent({ user_id, event_type, payload, ip, ua, country_code }) {
   await db.query(
-    'insert into events (user_id, event_type, payload, ip, ua) values ($1,$2,$3,$4,$5)',
-    [user_id || null, event_type, payload || null, ip || null, ua || null]
+    'insert into events (user_id, event_type, payload, ip, ua, country_code) values ($1,$2,$3,$4,$5,$6)',
+    [user_id || null, event_type, payload || null, ip || null, ua || null, country_code || null]
+  );
+}
+
+
+export async function updateUserCountryIfNull(userId, { country_code, country_name }) {
+  if (!userId || !country_code) return;
+  await db.query(
+    `UPDATE users
+       SET country_code = COALESCE(country_code, $2),
+           country_name = COALESCE(country_name, $3)
+     WHERE id = $1`,
+    [userId, country_code, country_name || country_code]
   );
 }

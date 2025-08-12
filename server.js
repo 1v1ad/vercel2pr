@@ -3,7 +3,9 @@ import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
 
-import { ensureTables, getUserById, logEvent } from './src/db.js';
+import geoip from 'geoip-lite';
+
+import { ensureTables, getUserById, logEvent, updateUserCountryIfNull } from './src/db.js';
 import authRouter from './src/routes_auth.js';
 
 dotenv.config();
@@ -76,6 +78,14 @@ app.post('/api/events', async (req, res) => {
     const ip = ipHeader.split(',')[0].trim();
     let userId = null;
 
+    
+let country_code = null;
+try {
+  const hit = ip && geoip.lookup(ip);
+  if (hit && hit.country) country_code = hit.country;
+} catch {}
+
+
     const token = req.cookies['sid'];
     if (token) {
       try {
@@ -90,7 +100,12 @@ app.post('/api/events', async (req, res) => {
       payload: payload || null,
       ip,
       ua: (req.headers['user-agent'] || '').slice(0, 256),
+      country_code,
     });
+
+    if (userId && country_code) {
+      await updateUserCountryIfNull(userId, { country_code, country_name: country_code });
+    }
 
     res.json({ ok: true });
   } catch (e) {

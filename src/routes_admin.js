@@ -31,7 +31,7 @@ router.get('/users', async (req, res) => {
   }
 
   const users = await db.query(
-    `select id, vk_id, first_name, last_name, avatar, balance, created_at, updated_at
+    `select id, vk_id, first_name, last_name, avatar, balance, country_code, country_name, created_at, updated_at
      from users ${where}
      order by id desc
      limit ${take} offset ${skip}`, params
