@@ -60,7 +60,7 @@ app.get('/api/me', async (req, res) => {
         balance: user.balance ?? 0,
       },
     });
-  } catch (e) {
+  } catch {
     res.status(401).json({ ok: false });
   }
 });
@@ -104,9 +104,16 @@ app.get('/', (_, res) => res.send('VK Auth backend up'));
 
 const PORT = process.env.PORT || 3001;
 
-ensureTables().then(() => {
-  app.listen(PORT, () => console.log(`API on :${PORT}`));
-}).catch((e) => {
-  console.error('DB init failed', e);
-  process.exit(1);
-});
+// ── ВАЖНО: слушаем порт сразу, чтобы Render не «висел» на пробуждении
+app.listen(PORT, () => console.log(`API on :${PORT}`));
+
+// ── А инициализацию БД запускаем асинхронно, без блокировки старта
+(async () => {
+  try {
+    await ensureTables();
+    console.log('DB ready (ensureTables done)');
+  } catch (e) {
+    console.error('DB init error (non-fatal):', e);
+    // Не падаем процессом: сервис уже слушает порт, БД догрузится позже
+  }
+})();
