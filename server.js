@@ -13,11 +13,16 @@ const app = express();
 const FRONTEND_URL = process.env.FRONTEND_URL;
 
 app.use(cors({
-  origin: FRONTEND_URL,
+  origin: [
+    FRONTEND_URL,
+    'https://sweet-twilight-63a9b6.netlify.app',
+  ].filter(Boolean),
   credentials: true,
-  methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Password'],
+  maxAge: 86400,
 }));
+app.options('*', cors()); // preflight
 
 app.use(express.json());
 app.use(cookieParser());
@@ -27,22 +32,22 @@ app.get('/health', (_, res) => res.status(200).send('ok'));
 
 // Auth routes
 app.use('/api/auth', authRouter);
+
 // === Admin feature (optional) ===
 if ((process.env.FEATURE_ADMIN || '').toLowerCase() === 'true') {
   const { default: adminRouter } = await import('./src/routes_admin.js');
   app.use('/api/admin', adminRouter);
 }
 
-
 // Session info for frontend
 app.get('/api/me', async (req, res) => {
   try {
     const token = req.cookies['sid'];
-    if (!token) return res.status(401).json({ ok:false });
+    if (!token) return res.status(401).json({ ok: false });
 
     const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
     const user = await getUserById(payload.uid);
-    if (!user) return res.status(401).json({ ok:false });
+    if (!user) return res.status(401).json({ ok: false });
 
     res.json({
       ok: true,
@@ -52,11 +57,11 @@ app.get('/api/me', async (req, res) => {
         first_name: user.first_name,
         last_name: user.last_name,
         avatar: user.avatar,
-        balance: user.balance ?? 0
-      }
+        balance: user.balance ?? 0,
+      },
     });
   } catch (e) {
-    res.status(401).json({ ok:false });
+    res.status(401).json({ ok: false });
   }
 });
 
@@ -64,7 +69,7 @@ app.get('/api/me', async (req, res) => {
 app.post('/api/events', async (req, res) => {
   try {
     const { type, payload } = req.body || {};
-    if (!type) return res.status(400).json({ ok:false, error: 'type required' });
+    if (!type) return res.status(400).json({ ok: false, error: 'type required' });
 
     // First IP only (Render adds chain of proxies)
     const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
@@ -87,10 +92,10 @@ app.post('/api/events', async (req, res) => {
       ua: (req.headers['user-agent'] || '').slice(0, 256),
     });
 
-    res.json({ ok:true });
+    res.json({ ok: true });
   } catch (e) {
     console.error('events error', e);
-    res.status(500).json({ ok:false });
+    res.status(500).json({ ok: false });
   }
 });
 
