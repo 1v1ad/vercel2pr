@@ -78,13 +78,11 @@ app.post('/api/events', async (req, res) => {
     const ip = ipHeader.split(',')[0].trim();
     let userId = null;
 
-    
-let country_code = null;
-try {
-  const hit = ip && geoip.lookup(ip);
-  if (hit && hit.country) country_code = hit.country;
-} catch {}
-
+    let country_code = null;
+    try {
+      const hit = ip && geoip.lookup(ip);
+      if (hit && hit.country) country_code = hit.country;
+    } catch {}
 
     const token = req.cookies['sid'];
     if (token) {

@@ -10,7 +10,9 @@ const ssl = (process.env.DATABASE_URL && process.env.DATABASE_URL.includes('sslm
 
 export const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl });
 
-\1
+export async function ensureTables() {
+  const client = await db.connect();
+  try {
     await client.query(`ALTER TABLE users
   ADD COLUMN IF NOT EXISTS country_code text,
   ADD COLUMN IF NOT EXISTS country_name text;`);
