@@ -1,18 +1,20 @@
-// server.js — mounts auth + admin + health
+// server.js — GGRoom backend (Auth + Admin + Health)
+// Node 18+
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
-import adminRouter from './src/routes_admin.js';
-import healthRouter from './src/routes_health.js';
-import authRouter from './src/routes_auth.js';
+
+import authRouter from './src/routes/auth.js';
+import adminRouter from './src/routes/admin.js';
+import healthRouter from './src/routes/health.js';
 
 const app = express();
+const FRONT = process.env.FRONTEND_URL;
 
 app.use(cookieParser());
 app.use(express.json());
 
-const FRONT = process.env.FRONTEND_URL;
-
+// CORS
 app.use(cors({
   origin: [FRONT],
   credentials: true,
@@ -24,13 +26,19 @@ app.use(cors({
   ]
 }));
 
+// Routes
 app.use('/api/health', healthRouter);
 app.use('/api/auth', authRouter);
 if (process.env.FEATURE_ADMIN === 'true') {
   app.use('/api/admin', adminRouter);
+} else {
+  console.log('FEATURE_ADMIN is not true — admin routes disabled');
 }
 
-app.get('/', (_req,res)=>res.json({ok:true, ts:Date.now()}));
+// Ping
+app.get('/', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, ()=>console.log('API on', PORT));
+app.listen(PORT, () => {
+  console.log('API on', PORT, 'FRONT=', FRONT, 'FEATURE_ADMIN=', process.env.FEATURE_ADMIN);
+});
