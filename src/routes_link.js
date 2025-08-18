@@ -105,7 +105,15 @@ router.post('/auth/tg', async (req, res) => {
       );
       account = aIns.rows[0];
 
-      return res.json({ ok:true, token: jwt.sign({ uid:user.id }, JWT_SECRET, { expiresIn:'30d' }), user, mergeNeeded:false });
+      const __token_new = jwt.sign({ uid:user.id }, JWT_SECRET, { expiresIn:'30d' });
+res.cookie('sid', __token_new, {
+  httpOnly: true,
+  secure: true,
+  sameSite: 'None',
+  path: '/',
+  maxAge: 30*24*60*60*1000
+});
+return res.json({ ok:true, token: __token_new, user, mergeNeeded:false });
     }
 
     // Existing TG account
@@ -136,7 +144,15 @@ router.post('/auth/tg', async (req, res) => {
     }
 
     if (!needMerge) {
-      return res.json({ ok:true, token: jwt.sign({ uid: tgUser.id }, JWT_SECRET, { expiresIn:'30d' }), user: tgUser, mergeNeeded:false });
+      const __token_go = jwt.sign({ uid: tgUser.id }, JWT_SECRET, { expiresIn:'30d' });
+res.cookie('sid', __token_go, {
+  httpOnly: true,
+  secure: true,
+  sameSite: 'None',
+  path: '/',
+  maxAge: 30*24*60*60*1000
+});
+return res.json({ ok:true, token: __token_go, user: tgUser, mergeNeeded:false });
     }
 
     // Soft-merge handshake
