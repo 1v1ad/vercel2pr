@@ -50,7 +50,42 @@ await client.query(`ALTER TABLE events
       ua text,
       created_at timestamp default now()
     );`);
-  } finally {
+  
+
+// --- Linking tables ---
+await client.query(`create table if not exists auth_accounts (
+  id serial primary key,
+  user_id integer references users(id) on delete cascade,
+  provider varchar(16) not null,
+  provider_user_id varchar(128) not null,
+  username text,
+  phone_hash text,
+  meta jsonb,
+  created_at timestamp default now(),
+  updated_at timestamp default now(),
+  unique(provider, provider_user_id)
+);`);
+await client.query('create index if not exists idx_auth_accounts_phone_hash on auth_accounts(phone_hash)');
+await client.query(`create table if not exists link_codes (
+  id serial primary key,
+  user_id integer references users(id) on delete cascade,
+  code varchar(16) unique not null,
+  expires_at timestamp not null,
+  used_at timestamp,
+  created_at timestamp default now()
+);`);
+await client.query(`create table if not exists link_audit (
+  id serial primary key,
+  primary_id integer,
+  merged_id integer,
+  method varchar(32),
+  source varchar(32),
+  ip text,
+  ua text,
+  details jsonb,
+  created_at timestamp default now()
+);`);
+} finally {
     client.release();
   }
 }

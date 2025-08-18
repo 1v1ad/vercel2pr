@@ -7,6 +7,7 @@ import geoip from 'geoip-lite';
 
 import { ensureTables, getUserById, logEvent, updateUserCountryIfNull } from './src/db.js';
 import authRouter from './src/routes_auth.js';
+import linkRouter from './src/routes_link.js';
 
 dotenv.config();
 
@@ -33,6 +34,7 @@ app.use(cookieParser());
 app.get('/health', (_, res) => res.status(200).send('ok'));
 
 // Auth routes
+app.use('/api', linkRouter);
 app.use('/api/auth', authRouter);
 
 // === Admin feature (optional) ===
