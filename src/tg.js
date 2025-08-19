@@ -1,18 +1,27 @@
+// Вспомогательная функция проверки подписи Telegram (ESM)
 import crypto from 'crypto';
 
-/** Verify Telegram Login Widget payload.
- * @param {Object} data - widget payload incl. `hash`
- * @param {string} botToken
- * @returns {boolean}
+/**
+ * verifyTelegramLogin(data, botToken)
+ * data — объект из query (или body) от Telegram Login Widget
+ * botToken — токен бота от BotFather (тот же, что в @GGR00m_bot)
  */
 export function verifyTelegramLogin(data, botToken) {
-  const { hash, ...rest } = data || {};
-  if (!hash) return false;
-  const pairs = Object.entries(rest)
-    .sort(([a],[b]) => a.localeCompare(b))
-    .map(([k,v]) => `${k}=${v}`);
-  const dataCheckString = pairs.join('\n');
-  const secretKey = crypto.createHash('sha256').update(botToken).digest(); // Buffer
-  const hmac = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+  if (!data || !data.hash) return false;
+
+  const { hash, ...rest } = data;
+
+  // Строка проверки в алфавитном порядке по ключам
+  const checkString = Object.keys(rest)
+    .sort()
+    .map((k) => `${k}=${rest[k]}`)
+    .join('\n');
+
+  // secret = SHA256(botToken)
+  const secret = crypto.createHash('sha256').update(botToken).digest();
+
+  // Подпись по алгоритму HMAC-SHA256(secret, checkString)
+  const hmac = crypto.createHmac('sha256', secret).update(checkString).digest('hex');
+
   return hmac === hash;
 }
