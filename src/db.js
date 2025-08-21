@@ -30,7 +30,9 @@ await client.query(`ALTER TABLE events
       ref_by varchar(64),
       created_at timestamp default now(),
       updated_at timestamp default now()
-    );`);
+    );
+  await client.query(`alter table if exists users alter column vk_id drop not null;`).catch(()=>{});
+`);
 
     await client.query(`create table if not exists transactions (
       id serial primary key,
@@ -120,6 +122,22 @@ export async function logEvent({ user_id, event_type, payload, ip, ua, country_c
   );
 }
 
+
+
+
+export async function ensureAuthAccount({ user_id, provider, provider_user_id, username=null, meta=null }) {
+  if (!user_id || !provider || !provider_user_id) return;
+  await db.query(
+    `insert into auth_accounts (user_id, provider, provider_user_id, username, meta)
+     values ($1,$2,$3,$4,$5)
+     on conflict (provider, provider_user_id) do update set
+       user_id = excluded.user_id,
+       username = coalesce(excluded.username, auth_accounts.username),
+       meta = coalesce(excluded.meta, auth_accounts.meta),
+       updated_at = now()`,
+    [user_id, provider, String(provider_user_id), username, meta]
+  );
+}
 
 export async function updateUserCountryIfNull(userId, { country_code, country_name }) {
   if (!userId || !country_code) return;

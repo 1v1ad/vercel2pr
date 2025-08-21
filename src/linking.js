@@ -7,13 +7,13 @@ import { normalizePhoneE164, phoneHash as makePhoneHash } from './phone.js';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
 const PHONE_SALT = process.env.PHONE_SALT || '';
 
-// Helper: get userId from cookie 'session'
+// Extract user id from cookie 'sid' (JWT)
 export function requireUserId(req) {
-  const token = req.cookies?.session || '';
+  const token = req.cookies?.sid || '';
   if (!token) throw Object.assign(new Error('no_session'), { status: 401 });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const uid = payload && (payload.userId || payload.id || payload.uid);
+    const uid = payload && (payload.uid || payload.userId || payload.id);
     if (!uid) throw new Error('bad_payload');
     return Number(uid);
   } catch (e) {
@@ -88,7 +88,7 @@ export async function mergeUsers(primaryId, mergedId, details = {}) {
   }
 }
 
-// Try to auto-merge by phone hash: update phone_hash for all accounts of user, then find other user_ids with same hash
+// Try to auto-merge by phone hash: set phone_hash for this user's auth_accounts; merge all users with same hash
 export async function setPhoneAndAutoMerge(userId, rawPhone, meta = {}) {
   const e164 = normalizePhoneE164(rawPhone);
   if (!e164) throw Object.assign(new Error('bad_phone'), { status: 400 });
@@ -98,17 +98,23 @@ export async function setPhoneAndAutoMerge(userId, rawPhone, meta = {}) {
   try {
     await client.query('begin');
 
-    // Set hash for all auth_accounts of this user (if some have it already — ok)
+    // Ensure there is at least one auth_account row for this user (vk or tg) — if not, create a stub vk row with provider_user_id='local'
+    const existing = await client.query('select id from auth_accounts where user_id = $1 limit 1', [userId]);
+    if (existing.rows.length === 0) {
+      await client.query(`insert into auth_accounts (user_id, provider, provider_user_id, username, meta) values ($1,'local','local',$2,$3)`, [userId, null, null]);
+    }
+
+    // Set hash
     await client.query(`update auth_accounts set phone_hash = $2, updated_at = now() where user_id = $1`, [userId, hash]);
 
     // Find another user with same hash (prioritize oldest user as primary)
     const { rows } = await client.query(
-      `select aa.user_id, u.created_at
+      `select aa.user_id, min(u.created_at) as created_at
          from auth_accounts aa
          join users u on u.id = aa.user_id
         where aa.phone_hash = $1
-        group by aa.user_id, u.created_at
-        order by u.created_at asc
+        group by aa.user_id
+        order by created_at asc
       `,
       [hash]
     );
@@ -117,12 +123,11 @@ export async function setPhoneAndAutoMerge(userId, rawPhone, meta = {}) {
       const primaryId = distinctUserIds[0];
       const others = distinctUserIds.slice(1);
       for (const mid of others) {
-        const primary = primaryId, merged = mid;
-        if (primary === merged) continue;
-        await mergeUsers(primary, merged, { method: 'phone-match', source: 'api/link/phone', ...meta });
+        if (primaryId === mid) continue;
+        await mergeUsers(primaryId, mid, { method: 'phone-match', source: 'api/link/phone', ...meta });
       }
       await client.query('commit');
-      return { ok: true, merged: true, primary_id: distinctUserIds[0], merged_count: distinctUserIds.length - 1 };
+      return { ok: true, merged: true, primary_id: primaryId, merged_count: distinctUserIds.length - 1 };
     }
 
     await client.query('commit');
@@ -157,7 +162,6 @@ export async function claimCodeAndMerge(claimantUserId, code, meta = {}) {
       return { ok: true, noop: true };
     }
 
-    // Decide primary (older account wins)
     const older = await client.query(`select id from users where id = any($1::int[]) order by created_at asc`, [[ownerId, claimantUserId]]);
     const primaryId = Number(older.rows[0].id);
     const mergedId = (primaryId === ownerId) ? claimantUserId : ownerId;

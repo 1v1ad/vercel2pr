@@ -3,7 +3,7 @@ import axios from 'axios';
 import crypto from 'crypto';
 import { createCodeVerifier, createCodeChallenge } from './pkce.js';
 import { signSession } from './jwt.js';
-import { upsertUser, logEvent } from './db.js';
+import { upsertUser, logEvent, ensureAuthAccount } from './db.js';
 
 const router = express.Router();
 
@@ -124,6 +124,7 @@ router.get('/vk/callback', async (req, res) => {
 
     const vk_id = String(tokenData?.user_id || tokenData?.user?.id || 'unknown');
     const user = await upsertUser({ vk_id, first_name, last_name, avatar });
+    await ensureAuthAccount({ user_id: user.id, provider: 'vk', provider_user_id: vk_id, username: null, meta: { first_name, last_name, avatar } });
 
     await logEvent({ user_id:user.id, event_type:'auth_success', payload:{ vk_id }, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
