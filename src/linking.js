@@ -1,0 +1,175 @@
+// src/linking.js
+import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
+import { db } from './db.js';
+import { normalizePhoneE164, phoneHash as makePhoneHash } from './phone.js';
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
+const PHONE_SALT = process.env.PHONE_SALT || '';
+
+// Helper: get userId from cookie 'session'
+export function requireUserId(req) {
+  const token = req.cookies?.session || '';
+  if (!token) throw Object.assign(new Error('no_session'), { status: 401 });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    const uid = payload && (payload.userId || payload.id || payload.uid);
+    if (!uid) throw new Error('bad_payload');
+    return Number(uid);
+  } catch (e) {
+    throw Object.assign(new Error('bad_session'), { status: 401 });
+  }
+}
+
+// Generate unique code like LINK-AB12 (4 base36 chars), ttl minutes
+export async function generateLinkCode(userId, ttlMinutes = 15) {
+  const client = await db.connect();
+  try {
+    const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000);
+    let code = '';
+    for (let i = 0; i < 5; i++) {
+      code = 'LINK-' + crypto.randomBytes(3).toString('base64').replace(/[^A-Za-z0-9]/g,'').slice(0,4).toUpperCase();
+      const { rows } = await client.query('select id from link_codes where code = $1 and used_at is null and expires_at > now()', [code]);
+      if (rows.length === 0) break;
+      code = '';
+    }
+    if (!code) throw new Error('cannot_generate_code');
+    await client.query(
+      `insert into link_codes (user_id, code, expires_at) values ($1, $2, $3)`,
+      [userId, code, expiresAt]
+    );
+    return { code, expires_at: expiresAt.toISOString() };
+  } finally {
+    client.release();
+  }
+}
+
+// Merge accounts: move transactions & auth_accounts; sum balance; delete merged user
+export async function mergeUsers(primaryId, mergedId, details = {}) {
+  if (primaryId === mergedId) return { ok: true, noop: true };
+  const client = await db.connect();
+  try {
+    await client.query('begin');
+    // Sum balances
+    const balRes = await client.query('select id, balance from users where id = any($1::int[]) order by created_at asc', [[primaryId, mergedId]]);
+    const balances = Object.fromEntries(balRes.rows.map(r => [r.id, Number(r.balance||0)]));
+    const newBalance = (balances[primaryId]||0) + (balances[mergedId]||0);
+
+    // Move rows
+    await client.query('update transactions set user_id = $1 where user_id = $2', [primaryId, mergedId]);
+    await client.query('update auth_accounts set user_id = $1 where user_id = $2', [primaryId, mergedId]);
+
+    // Apply balance & delete merged user
+    await client.query('update users set balance = $2 where id = $1', [primaryId, newBalance]);
+    await client.query('delete from users where id = $1', [mergedId]);
+
+    // Audit
+    await client.query(
+      `insert into link_audit (primary_id, merged_id, method, source, ip, ua, details)
+       values ($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        primaryId,
+        mergedId,
+        details.method || 'unknown',
+        details.source || 'api',
+        (details.ip || '').slice(0, 128),
+        (details.ua || '').slice(0, 256),
+        details
+      ]
+    );
+
+    await client.query('commit');
+    return { ok: true, primary_id: primaryId, merged_id: mergedId, balance: newBalance };
+  } catch (e) {
+    await client.query('rollback');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// Try to auto-merge by phone hash: update phone_hash for all accounts of user, then find other user_ids with same hash
+export async function setPhoneAndAutoMerge(userId, rawPhone, meta = {}) {
+  const e164 = normalizePhoneE164(rawPhone);
+  if (!e164) throw Object.assign(new Error('bad_phone'), { status: 400 });
+  const hash = makePhoneHash(e164, PHONE_SALT);
+
+  const client = await db.connect();
+  try {
+    await client.query('begin');
+
+    // Set hash for all auth_accounts of this user (if some have it already — ok)
+    await client.query(`update auth_accounts set phone_hash = $2, updated_at = now() where user_id = $1`, [userId, hash]);
+
+    // Find another user with same hash (prioritize oldest user as primary)
+    const { rows } = await client.query(
+      `select aa.user_id, u.created_at
+         from auth_accounts aa
+         join users u on u.id = aa.user_id
+        where aa.phone_hash = $1
+        group by aa.user_id, u.created_at
+        order by u.created_at asc
+      `,
+      [hash]
+    );
+    const distinctUserIds = [...new Set(rows.map(r => Number(r.user_id)))];
+    if (distinctUserIds.length >= 2) {
+      const primaryId = distinctUserIds[0];
+      const others = distinctUserIds.slice(1);
+      for (const mid of others) {
+        const primary = primaryId, merged = mid;
+        if (primary === merged) continue;
+        await mergeUsers(primary, merged, { method: 'phone-match', source: 'api/link/phone', ...meta });
+      }
+      await client.query('commit');
+      return { ok: true, merged: true, primary_id: distinctUserIds[0], merged_count: distinctUserIds.length - 1 };
+    }
+
+    await client.query('commit');
+    return { ok: true, merged: false };
+  } catch (e) {
+    await client.query('rollback');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// Claim code: choose oldest user as primary
+export async function claimCodeAndMerge(claimantUserId, code, meta = {}) {
+  const client = await db.connect();
+  try {
+    await client.query('begin');
+    const { rows } = await client.query(
+      `select * from link_codes where code = $1 and used_at is null and expires_at > now() for update`,
+      [code]
+    );
+    if (rows.length === 0) {
+      await client.query('rollback');
+      return { ok: false, error: 'invalid_or_expired' };
+    }
+    const rec = rows[0];
+    const ownerId = Number(rec.user_id);
+
+    if (ownerId === claimantUserId) {
+      await client.query('update link_codes set used_at = now() where id = $1', [rec.id]);
+      await client.query('commit');
+      return { ok: true, noop: true };
+    }
+
+    // Decide primary (older account wins)
+    const older = await client.query(`select id from users where id = any($1::int[]) order by created_at asc`, [[ownerId, claimantUserId]]);
+    const primaryId = Number(older.rows[0].id);
+    const mergedId = (primaryId === ownerId) ? claimantUserId : ownerId;
+
+    await mergeUsers(primaryId, mergedId, { method: 'code-link', source: 'api/link/code/claim', ...meta });
+    await client.query('update link_codes set used_at = now() where id = $1', [rec.id]);
+    await client.query('commit');
+    return { ok: true, primary_id: primaryId, merged_id: mergedId };
+  } catch (e) {
+    await client.query('rollback');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
