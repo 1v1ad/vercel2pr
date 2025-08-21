@@ -7,7 +7,7 @@ const router = Router();
 
 router.all('/callback', async (req, res) => {
   try {
-    const data = (req.method === 'GET') ? req.query : req.body;
+    const data = req.method === 'GET' ? req.query : req.body;
     const botToken = process.env.TELEGRAM_BOT_TOKEN;
     const frontendUrl = process.env.FRONTEND_URL;
 
@@ -15,24 +15,32 @@ router.all('/callback', async (req, res) => {
       return res.status(400).send('invalid tg login');
     }
 
-    // Extract profile
     const tg_id = String(data.id);
     const first_name = String(data.first_name || '');
     const last_name = String(data.last_name || '');
     const username = String(data.username || '');
     const avatar = String(data.photo_url || '');
 
-    // We allow user without vk_id now; upsertUser still expects vk_id, so we insert a 'shell' user via auth_accounts:
-    // Use upsertUser with vk_id='tg:<id>' to reuse function (vk_id unique, but it can store arbitrary string)
+    // Для единообразия используем vk_id='tg:<id>' (уникально и not null)
     const vk_id = `tg:${tg_id}`;
     const user = await upsertUser({ vk_id, first_name, last_name, avatar });
 
-    // Ensure auth_accounts row
-    await ensureAuthAccount({ user_id: user.id, provider: 'tg', provider_user_id: tg_id, username, meta: { first_name, last_name, avatar } });
+    await ensureAuthAccount({
+      user_id: user.id,
+      provider: 'tg',
+      provider_user_id: tg_id,
+      username,
+      meta: { first_name, last_name, avatar }
+    });
 
-    await logEvent({ user_id: user.id, event_type: 'tg_auth', payload: { tg_id, username }, source_ip: req.ip, ua: (req.headers['user-agent']||'').slice(0,256) });
+    await logEvent({
+      user_id: user.id,
+      event_type: 'tg_auth',
+      payload: { tg_id, username },
+      ip: req.ip,
+      ua: (req.headers['user-agent'] || '').slice(0, 256)
+    });
 
-    // Issue session cookie
     const sessionJwt = signSession({ uid: user.id, tg_id });
     res.cookie('sid', sessionJwt, {
       httpOnly: true,
