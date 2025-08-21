@@ -2,11 +2,14 @@
 import express from 'express';
 import axios from 'axios';
 import crypto from 'crypto';
+import jwt from 'jsonwebtoken';
 import { createCodeVerifier, createCodeChallenge } from './pkce.js';
 import { signSession } from './jwt.js';
-import { upsertUser, logEvent, ensureAuthAccount } from './db.js';
+import { upsertUser, logEvent, ensureAuthAccount, getUserById } from './db.js';
+import { mergeUsers } from './linking.js';
 
 const router = express.Router();
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
 
 function getenv() {
   const env = process.env;
@@ -25,7 +28,6 @@ function firstIp(req) {
   return ipHeader.split(',')[0].trim();
 }
 
-/** VK: начало — ставим state + code_verifier в httpOnly куки и редиректим на VK ID */
 router.get('/vk/start', async (req, res) => {
   try {
     const { clientId, redirectUri } = getenv();
@@ -33,20 +35,10 @@ router.get('/vk/start', async (req, res) => {
     const codeVerifier  = createCodeVerifier();
     const codeChallenge = createCodeChallenge(codeVerifier);
 
-    res.cookie('vk_state', state, {
-      httpOnly: true, sameSite: 'lax', secure: true, path: '/', maxAge: 10 * 60 * 1000
-    });
-    res.cookie('vk_code_verifier', codeVerifier, {
-      httpOnly: true, sameSite: 'lax', secure: true, path: '/', maxAge: 10 * 60 * 1000
-    });
+    res.cookie('vk_state', state,            { httpOnly:true, sameSite:'lax',  secure:true, path:'/', maxAge: 10*60*1000 });
+    res.cookie('vk_code_verifier', codeVerifier, { httpOnly:true, sameSite:'lax',  secure:true, path:'/', maxAge: 10*60*1000 });
 
-    await logEvent({
-      user_id: null,
-      event_type: 'auth_start',
-      payload: { provider: 'vk' },
-      ip: firstIp(req),
-      ua: (req.headers['user-agent'] || '').slice(0, 256)
-    });
+    await logEvent({ user_id:null, event_type:'auth_start', payload:{ provider:'vk' }, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
     const u = new URL('https://id.vk.com/authorize');
     u.searchParams.set('response_type', 'code');
@@ -56,7 +48,6 @@ router.get('/vk/start', async (req, res) => {
     u.searchParams.set('code_challenge', codeChallenge);
     u.searchParams.set('code_challenge_method', 'S256');
     u.searchParams.set('scope', 'vkid.personal_info');
-
     return res.redirect(u.toString());
   } catch (e) {
     console.error('vk/start error:', e?.message || e);
@@ -64,7 +55,6 @@ router.get('/vk/start', async (req, res) => {
   }
 });
 
-/** VK: коллбек — обмениваем code на токен, берём профиль, создаём юзера, выдаём sid */
 router.get('/vk/callback', async (req, res) => {
   const { code, state } = req.query;
   try {
@@ -74,12 +64,12 @@ router.get('/vk/callback', async (req, res) => {
       return res.status(400).send('Invalid state');
     }
 
-    res.clearCookie('vk_state', { path: '/' });
-    res.clearCookie('vk_code_verifier', { path: '/' });
+    res.clearCookie('vk_state', { path:'/' });
+    res.clearCookie('vk_code_verifier', { path:'/' });
 
     const { clientId, clientSecret, redirectUri, frontendUrl } = getenv();
 
-    // Обмен кода на токен (PKCE)
+    // 1) Token exchange
     let tokenData = null;
     try {
       const resp = await axios.post(
@@ -100,7 +90,7 @@ router.get('/vk/callback', async (req, res) => {
       return res.status(400).send('Token exchange failed');
     }
 
-    // Профиль
+    // 2) Profile
     let first_name = '', last_name = '', avatar = '';
     try {
       const u = await axios.get('https://api.vk.com/method/users.get', {
@@ -108,44 +98,47 @@ router.get('/vk/callback', async (req, res) => {
         timeout: 10000
       });
       const r = u.data?.response?.[0];
-      if (r) {
-        first_name = r.first_name || '';
-        last_name  = r.last_name  || '';
-        avatar     = r.photo_200  || '';
-      }
+      if (r) { first_name = r.first_name || ''; last_name = r.last_name || ''; avatar = r.photo_200 || ''; }
     } catch {}
 
     const vk_id = String(tokenData?.user_id || tokenData?.user?.id || 'unknown');
 
-    // Пользователь + связка VK в auth_accounts
-    const user = await upsertUser({ vk_id, first_name, last_name, avatar });
-    await ensureAuthAccount({
-      user_id: user.id,
-      provider: 'vk',
-      provider_user_id: vk_id,
-      username: null,
-      meta: { first_name, last_name, avatar }
-    });
+    // 3) Upsert + привязка VK к auth_accounts
+    let user = await upsertUser({ vk_id, first_name, last_name, avatar });
+    await ensureAuthAccount({ user_id: user.id, provider: 'vk', provider_user_id: vk_id, username: null, meta: { first_name, last_name, avatar } });
 
-    await logEvent({
-      user_id: user.id,
-      event_type: 'auth_success',
-      payload: { provider: 'vk' },
-      ip: firstIp(req),
-      ua: (req.headers['user-agent'] || '').slice(0, 256)
-    });
+    // 4) Если в КУКАХ уже был sid (например, от TG), и это ДРУГОЙ пользователь — склеиваем автоматически
+    const priorSid = req.cookies?.sid;
+    if (priorSid) {
+      try {
+        const payload = jwt.verify(priorSid, JWT_SECRET);
+        const priorUid = Number(payload?.uid);
+        if (priorUid && priorUid !== user.id) {
+          // Определяем «старшего» по дате создания
+          const older = await Promise.all([getUserById(priorUid), getUserById(user.id)]);
+          const [a,b] = older;
+          const [primaryId, mergedId] =
+            (new Date(a.created_at) <= new Date(b.created_at)) ? [a.id, b.id] : [b.id, a.id];
 
-    // Серверная сессия
+          await mergeUsers(primaryId, mergedId, {
+            method: 'auto-merge',
+            source: '/api/auth/vk/callback',
+            ip: firstIp(req),
+            ua: (req.headers['user-agent']||'').slice(0,256)
+          });
+
+          // после merge используем sid старшего
+          user = await getUserById(primaryId);
+        }
+      } catch { /* старый sid невалиден — игнорируем */ }
+    }
+
+    await logEvent({ user_id:user.id, event_type:'auth_success', payload:{ provider:'vk' }, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
+
+    // 5) Ставим свежий sid старшего
     const sessionJwt = signSession({ uid: user.id, vk_id: user.vk_id });
-    res.cookie('sid', sessionJwt, {
-      httpOnly: true,
-      sameSite: 'none',
-      secure: true,
-      path: '/',
-      maxAge: 30 * 24 * 3600 * 1000
-    });
+    res.cookie('sid', sessionJwt, { httpOnly:true, sameSite:'none', secure:true, path:'/', maxAge: 30*24*3600*1000 });
 
-    // Назад на фронт
     const url = new URL(frontendUrl);
     url.searchParams.set('logged', '1');
     return res.redirect(url.toString());
