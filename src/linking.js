@@ -16,31 +16,35 @@ export function requireUserId(req) {
     const uid = payload && (payload.uid || payload.userId || payload.id);
     if (!uid) throw new Error('bad_payload');
     return Number(uid);
-  } catch (e) {
+  } catch {
     throw Object.assign(new Error('bad_session'), { status: 401 });
   }
 }
 
-/** Генерим код вида LINK-AB12, TTL по умолчанию 15 минут. */
+/** Генерим код вида LINK-XXXX (4 символа, безопасный алфавит), TTL 15 мин. */
 export async function generateLinkCode(userId, ttlMinutes = 15) {
   const client = await db.connect();
   try {
     const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000);
-    let code = '';
-    for (let i = 0; i < 5; i++) {
-      code = 'LINK-' + crypto
-        .randomBytes(3)
-        .toString('base64')
-        .replace(/[^A-Za-z0-9]/g, '')
-        .slice(0, 4)
-        .toUpperCase();
 
+    // Алфавит без 0/O/1/I
+    const ABC = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const makeBody = (len = 4) => {
+      let s = '';
+      for (let i = 0; i < len; i++) {
+        s += ABC[crypto.randomInt(0, ABC.length)];
+      }
+      return s;
+    };
+
+    let code = '';
+    for (let tries = 0; tries < 20; tries++) {
+      const candidate = `LINK-${makeBody(4)}`;
       const { rows } = await client.query(
-        'select id from link_codes where code = $1 and used_at is null and expires_at > now()',
-        [code]
+        `select id from link_codes where code = $1 and used_at is null and expires_at > now()`,
+        [candidate]
       );
-      if (rows.length === 0) break;
-      code = '';
+      if (rows.length === 0) { code = candidate; break; }
     }
     if (!code) throw new Error('cannot_generate_code');
 
@@ -55,13 +59,14 @@ export async function generateLinkCode(userId, ttlMinutes = 15) {
   }
 }
 
-/** Сшивка: переносим transactions и auth_accounts, суммируем баланс, младшего удаляем, пишем аудит. */
+/** Слияние: переносим всё к primary, младшего удаляем, логируем. */
 export async function mergeUsers(primaryId, mergedId, details = {}) {
   if (primaryId === mergedId) return { ok: true, noop: true };
   const client = await db.connect();
   try {
     await client.query('begin');
 
+    // Баланс
     const balRes = await client.query(
       'select id, balance from users where id = any($1::int[]) order by created_at asc',
       [[primaryId, mergedId]]
@@ -69,12 +74,17 @@ export async function mergeUsers(primaryId, mergedId, details = {}) {
     const balances = Object.fromEntries(balRes.rows.map(r => [r.id, Number(r.balance || 0)]));
     const newBalance = (balances[primaryId] || 0) + (balances[mergedId] || 0);
 
+    // Переносим все связанные сущности
     await client.query('update transactions set user_id = $1 where user_id = $2', [primaryId, mergedId]);
     await client.query('update auth_accounts set user_id = $1 where user_id = $2', [primaryId, mergedId]);
+    await client.query('update events set user_id = $1 where user_id = $2', [primaryId, mergedId]);
+    await client.query('update link_codes set user_id = $1 where user_id = $2', [primaryId, mergedId]);
 
+    // Применяем баланс и удаляем младшего
     await client.query('update users set balance = $2 where id = $1', [primaryId, newBalance]);
     await client.query('delete from users where id = $1', [mergedId]);
 
+    // Аудит
     await client.query(
       `insert into link_audit (primary_id, merged_id, method, source, ip, ua, details)
        values ($1,$2,$3,$4,$5,$6,$7)`,
@@ -109,7 +119,7 @@ export async function setPhoneAndAutoMerge(userId, rawPhone, meta = {}) {
   try {
     await client.query('begin');
 
-    // На всякий: если у юзера нет строки в auth_accounts — создадим локальную-заглушку.
+    // На всякий случай: если у юзера нет строки в auth_accounts — создадим заглушку.
     const ex = await client.query('select id from auth_accounts where user_id = $1 limit 1', [userId]);
     if (ex.rows.length === 0) {
       await client.query(
@@ -134,16 +144,16 @@ export async function setPhoneAndAutoMerge(userId, rawPhone, meta = {}) {
       [hash]
     );
 
-    const distinctUserIds = [...new Set(rows.map(r => Number(r.user_id)))];
-    if (distinctUserIds.length >= 2) {
-      const primaryId = distinctUserIds[0];
-      const others = distinctUserIds.slice(1);
-      for (const mid of others) {
-        if (primaryId === mid) continue;
-        await mergeUsers(primaryId, mid, { method: 'phone-match', source: 'api/link/phone', ...meta });
+    const ids = [...new Set(rows.map(r => Number(r.user_id)))];
+    if (ids.length >= 2) {
+      const primaryId = ids[0];
+      for (const mid of ids.slice(1)) {
+        if (primaryId !== mid) {
+          await mergeUsers(primaryId, mid, { method: 'phone-match', source: 'api/link/phone', ...meta });
+        }
       }
       await client.query('commit');
-      return { ok: true, merged: true, primary_id: primaryId, merged_count: distinctUserIds.length - 1 };
+      return { ok: true, merged: true, primary_id: primaryId, merged_count: ids.length - 1 };
     }
 
     await client.query('commit');
@@ -156,7 +166,7 @@ export async function setPhoneAndAutoMerge(userId, rawPhone, meta = {}) {
   }
 }
 
-/** Применить LINK-XXXX: выбираем старшего по дате создания, младшего вливаем. */
+/** Применить LINK-XXXX: старший определяется по дате создания. */
 export async function claimCodeAndMerge(claimantUserId, code, meta = {}) {
   const client = await db.connect();
   try {
