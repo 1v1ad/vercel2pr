@@ -1,46 +1,69 @@
 import { Router } from 'express';
 import { verifyTelegramLogin } from './tg.js';
+import { upsertAndLink, logEvent } from './db.js';
+import { signSession } from './jwt.js';
 
 const router = Router();
 
+function getenv() {
+  const env = process.env;
+  return {
+    frontendUrl: env.FRONTEND_URL || env.CLIENT_URL,
+    deviceHeader: env.DEVICE_ID_HEADER || 'x-device-id',
+  };
+}
+
+function getFirstIp(req) {
+  return (req.headers['x-forwarded-for'] || req.ip || '').toString().split(',')[0].trim();
+}
+
 /**
- * Telegram Login Widget присылает данные user (обычно GET с query).
- * Отвечаем быстро: валидируем hash и сразу редиректим на фронт
- * с параметрами, чтобы лобби могло отрисовать профиль TG.
+ * Telegram Login Widget sends GET (or POST) with user data.
+ * We validate hash, upsert+link by device id, set session and redirect.
  */
-router.all('/callback', (req, res) => {
+router.all('/callback', async (req, res) => {
   const data = req.method === 'POST' ? req.body : req.query;
 
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   if (!botToken) return res.status(500).send('Missing TELEGRAM_BOT_TOKEN');
 
-  const ok = verifyTelegramLogin(data, botToken);
-  const fresh =
-    data?.auth_date && Number.isFinite(+data.auth_date)
-      ? Math.abs(Date.now() / 1000 - Number(data.auth_date)) < 86400
-      : true;
+  const isValid = verifyTelegramLogin(data, botToken);
+  if (!isValid) return res.status(400).send('invalid tg login payload');
 
-  if (!ok || !fresh) return res.status(401).send('Invalid Telegram auth');
+  const { frontendUrl, deviceHeader } = getenv();
+  const device_id = (req.query?.did || req.headers[deviceHeader] || '').toString().slice(0, 200) || null;
 
-  // Чистим возможную старую VK-куку, чтобы не перетёрла отображение
   try {
-    res.clearCookie('sid', { path: '/', httpOnly: true, secure: true, sameSite: 'none' });
-  } catch {}
+    const user = await upsertAndLink({
+      provider: 'tg',
+      provider_user_id: data.id,
+      username: data.username || null,
+      first_name: data.first_name || null,
+      last_name: data.last_name || null,
+      avatar_url: data.photo_url || null,
+      phone_hash: null,
+      device_id,
+    });
 
-  // Быстрый редирект на фронт с данными TG (без БД и без задержек)
-  const frontBase = (process.env.FRONTEND_URL || 'https://sweet-twilight-63a9b6.netlify.app').replace(/\/$/, '');
-  const url = new URL(frontBase + '/');
+    await logEvent({ user_id:user?.id, event_type:'auth_ok', payload:{ provider:'tg' }, ip:getFirstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
-  url.searchParams.set('logged', '1');
-  url.searchParams.set('provider', 'tg');
+    const session = signSession({ uid: user.id, prov: 'tg' });
+    res.cookie('sid', session, {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: true,
+      path: '/',
+      maxAge: 30 * 24 * 3600 * 1000
+    });
 
-  if (data.id) url.searchParams.set('id', String(data.id));
-  if (data.first_name) url.searchParams.set('first_name', String(data.first_name));
-  if (data.last_name) url.searchParams.set('last_name', String(data.last_name));
-  if (data.username) url.searchParams.set('username', String(data.username));
-  if (data.photo_url) url.searchParams.set('photo_url', String(data.photo_url));
-
-  return res.redirect(302, url.toString());
+    const url = new URL(frontendUrl);
+    url.searchParams.set('logged', '1');
+    url.searchParams.set('provider', 'tg');
+    return res.redirect(302, url.toString());
+  } catch (e) {
+    console.error('tg/callback error:', e?.response?.data || e?.message);
+    return res.status(500).send('tg callback failed');
+  }
 });
 
 export default router;
