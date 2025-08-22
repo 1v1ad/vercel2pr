@@ -3,9 +3,13 @@ import { db } from './db.js';
 
 const router = Router();
 
+function readAdminKey(req) {
+  // Accept both headers and optional ?key= for convenience
+  return req.headers['x-admin-key'] || req.headers['x-admin-password'] || req.query.key || '';
+}
 function auth(req) {
-  const key = req.headers['x-admin-key'] || '';
-  const expected = process.env.ADMIN_PASSWORD || '';
+  const key = String(readAdminKey(req));
+  const expected = String(process.env.ADMIN_PASSWORD || '');
   return expected && key === expected;
 }
 

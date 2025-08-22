@@ -33,7 +33,7 @@ router.get('/vk/start', async (req, res) => {
     const codeVerifier  = createCodeVerifier();
     const codeChallenge = createCodeChallenge(codeVerifier);
 
-    // Small, cookie-backed state; all data live in cookies
+    // Minimal state: just csrf; rest goes to cookies
     const state = csrf;
 
     const cookieOpts = { httpOnly: true, sameSite: 'none', secure: true, path: '/', maxAge: 10 * 60 * 1000 };
@@ -117,10 +117,10 @@ router.get('/vk/callback', async (req, res) => {
 
     await logEvent({ user_id:user?.id, event_type:'auth_ok', payload:{ provider:'vk' }, ip:getFirstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
-    const session = signSession({ uid: user.id, prov: 'vk' });
-    res.cookie('sid', session, {
+    // Session cookie for cross-site XHR: SameSite=None
+    res.cookie('sid', (await import('jsonwebtoken')).default.sign({ uid: user.id, prov: 'vk' }, process.env.JWT_SECRET || 'dev_secret_change_me', { algorithm: 'HS256', expiresIn: '30d' }), {
       httpOnly: true,
-      sameSite: 'lax',
+      sameSite: 'none',
       secure: true,
       path: '/',
       maxAge: 30 * 24 * 3600 * 1000,
@@ -130,8 +130,9 @@ router.get('/vk/callback', async (req, res) => {
     url.searchParams.set('logged', '1');
     return res.redirect(url.toString());
   } catch (e) {
-    console.error('vk/callback error:', e?.response?.data || e?.message);
-    return res.status(500).send('auth callback failed');
+    const msg = e?.response?.data ? JSON.stringify(e.response.data) : (e?.message || 'unknown');
+    console.error('vk/callback error:', msg);
+    return res.status(500).send('auth callback failed: ' + msg);
   }
 });
 

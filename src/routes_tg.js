@@ -44,10 +44,10 @@ router.all('/callback', async (req, res) => {
 
     await logEvent({ user_id:user?.id, event_type:'auth_ok', payload:{ provider:'tg' }, ip:getFirstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
-    const session = signSession({ uid: user.id, prov: 'tg' });
-    res.cookie('sid', session, {
+    // SameSite=None for cross-site XHR
+    res.cookie('sid', (await import('jsonwebtoken')).default.sign({ uid: user.id, prov: 'tg' }, process.env.JWT_SECRET || 'dev_secret_change_me', { algorithm: 'HS256', expiresIn: '30d' }), {
       httpOnly: true,
-      sameSite: 'lax',
+      sameSite: 'none',
       secure: true,
       path: '/',
       maxAge: 30 * 24 * 3600 * 1000,
