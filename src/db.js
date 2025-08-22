@@ -5,24 +5,23 @@ import crypto from 'crypto';
 dotenv.config();
 const { Pool } = pkg;
 
-// Neon: sslmode=require in connection string
+/* Подключение к Neon/Postgres */
 const ssl = (process.env.DATABASE_URL && process.env.DATABASE_URL.includes('sslmode=require'))
   ? { rejectUnauthorized: false }
   : false;
 
 export const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl });
 
-const COOKIE_SECRET = process.env.COOKIE_SECRET || 'dev_cookie_secret';
+const COOKIE_SECRET   = process.env.COOKIE_SECRET || 'dev_cookie_secret';
 const PHONE_HASH_SALT = process.env.PHONE_HASH_SALT || '';
 
-/* ──────────────────────────────────────────────────────────────
-   Helpers
-────────────────────────────────────────────────────────────── */
+/* ───────────────────────── Helpers ───────────────────────── */
 export function hashDeviceId(did) {
   if (!did) return null;
   return crypto.createHash('sha256').update(`${did}|${COOKIE_SECRET}`).digest('hex');
 }
 
+/* ─────────────────────── Schema bootstrap ─────────────────── */
 export async function ensureTables() {
   const client = await db.connect();
   try {
@@ -32,74 +31,78 @@ export async function ensureTables() {
     await client.query(`
       create table if not exists users (
         id serial primary key,
-        first_name text,
-        last_name text,
-        avatar_url text,
-        balance integer not null default 0,
+        first_name   text,
+        last_name    text,
+        avatar_url   text,
+        balance      integer not null default 0,
         country_code text,
         country_name text,
-        created_at timestamp default now(),
-        updated_at timestamp default now()
+        created_at   timestamp default now(),
+        updated_at   timestamp default now()
       );
     `);
     await client.query(`create index if not exists users_created_at_idx on users(created_at);`);
 
-    // events (for debug/analytics)
+    // На случай, если таблица уже была без колонок стран:
+    await client.query(`alter table users add column if not exists country_code text;`);
+    await client.query(`alter table users add column if not exists country_name text;`);
+
+    // events
     await client.query(`
       create table if not exists events (
         id serial primary key,
-        user_id integer references users(id) on delete set null,
-        event_type text not null,
-        payload jsonb,
-        ip text,
-        ua text,
+        user_id      integer references users(id) on delete set null,
+        event_type   text not null,
+        payload      jsonb,
+        ip           text,
+        ua           text,
         country_code text,
-        created_at timestamp default now()
+        created_at   timestamp default now()
       );
     `);
 
-    // auth_accounts: one user ↔ many provider accounts
+    // auth_accounts
     await client.query(`
       create table if not exists auth_accounts (
         id serial primary key,
-        user_id integer references users(id) on delete cascade,
-        provider varchar(16) not null,
+        user_id          integer references users(id) on delete cascade,
+        provider         varchar(16) not null,
         provider_user_id varchar(128) not null,
-        username text,
-        phone_hash text,
-        meta jsonb,
-        created_at timestamp default now(),
+        username         text,
+        phone_hash       text,
+        meta             jsonb,
+        created_at       timestamp default now(),
         unique(provider, provider_user_id)
       );
     `);
     await client.query(`create index if not exists auth_accounts_user_idx on auth_accounts(user_id);`);
     await client.query(`create index if not exists auth_accounts_phone_hash_idx on auth_accounts(phone_hash);`);
 
-    // device_links: one device id → one "primary" user
+    // device_links
     await client.query(`
       create table if not exists device_links (
         id serial primary key,
         device_id_hash text not null unique,
-        user_id integer references users(id) on delete cascade,
-        first_seen_at timestamp default now(),
-        last_seen_at timestamp default now(),
-        seen_count integer not null default 1
+        user_id        integer references users(id) on delete cascade,
+        first_seen_at  timestamp default now(),
+        last_seen_at   timestamp default now(),
+        seen_count     integer not null default 1
       );
     `);
 
-    // transactions (optional, if already exists we won't change it)
+    // transactions (на всякий)
     await client.query(`
       create table if not exists transactions (
         id serial primary key,
-        user_id integer references users(id) on delete cascade,
-        type text not null,        -- deposit, withdraw, win, lose, bonus
-        amount integer not null,
-        meta jsonb,
+        user_id   integer references users(id) on delete cascade,
+        type      text    not null,  -- deposit, withdraw, win, lose, bonus
+        amount    integer not null,
+        meta      jsonb,
         created_at timestamp default now()
       );
     `);
 
-    // update triggers
+    // updated_at триггер
     await client.query(`
       create or replace function set_updated_at()
       returns trigger as $$
@@ -111,9 +114,7 @@ export async function ensureTables() {
     `);
     await client.query(`
       do $$ begin
-        if not exists (
-          select 1 from pg_trigger where tgname = 'users_set_updated_at'
-        ) then
+        if not exists (select 1 from pg_trigger where tgname = 'users_set_updated_at') then
           create trigger users_set_updated_at
           before update on users
           for each row execute function set_updated_at();
@@ -130,6 +131,7 @@ export async function ensureTables() {
   }
 }
 
+/* ──────────────────────── Utilities ───────────────────────── */
 export async function logEvent({ user_id, event_type, payload, ip, ua, country_code }) {
   await db.query(
     `insert into events (user_id, event_type, payload, ip, ua, country_code)
@@ -145,10 +147,9 @@ export async function getUserById(id) {
 
 export async function findUserByAuth(provider, providerUserId) {
   const { rows } = await db.query(
-    `select u.*
-       from auth_accounts a
-       join users u on u.id = a.user_id
-      where a.provider = $1 and a.provider_user_id = $2`,
+    `select u.* from auth_accounts a
+      join users u on u.id = a.user_id
+     where a.provider = $1 and a.provider_user_id = $2`,
     [provider, String(providerUserId)]
   );
   return rows[0] || null;
@@ -173,7 +174,8 @@ export async function findUserIdByPhoneHash(phash) {
 
 export async function createUser({ first_name, last_name, avatar_url }) {
   const { rows } = await db.query(
-    `insert into users (first_name, last_name, avatar_url) values ($1,$2,$3) returning *`,
+    `insert into users (first_name, last_name, avatar_url)
+     values ($1,$2,$3) returning *`,
     [first_name || null, last_name || null, avatar_url || null]
   );
   return rows[0];
@@ -206,6 +208,18 @@ export async function linkDevice(userId, deviceId) {
   );
 }
 
+/* ⬇⬇⬇  Новая функция — ради неё и был фейл на Render  ⬇⬇⬇ */
+export async function updateUserCountryIfNull(userId, { country_code, country_name }) {
+  if (!userId || !country_code) return;
+  await db.query(
+    `update users
+        set country_code = coalesce(country_code, $2),
+            country_name = coalesce(country_name, $3)
+      where id = $1`,
+    [userId, country_code, country_name || country_code]
+  );
+}
+
 export async function mergeUsers(primaryId, secondaryId) {
   if (!primaryId || !secondaryId || primaryId === secondaryId) return primaryId;
   const client = await db.connect();
@@ -216,7 +230,7 @@ export async function mergeUsers(primaryId, secondaryId) {
     await client.query(`update device_links set user_id = $1 where user_id = $2`, [primaryId, secondaryId]);
     await client.query(`update transactions set user_id = $1 where user_id = $2`, [primaryId, secondaryId]);
 
-    // transfer balance
+    // переносим баланс
     const { rows } = await client.query(`select balance from users where id = $1`, [secondaryId]);
     const add = rows[0]?.balance || 0;
     if (add) {
@@ -235,23 +249,21 @@ export async function mergeUsers(primaryId, secondaryId) {
   }
 }
 
-/**
- * Main upsert+link function.
- * - Ensures auth account exists and points to a user.
- * - If device or phone_hash points to another user, merges into a single account.
- */
+/* Главная функция upsert+link */
 export async function upsertAndLink({
-  provider, provider_user_id, username, first_name, last_name, avatar_url, phone_hash, device_id
+  provider, provider_user_id, username,
+  first_name, last_name, avatar_url,
+  phone_hash, device_id
 }) {
-  // 1) Try by auth
+  // 1) по auth
   let user = await findUserByAuth(provider, provider_user_id);
   let userId = user?.id || null;
 
-  // 2) Try by device
+  // 2) по device
   const deviceHash = device_id ? hashDeviceId(device_id) : null;
   const deviceUserId = deviceHash ? await findUserIdByDevice(deviceHash) : null;
 
-  // 3) Try by phone hash
+  // 3) по телефону (если будет)
   const phoneUserId = phone_hash ? await findUserIdByPhoneHash(phone_hash) : null;
 
   if (!userId) {
@@ -263,22 +275,23 @@ export async function upsertAndLink({
     }
   }
 
-  // Link auth to user
+  // линкуем провайдера
   await linkAuthAccount(userId, { provider, provider_user_id, username, phone_hash, meta: null });
 
-  // Link device
-  if (device_id) {
-    await linkDevice(userId, device_id);
-  }
+  // линкуем девайс
+  if (device_id) await linkDevice(userId, device_id);
 
-  // Merge if needed
+  // возможно, нужно склеить
   const toMerge = [deviceUserId, phoneUserId].filter(Boolean).filter((x) => x !== userId);
   let primary = userId;
   for (const other of toMerge) {
-    // choose the older user as primary to keep history stable
-    const { rows } = await db.query(`select id, created_at from users where id in ($1,$2) order by created_at asc`, [primary, other]);
-    const first = rows[0]?.id === primary ? primary : other;
-    const second = rows[0]?.id === primary ? other : primary;
+    // выбираем более старую учётку как primary
+    const { rows } = await db.query(
+      `select id, created_at from users where id in ($1,$2) order by created_at asc`,
+      [primary, other]
+    );
+    const first  = rows[0]?.id === primary ? primary : other;
+    const second = rows[0]?.id === primary ? other   : primary;
     primary = await mergeUsers(first, second);
   }
 
