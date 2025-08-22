@@ -1,14 +1,19 @@
-// src/tg.js
 import crypto from 'crypto';
 
+/* Валидация Telegram Login Widget */
 export function verifyTelegramLogin(data, botToken) {
-  if (!data || !data.hash) return false;
-  const { hash, ...rest } = data;
-  const checkString = Object.keys(rest)
+  const checkHash = data.hash;
+  const secret    = crypto.createHash('sha256').update(botToken).digest();
+
+  const dataCheckString = Object.keys(data)
+    .filter((k) => k !== 'hash')
     .sort()
-    .map((k) => `${k}=${rest[k]}`)
+    .map((k) => `${k}=${data[k]}`)
     .join('\n');
-  const secret = crypto.createHash('sha256').update(botToken).digest();
-  const hmac = crypto.createHmac('sha256', secret).update(checkString).digest('hex');
-  return hmac === hash;
+
+  const hmac = crypto.createHmac('sha256', secret)
+    .update(dataCheckString)
+    .digest('hex');
+
+  return hmac === checkHash;
 }
