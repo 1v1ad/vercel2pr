@@ -38,7 +38,7 @@ export async function ensureTables() {
         updated_at   timestamp default now()
       );
     `);
-    -- Legacy databases might miss these columns — add them if absent
+    // Legacy DBs might miss some columns — add them if absent
     await client.query(`alter table users add column if not exists avatar_url   text;`);
     await client.query(`alter table users add column if not exists first_name   text;`);
     await client.query(`alter table users add column if not exists last_name    text;`);
@@ -283,9 +283,9 @@ export async function upsertAndLink({
       `select id, created_at from users where id in ($1,$2) order by created_at asc`,
       [primary, other]
     );
-    const first  = rows[0]?.id === primary ? primary : other;
-    const second = rows[0]?.id === primary ? other   : primary;
-    primary = await mergeUsers(first, second);
+      const first  = rows[0]?.id === primary ? primary : other;
+      const second = rows[0]?.id === primary ? other   : primary;
+      primary = await mergeUsers(first, second);
   }
 
   // Fill empty profile fields from provider (avatar/name)

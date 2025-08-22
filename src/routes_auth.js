@@ -1,7 +1,7 @@
 import express from 'express';
 import axios from 'axios';
 import crypto from 'crypto';
-import { signSession } from './jwt.js';
+
 import { upsertAndLink, logEvent } from './db.js';
 
 const router = express.Router();
@@ -36,7 +36,6 @@ router.get('/vk/start', async (req, res) => {
 
     await logEvent({ user_id:null, event_type:'auth_start', payload:{ provider:'vk' }, ip:getFirstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
-    // classic oauth.vk.com flow (no PKCE)
     const u = new URL('https://oauth.vk.com/authorize');
     u.searchParams.set('response_type', 'code');
     u.searchParams.set('client_id', clientId);
@@ -105,7 +104,8 @@ router.get('/vk/callback', async (req, res) => {
 
     await logEvent({ user_id:user?.id, event_type:'auth_ok', payload:{ provider:'vk' }, ip:getFirstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
-    res.cookie('sid', (await import('jsonwebtoken')).default.sign({ uid: user.id, prov: 'vk' }, process.env.JWT_SECRET || 'dev_secret_change_me', { algorithm: 'HS256', expiresIn: '30d' }), {
+    const jwt = (await import('jsonwebtoken')).default;
+    res.cookie('sid', jwt.sign({ uid: user.id, prov: 'vk' }, process.env.JWT_SECRET || 'dev_secret_change_me', { algorithm: 'HS256', expiresIn: '30d' }), {
       httpOnly: true,
       sameSite: 'none',
       secure: true,

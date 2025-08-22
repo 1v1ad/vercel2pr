@@ -41,7 +41,8 @@ router.all('/callback', async (req, res) => {
 
     await logEvent({ user_id:user?.id, event_type:'auth_ok', payload:{ provider:'tg' }, ip:getFirstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
-    res.cookie('sid', (await import('jsonwebtoken')).default.sign({ uid: user.id, prov: 'tg' }, process.env.JWT_SECRET || 'dev_secret_change_me', { algorithm: 'HS256', expiresIn: '30d' }), {
+    const jwt = (await import('jsonwebtoken')).default;
+    res.cookie('sid', jwt.sign({ uid: user.id, prov: 'tg' }, process.env.JWT_SECRET || 'dev_secret_change_me', { algorithm: 'HS256', expiresIn: '30d' }), {
       httpOnly: true,
       sameSite: 'none',
       secure: true,
