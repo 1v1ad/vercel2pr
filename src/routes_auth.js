@@ -1,7 +1,6 @@
 import express from 'express';
 import axios from 'axios';
 import crypto from 'crypto';
-import { createCodeVerifier, createCodeChallenge } from './pkce.js';
 import { signSession } from './jwt.js';
 import { upsertAndLink, logEvent } from './db.js';
 
@@ -16,7 +15,6 @@ function getenv() {
     frontendUrl: env.FRONTEND_URL || env.CLIENT_URL,
   };
 }
-
 function getFirstIp(req) {
   return (req.headers['x-forwarded-for'] || req.ip || '').toString().split(',')[0].trim();
 }
@@ -30,27 +28,22 @@ router.get('/vk/start', async (req, res) => {
     const did = (req.query.did || '').toString().slice(0, 200) || null;
 
     const csrf = crypto.randomBytes(16).toString('hex');
-    const codeVerifier  = createCodeVerifier();
-    const codeChallenge = createCodeChallenge(codeVerifier);
-
-    // Minimal state: just csrf; rest goes to cookies
     const state = csrf;
 
     const cookieOpts = { httpOnly: true, sameSite: 'none', secure: true, path: '/', maxAge: 10 * 60 * 1000 };
     res.cookie('vk_state', csrf, cookieOpts);
-    res.cookie('vk_code_verifier', codeVerifier, cookieOpts);
     if (did) res.cookie('vk_did', did, cookieOpts);
 
     await logEvent({ user_id:null, event_type:'auth_start', payload:{ provider:'vk' }, ip:getFirstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
-    const u = new URL('https://id.vk.com/authorize');
+    // classic oauth.vk.com flow (no PKCE)
+    const u = new URL('https://oauth.vk.com/authorize');
     u.searchParams.set('response_type', 'code');
     u.searchParams.set('client_id', clientId);
     u.searchParams.set('redirect_uri', redirectUri);
-    u.searchParams.set('state', state);
-    u.searchParams.set('code_challenge', codeChallenge);
-    u.searchParams.set('code_challenge_method', 'S256');
     u.searchParams.set('scope', 'email,phone');
+    u.searchParams.set('v', '5.199');
+    u.searchParams.set('state', state);
 
     return res.redirect(302, u.toString());
   } catch (e) {
@@ -71,9 +64,6 @@ router.get('/vk/callback', async (req, res) => {
       return res.status(400).send('invalid state');
     }
 
-    const codeVerifier = req.cookies?.vk_code_verifier || null;
-    if (!codeVerifier) return res.status(400).send('missing code_verifier');
-
     const deviceIdFromCookie = req.cookies?.vk_did || null;
 
     const tokenResp = await axios.get('https://oauth.vk.com/access_token', {
@@ -82,8 +72,6 @@ router.get('/vk/callback', async (req, res) => {
         client_secret: clientSecret,
         redirect_uri: redirectUri,
         code,
-        code_verifier: codeVerifier,
-        device_id: deviceIdFromCookie || 'web',
       },
       timeout: 15000,
     });
@@ -117,7 +105,6 @@ router.get('/vk/callback', async (req, res) => {
 
     await logEvent({ user_id:user?.id, event_type:'auth_ok', payload:{ provider:'vk' }, ip:getFirstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
-    // Session cookie for cross-site XHR: SameSite=None
     res.cookie('sid', (await import('jsonwebtoken')).default.sign({ uid: user.id, prov: 'vk' }, process.env.JWT_SECRET || 'dev_secret_change_me', { algorithm: 'HS256', expiresIn: '30d' }), {
       httpOnly: true,
       sameSite: 'none',

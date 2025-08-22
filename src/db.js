@@ -38,6 +38,10 @@ export async function ensureTables() {
         updated_at   timestamp default now()
       );
     `);
+    -- Legacy databases might miss these columns — add them if absent
+    await client.query(`alter table users add column if not exists avatar_url   text;`);
+    await client.query(`alter table users add column if not exists first_name   text;`);
+    await client.query(`alter table users add column if not exists last_name    text;`);
     await client.query(`alter table users add column if not exists country_code text;`);
     await client.query(`alter table users add column if not exists country_name text;`);
 

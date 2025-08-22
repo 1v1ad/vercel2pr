@@ -1,7 +1,6 @@
 import { Router } from 'express';
 import { verifyTelegramLogin } from './tg.js';
 import { upsertAndLink, logEvent } from './db.js';
-import { signSession } from './jwt.js';
 
 const router = Router();
 
@@ -12,12 +11,10 @@ function getenv() {
     deviceHeader: env.DEVICE_ID_HEADER || 'x-device-id',
   };
 }
-
 function getFirstIp(req) {
   return (req.headers['x-forwarded-for'] || req.ip || '').toString().split(',')[0].trim();
 }
 
-// Telegram Login Widget — GET/POST
 router.all('/callback', async (req, res) => {
   const data = req.method === 'POST' ? req.body : req.query;
 
@@ -44,7 +41,6 @@ router.all('/callback', async (req, res) => {
 
     await logEvent({ user_id:user?.id, event_type:'auth_ok', payload:{ provider:'tg' }, ip:getFirstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
-    // SameSite=None for cross-site XHR
     res.cookie('sid', (await import('jsonwebtoken')).default.sign({ uid: user.id, prov: 'tg' }, process.env.JWT_SECRET || 'dev_secret_change_me', { algorithm: 'HS256', expiresIn: '30d' }), {
       httpOnly: true,
       sameSite: 'none',
@@ -58,8 +54,8 @@ router.all('/callback', async (req, res) => {
     url.searchParams.set('provider', 'tg');
     return res.redirect(302, url.toString());
   } catch (e) {
-    console.error('tg/callback error:', e?.response?.data || e?.message);
-    return res.status(500).send('tg callback failed');
+    console.error('tg/callback error:', e?.response?.data || e?.message || e);
+    return res.status(500).send('tg callback failed: ' + (e?.message || 'unknown'));
   }
 });
 
