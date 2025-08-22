@@ -27,14 +27,11 @@ function getFirstIp(req) {
 function signState(payload, secret) {
   return jwt.sign(payload, secret, { algorithm: 'HS256', expiresIn: '10m' });
 }
-
 function verifyState(token, secret) {
   try { return jwt.verify(token, secret, { algorithms: ['HS256'] }); } catch { return null; }
 }
 
-// ──────────────────────────────────────────────────────────────
-// GET /api/auth/vk/start
-// ──────────────────────────────────────────────────────────────
+/* ───────────────  GET /api/auth/vk/start  ─────────────── */
 router.get('/vk/start', async (req, res) => {
   const { clientId, redirectUri, frontendUrl, jwtSecret } = getenv();
   if (!clientId || !redirectUri) return res.status(500).send('VK client not configured');
@@ -45,11 +42,11 @@ router.get('/vk/start', async (req, res) => {
     const csrf = crypto.randomBytes(16).toString('hex');
     const state = signState({ csrf, did }, jwtSecret);
 
-    const codeVerifier = createCodeVerifier();
+    const codeVerifier  = createCodeVerifier();
     const codeChallenge = createCodeChallenge(codeVerifier);
 
-    res.cookie('vk_state', csrf,            { httpOnly:true, sameSite:'lax',  secure:true, path:'/', maxAge: 10*60*1000 });
-    res.cookie('vk_code_verifier', codeVerifier, { httpOnly:true, sameSite:'lax',  secure:true, path:'/', maxAge: 10*60*1000 });
+    res.cookie('vk_state', csrf,                 { httpOnly:true, sameSite:'lax', secure:true, path:'/', maxAge: 10*60*1000 });
+    res.cookie('vk_code_verifier', codeVerifier, { httpOnly:true, sameSite:'lax', secure:true, path:'/', maxAge: 10*60*1000 });
 
     await logEvent({ user_id:null, event_type:'auth_start', payload:{ provider:'vk' }, ip:getFirstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
@@ -60,8 +57,7 @@ router.get('/vk/start', async (req, res) => {
     u.searchParams.set('state', state);
     u.searchParams.set('code_challenge', codeChallenge);
     u.searchParams.set('code_challenge_method', 'S256');
-    // scopes: basic profile + optional phone if approved
-    u.searchParams.set('scope', 'email,phone');
+    u.searchParams.set('scope', 'email,phone'); // если будет одобрено
 
     return res.redirect(302, u.toString());
   } catch (e) {
@@ -70,16 +66,13 @@ router.get('/vk/start', async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────────────────────
-// GET /api/auth/vk/callback
-// ──────────────────────────────────────────────────────────────
+/* ───────────────  GET /api/auth/vk/callback  ─────────────── */
 router.get('/vk/callback', async (req, res) => {
   const { clientId, clientSecret, redirectUri, frontendUrl, deviceHeader, jwtSecret } = getenv();
   try {
     const { code, state } = req.query;
     if (!code || !state) return res.status(400).send('missing code/state');
 
-    // verify state and CSRF
     const parsed = verifyState(String(state), jwtSecret);
     const csrfFromCookie = req.cookies?.vk_state || null;
     if (!parsed || !csrfFromCookie || parsed.csrf !== csrfFromCookie) {
@@ -90,13 +83,12 @@ router.get('/vk/callback', async (req, res) => {
     const codeVerifier = req.cookies?.vk_code_verifier || null;
     if (!codeVerifier) return res.status(400).send('missing code_verifier');
 
-    // Exchange code -> token
     const tokenResp = await axios.get('https://oauth.vk.com/access_token', {
       params: {
         client_id: clientId,
         client_secret: clientSecret,
         redirect_uri: redirectUri,
-        code: code,
+        code,
         code_verifier: codeVerifier,
         device_id: deviceIdFromState || 'web',
       },
@@ -105,7 +97,6 @@ router.get('/vk/callback', async (req, res) => {
     const token = tokenResp.data;
     const vkUserId = token.user_id;
 
-    // Pull basic profile
     const apiResp = await axios.get('https://api.vk.com/method/users.get', {
       params: {
         user_ids: vkUserId,
@@ -117,7 +108,7 @@ router.get('/vk/callback', async (req, res) => {
     });
     const profile = apiResp.data?.response?.[0] || {};
 
-    const phone_hash = token.phone ? token.phone : null; // unlikely unless scope approved
+    const phone_hash = token.phone ? token.phone : null; // редко в вебе
     const device_id = deviceIdFromState;
 
     const user = await upsertAndLink({
@@ -133,14 +124,13 @@ router.get('/vk/callback', async (req, res) => {
 
     await logEvent({ user_id:user?.id, event_type:'auth_ok', payload:{ provider:'vk' }, ip:getFirstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
-    // issue session
     const session = signSession({ uid: user.id, prov: 'vk' });
     res.cookie('sid', session, {
       httpOnly: true,
       sameSite: 'lax',
       secure: true,
       path: '/',
-      maxAge: 30 * 24 * 3600 * 1000
+      maxAge: 30 * 24 * 3600 * 1000,
     });
 
     const url = new URL(frontendUrl);
