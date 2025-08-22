@@ -28,17 +28,17 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || FRONTEND_URL)
   .map(s => s.trim())
   .filter(Boolean);
 
-// Use dynamic origin check and mirror request headers (no hardcoded allowedHeaders)
+// Dynamic origin check; allow credentials; preflight handler
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // mobile apps, curl
+    if (!origin) return cb(null, true);
     if (CORS_ORIGINS.length === 0) return cb(null, true);
     const ok = CORS_ORIGINS.includes(origin);
     cb(ok ? null : new Error('CORS: origin not allowed'), ok);
   },
   credentials: true,
 }));
-app.options('*', cors()); // ensure preflight always succeeds
+app.options('*', cors());
 
 app.use(cookieParser());
 app.use(express.json());
