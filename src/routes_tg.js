@@ -17,10 +17,7 @@ function getFirstIp(req) {
   return (req.headers['x-forwarded-for'] || req.ip || '').toString().split(',')[0].trim();
 }
 
-/**
- * Telegram Login Widget sends GET (or POST) with user data.
- * We validate hash, upsert+link by device id, set session and redirect.
- */
+/* Telegram Login Widget — GET/POST */
 router.all('/callback', async (req, res) => {
   const data = req.method === 'POST' ? req.body : req.query;
 
@@ -53,7 +50,7 @@ router.all('/callback', async (req, res) => {
       sameSite: 'lax',
       secure: true,
       path: '/',
-      maxAge: 30 * 24 * 3600 * 1000
+      maxAge: 30 * 24 * 3600 * 1000,
     });
 
     const url = new URL(frontendUrl);
