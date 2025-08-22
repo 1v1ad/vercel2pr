@@ -1,12 +1,23 @@
 import crypto from 'crypto';
 
-/* Валидация Telegram Login Widget */
-export function verifyTelegramLogin(data, botToken) {
-  const checkHash = data.hash;
-  const secret    = crypto.createHash('sha256').update(botToken).digest();
+/**
+ * Validate Telegram Login Widget payload.
+ * Only Telegram-provided fields are part of HMAC: id, first_name, last_name, username, photo_url, auth_date.
+ * Ignore any extra parameters (e.g., our 'did').
+ */
+export function verifyTelegramLogin(rawData, botToken) {
+  const checkHash = rawData.hash;
+  if (!checkHash) return false;
 
+  const allowedKeys = new Set(['id','first_name','last_name','username','photo_url','auth_date']);
+  const data = {};
+  for (const [k, v] of Object.entries(rawData)) {
+    if (k === 'hash') continue;
+    if (allowedKeys.has(k)) data[k] = v;
+  }
+
+  const secret = crypto.createHash('sha256').update(botToken).digest();
   const dataCheckString = Object.keys(data)
-    .filter((k) => k !== 'hash')
     .sort()
     .map((k) => `${k}=${data[k]}`)
     .join('\n');
