@@ -1,7 +1,6 @@
 import express from 'express';
 import axios from 'axios';
 import crypto from 'crypto';
-import jwt from 'jsonwebtoken';
 import { createCodeVerifier, createCodeChallenge } from './pkce.js';
 import { signSession } from './jwt.js';
 import { upsertAndLink, logEvent } from './db.js';
@@ -15,8 +14,6 @@ function getenv() {
     clientSecret: env.VK_CLIENT_SECRET,
     redirectUri: env.VK_REDIRECT_URI || env.REDIRECT_URI,
     frontendUrl: env.FRONTEND_URL || env.CLIENT_URL,
-    deviceHeader: env.DEVICE_ID_HEADER || 'x-device-id',
-    jwtSecret: env.JWT_SECRET || 'dev_secret_change_me',
   };
 }
 
@@ -24,17 +21,11 @@ function getFirstIp(req) {
   return (req.headers['x-forwarded-for'] || req.ip || '').toString().split(',')[0].trim();
 }
 
-function signState(payload, secret) {
-  return jwt.sign(payload, secret, { algorithm: 'HS256', expiresIn: '10m' });
-}
-function verifyState(token, secret) {
-  try { return jwt.verify(token, secret, { algorithms: ['HS256'] }); } catch { return null; }
-}
-
-// GET /api/auth/vk/start
+// ───────────────  GET /api/auth/vk/start  ───────────────
 router.get('/vk/start', async (req, res) => {
-  const { clientId, redirectUri, jwtSecret } = getenv();
+  const { clientId, redirectUri } = getenv();
   if (!clientId || !redirectUri) return res.status(500).send('VK client not configured');
+
   try {
     const did = (req.query.did || '').toString().slice(0, 200) || null;
 
@@ -42,11 +33,13 @@ router.get('/vk/start', async (req, res) => {
     const codeVerifier  = createCodeVerifier();
     const codeChallenge = createCodeChallenge(codeVerifier);
 
-    const state = signState({ csrf, did, cv: codeVerifier }, jwtSecret);
+    // Small, cookie-backed state; all data live in cookies
+    const state = csrf;
 
     const cookieOpts = { httpOnly: true, sameSite: 'none', secure: true, path: '/', maxAge: 10 * 60 * 1000 };
     res.cookie('vk_state', csrf, cookieOpts);
     res.cookie('vk_code_verifier', codeVerifier, cookieOpts);
+    if (did) res.cookie('vk_did', did, cookieOpts);
 
     await logEvent({ user_id:null, event_type:'auth_start', payload:{ provider:'vk' }, ip:getFirstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
@@ -66,25 +59,22 @@ router.get('/vk/start', async (req, res) => {
   }
 });
 
-// GET /api/auth/vk/callback
+// ───────────────  GET /api/auth/vk/callback  ───────────────
 router.get('/vk/callback', async (req, res) => {
-  const { clientId, clientSecret, redirectUri, frontendUrl, jwtSecret } = getenv();
+  const { clientId, clientSecret, redirectUri, frontendUrl } = getenv();
   try {
     const { code, state } = req.query;
     if (!code || !state) return res.status(400).send('missing code/state');
 
-    const parsed = verifyState(String(state), jwtSecret);
-    if (!parsed) return res.status(400).send('invalid state token');
-
     const csrfFromCookie = req.cookies?.vk_state || null;
-    if (csrfFromCookie && parsed.csrf !== csrfFromCookie) {
+    if (!csrfFromCookie || state !== csrfFromCookie) {
       return res.status(400).send('invalid state');
     }
-    const deviceIdFromState = parsed.did || null;
 
-    let codeVerifier = req.cookies?.vk_code_verifier || null;
-    if (!codeVerifier) codeVerifier = parsed.cv || null;
+    const codeVerifier = req.cookies?.vk_code_verifier || null;
     if (!codeVerifier) return res.status(400).send('missing code_verifier');
+
+    const deviceIdFromCookie = req.cookies?.vk_did || null;
 
     const tokenResp = await axios.get('https://oauth.vk.com/access_token', {
       params: {
@@ -93,7 +83,7 @@ router.get('/vk/callback', async (req, res) => {
         redirect_uri: redirectUri,
         code,
         code_verifier: codeVerifier,
-        device_id: deviceIdFromState || 'web',
+        device_id: deviceIdFromCookie || 'web',
       },
       timeout: 15000,
     });
@@ -112,7 +102,7 @@ router.get('/vk/callback', async (req, res) => {
     const profile = apiResp.data?.response?.[0] || {};
 
     const phone_hash = token.phone ? token.phone : null;
-    const device_id = deviceIdFromState;
+    const device_id = deviceIdFromCookie;
 
     const user = await upsertAndLink({
       provider: 'vk',
