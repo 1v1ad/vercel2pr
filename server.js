@@ -21,15 +21,24 @@ dotenv.config();
 const app = express();
 app.set('trust proxy', 1);
 
-const FRONTEND_URL = process.env.FRONTEND_URL || process.env.CLIENT_URL || '*';
-const DEVICE_ID_HEADER = process.env.DEVICE_ID_HEADER || 'x-device-id';
+// Origins: allow FRONTEND_URL (single) or CORS_ORIGINS=comma,list
+const FRONTEND_URL = process.env.FRONTEND_URL || process.env.CLIENT_URL || '';
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || FRONTEND_URL)
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
+// Use dynamic origin check and mirror request headers (no hardcoded allowedHeaders)
 app.use(cors({
-  origin: FRONTEND_URL,
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // mobile apps, curl
+    if (CORS_ORIGINS.length === 0) return cb(null, true);
+    const ok = CORS_ORIGINS.includes(origin);
+    cb(ok ? null : new Error('CORS: origin not allowed'), ok);
+  },
   credentials: true,
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', DEVICE_ID_HEADER, 'x-admin-key'],
 }));
+app.options('*', cors()); // ensure preflight always succeeds
 
 app.use(cookieParser());
 app.use(express.json());
