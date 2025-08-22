@@ -13,6 +13,7 @@ import {
 
 import authRouter from './src/routes_auth.js';
 import tgRouter from './src/routes_tg.js';
+import adminRouter from './src/routes_admin.js';
 import { verifySession } from './src/jwt.js';
 
 dotenv.config();
@@ -27,7 +28,7 @@ app.use(cors({
   origin: FRONTEND_URL,
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', DEVICE_ID_HEADER],
+  allowedHeaders: ['Content-Type', 'Authorization', DEVICE_ID_HEADER, 'x-admin-key'],
 }));
 
 app.use(cookieParser());
@@ -50,13 +51,15 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 
 app.use('/api/auth', authRouter);
 app.use('/api/auth/tg', tgRouter);
+app.use('/api/admin', adminRouter);
 
-app.get('/api/whoami', async (req, res) => {
+// Frontend expects /api/me
+app.get('/api/me', async (req, res) => {
   try {
     const token = req.cookies?.sid || null;
     const data = token ? verifySession(token) : null;
     const user = data?.uid ? await getUserById(data.uid) : null;
-    res.json({ ok: true, user });
+    res.json({ ok: true, user, provider: data?.prov || null });
   } catch {
     res.status(500).json({ ok: false });
   }
