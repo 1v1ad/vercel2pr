@@ -33,7 +33,7 @@ app.use(cors({
 app.use(cookieParser());
 app.use(express.json());
 
-/* Геолокация по IP (best-effort) — кладём в req.__country_code */
+// Geo by IP (best-effort)
 app.use((req, _res, next) => {
   try {
     const ip = (req.headers['x-forwarded-for'] || req.ip || '')
@@ -42,20 +42,15 @@ app.use((req, _res, next) => {
       .trim();
     const geo = ip ? geoip.lookup(ip) : null;
     req.__country_code = geo?.country || null;
-  } catch {
-    // молча
-  }
+  } catch {}
   next();
 });
 
-/* Health */
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-/* Основные роуты авторизации */
 app.use('/api/auth', authRouter);
 app.use('/api/auth/tg', tgRouter);
 
-/* Простой whoami */
 app.get('/api/whoami', async (req, res) => {
   try {
     const token = req.cookies?.sid || null;
@@ -67,8 +62,6 @@ app.get('/api/whoami', async (req, res) => {
   }
 });
 
-/* Тех. endpoint для клиентских событий: пишем их и,
-   если у пользователя ещё пустая страна — заполняем. */
 app.post('/api/events', async (req, res) => {
   try {
     const token = req.cookies?.sid || null;
