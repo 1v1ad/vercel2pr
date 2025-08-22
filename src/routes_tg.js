@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { verifyTelegramLogin } from './tg.js';
 import { upsertAndLink, logEvent } from './db.js';
+import { signSession } from './jwt.js';
 
 const router = Router();
 
@@ -41,8 +42,7 @@ router.all('/callback', async (req, res) => {
 
     await logEvent({ user_id:user?.id, event_type:'auth_ok', payload:{ provider:'tg' }, ip:getFirstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
-    const jwt = (await import('jsonwebtoken')).default;
-    res.cookie('sid', jwt.sign({ uid: user.id, prov: 'tg' }, process.env.JWT_SECRET || 'dev_secret_change_me', { algorithm: 'HS256', expiresIn: '30d' }), {
+    res.cookie('sid', signSession({ uid: user.id, prov: 'tg' }), {
       httpOnly: true,
       sameSite: 'none',
       secure: true,

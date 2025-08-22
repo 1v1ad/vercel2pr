@@ -12,17 +12,30 @@ function auth(req) {
   return expected && key === expected;
 }
 
+router.get('/ping', (req, res) => {
+  if (!auth(req)) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  res.json({ ok: true, now: new Date().toISOString(), service: 'ok' });
+});
+
 router.get('/summary', async (req, res) => {
   if (!auth(req)) return res.status(401).json({ ok: false, error: 'unauthorized' });
 
   try {
     const { rows: u1 } = await db.query('select count(*)::int as users from users');
     const { rows: e1 } = await db.query('select count(*)::int as events from events');
+
+    // Count auth-like events inclusively, not only 'auth_ok'
     const { rows: a7 } = await db.query(`
-      select count(*)::int as auth_total_7d,
-             count(distinct user_id)::int as uniq_7d
+      select
+        count(*)::int as auth_total_7d,
+        count(distinct user_id)::int as uniq_7d
       from events
-      where created_at >= now() - interval '7 day' and event_type = 'auth_ok'
+      where created_at >= now() - interval '7 day'
+        and (
+          event_type = 'auth_ok'
+          or event_type ilike '%auth%'
+          or event_type = 'login'
+        )
     `);
 
     res.json({

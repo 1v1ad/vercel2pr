@@ -11,15 +11,13 @@ const ssl = (process.env.DATABASE_URL && process.env.DATABASE_URL.includes('sslm
 
 export const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl });
 
-const COOKIE_SECRET   = process.env.COOKIE_SECRET || 'dev_cookie_secret';
+const COOKIE_SECRET = process.env.COOKIE_SECRET || 'dev_cookie_secret';
 
-/* ───────── Helpers ───────── */
 export function hashDeviceId(did) {
   if (!did) return null;
   return crypto.createHash('sha256').update(`${did}|${COOKIE_SECRET}`).digest('hex');
 }
 
-/* ───────── Schema ───────── */
 export async function ensureTables() {
   const client = await db.connect();
   try {
@@ -38,12 +36,13 @@ export async function ensureTables() {
         updated_at   timestamp default now()
       );
     `);
-    // Legacy DBs might miss some columns — add them if absent
     await client.query(`alter table users add column if not exists avatar_url   text;`);
     await client.query(`alter table users add column if not exists first_name   text;`);
     await client.query(`alter table users add column if not exists last_name    text;`);
     await client.query(`alter table users add column if not exists country_code text;`);
     await client.query(`alter table users add column if not exists country_name text;`);
+    await client.query(`alter table users alter column balance set default 0;`);
+    await client.query(`update users set balance = 0 where balance is null;`);
 
     await client.query(`
       create table if not exists events (
@@ -124,7 +123,6 @@ export async function ensureTables() {
   }
 }
 
-/* ───────── DAO ───────── */
 export async function logEvent({ user_id, event_type, payload, ip, ua, country_code }) {
   await db.query(
     `insert into events (user_id, event_type, payload, ip, ua, country_code)
@@ -228,19 +226,13 @@ export async function mergeUsers(primaryId, secondaryId) {
   const client = await db.connect();
   try {
     await client.query('begin');
-
     await client.query(`update auth_accounts set user_id = $1 where user_id = $2`, [primaryId, secondaryId]);
     await client.query(`update device_links set user_id = $1 where user_id = $2`, [primaryId, secondaryId]);
     await client.query(`update transactions set user_id = $1 where user_id = $2`, [primaryId, secondaryId]);
-
     const { rows } = await client.query(`select balance from users where id = $1`, [secondaryId]);
     const add = rows[0]?.balance || 0;
-    if (add) {
-      await client.query(`update users set balance = balance + $2 where id = $1`, [primaryId, add]);
-    }
-
+    if (add) await client.query(`update users set balance = balance + $2 where id = $1`, [primaryId, add]);
     await client.query(`delete from users where id = $1`, [secondaryId]);
-
     await client.query('commit');
     return primaryId;
   } catch (e) {
@@ -275,7 +267,6 @@ export async function upsertAndLink({
   await linkAuthAccount(userId, { provider, provider_user_id, username, phone_hash, meta: null });
   if (device_id) await linkDevice(userId, device_id);
 
-  // Merge if needed
   const toMerge = [deviceUserId, phoneUserId].filter(Boolean).filter(x => x !== userId);
   let primary = userId;
   for (const other of toMerge) {
@@ -283,12 +274,11 @@ export async function upsertAndLink({
       `select id, created_at from users where id in ($1,$2) order by created_at asc`,
       [primary, other]
     );
-      const first  = rows[0]?.id === primary ? primary : other;
-      const second = rows[0]?.id === primary ? other   : primary;
-      primary = await mergeUsers(first, second);
+    const first  = rows[0]?.id === primary ? primary : other;
+    const second = rows[0]?.id === primary ? other   : primary;
+    primary = await mergeUsers(first, second);
   }
 
-  // Fill empty profile fields from provider (avatar/name)
   await updateUserProfileIfEmpty(primary, { first_name, last_name, avatar_url });
 
   const resultUser = await getUserById(primary);
