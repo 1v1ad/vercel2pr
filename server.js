@@ -1,15 +1,13 @@
-// server.js
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
 import geoip from 'geoip-lite';
-import jwt from 'jsonwebtoken';
 
 import { ensureTables, getUserById, logEvent, updateUserCountryIfNull } from './src/db.js';
 import authRouter from './src/routes_auth.js';
 import linkRouter from './src/routes_link.js';
-import tgRouter from './src/routes_tg.js';
+import tgRouter from './src/routes_tg.js'; // ← Добавили
 
 dotenv.config();
 
@@ -18,55 +16,45 @@ app.set('trust proxy', 1);
 
 const FRONTEND_URL = process.env.FRONTEND_URL;
 
-app.use(
-  cors({
-    origin: [FRONTEND_URL, 'https://sweet-twilight-63a9b6.netlify.app'].filter(Boolean),
-    credentials: true,
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Password'],
-    maxAge: 86400,
-  }),
-);
+app.use(cors({
+  origin: [
+    FRONTEND_URL,
+    'https://sweet-twilight-63a9b6.netlify.app',
+  ].filter(Boolean),
+  credentials: true,
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Password'],
+  maxAge: 86400,
+}));
 app.options('*', cors());
 
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true })); // ← Добавили для form-urlencoded
 app.use(cookieParser());
 
-// ───────── Health
+// Health (прогрев)
 app.get('/health', (_, res) => res.status(200).send('ok'));
 
-// ───────── Auth callbacks
+// Telegram auth callback (НОВОЕ)
 app.use('/api/auth/tg', tgRouter);
+
+// Остальные маршруты
 app.use('/api', linkRouter);
 app.use('/api/auth', authRouter);
 
-// ───────── Telegram webhook (тихий phone-match) — подключаем, если задан секрет
-if ((process.env.BOT_WEBHOOK_SECRET || '').length > 0) {
-  const { default: telegramWebhook } = await import('./src/routes_telegram_webhook.js');
-  app.use('/provider/telegram', telegramWebhook);
-}
-
-// ───────── Admin (по флагу)
+// === Admin feature (optional) ===
 if ((process.env.FEATURE_ADMIN || '').toLowerCase() === 'true') {
   const { default: adminRouter } = await import('./src/routes_admin.js');
   app.use('/api/admin', adminRouter);
 }
 
-// ───────── Текущий пользователь (проверяем подпись JWT!)
-const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
+// Session info для фронта
 app.get('/api/me', async (req, res) => {
   try {
-    const token = req.cookies?.sid;
+    const token = req.cookies['sid'];
     if (!token) return res.status(401).json({ ok: false });
 
-    let payload;
-    try {
-      payload = jwt.verify(token, JWT_SECRET);
-    } catch {
-      return res.status(401).json({ ok: false });
-    }
-
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
     const user = await getUserById(payload.uid);
     if (!user) return res.status(401).json({ ok: false });
 
@@ -86,7 +74,7 @@ app.get('/api/me', async (req, res) => {
   }
 });
 
-// ───────── Клиентские события (аналитика)
+// Client events (аналитика)
 app.post('/api/events', async (req, res) => {
   try {
     const { type, payload } = req.body || {};
@@ -94,6 +82,7 @@ app.post('/api/events', async (req, res) => {
 
     const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
     const ip = ipHeader.split(',')[0].trim();
+    let userId = null;
 
     let country_code = null;
     try {
@@ -101,11 +90,10 @@ app.post('/api/events', async (req, res) => {
       if (hit && hit.country) country_code = hit.country;
     } catch {}
 
-    let userId = null;
-    const token = req.cookies?.sid;
+    const token = req.cookies['sid'];
     if (token) {
       try {
-        const p = jwt.verify(token, JWT_SECRET);
+        const p = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
         userId = p.uid || null;
       } catch {}
     }
@@ -130,13 +118,15 @@ app.post('/api/events', async (req, res) => {
   }
 });
 
-// ───────── Root
+// Root
 app.get('/', (_, res) => res.send('VK Auth backend up'));
 
 const PORT = process.env.PORT || 3001;
+
+// слушаем порт сразу, чтобы Render не «висел» при пробуждении
 app.listen(PORT, () => console.log(`API on :${PORT}`));
 
-// ───────── Инициализация БД (не блокирует старт сервера)
+// Инициализацию БД запускаем асинхронно, без блокировки старта
 (async () => {
   try {
     await ensureTables();
