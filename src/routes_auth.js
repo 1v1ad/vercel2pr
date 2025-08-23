@@ -1,4 +1,3 @@
-// src/routes_auth.js
 import express from 'express';
 import axios from 'axios';
 import crypto from 'crypto';
@@ -11,12 +10,13 @@ const router = express.Router();
 function getenv() {
   const env = process.env;
   const clientId     = env.VK_CLIENT_ID;
-  const clientSecret = env.VK_CLIENT_SECRET; // допустим к передаче с PKCE
+  const clientSecret = env.VK_CLIENT_SECRET;
   const redirectUri  = env.VK_REDIRECT_URI || env.REDIRECT_URI;
   const frontendUrl  = env.FRONTEND_URL  || env.CLIENT_URL;
 
   for (const [k, v] of Object.entries({
     VK_CLIENT_ID: clientId,
+    VK_CLIENT_SECRET: clientSecret,
     VK_REDIRECT_URI: redirectUri,
     FRONTEND_URL: frontendUrl,
   })) {
@@ -30,26 +30,25 @@ function firstIp(req) {
   return ipHeader.split(',')[0].trim();
 }
 
-const samesiteNone = {
-  httpOnly: true,
-  sameSite: 'none',
-  secure: true,
-  path: '/',
-  maxAge: 10 * 60 * 1000,
-};
-
-// === VK ID: start ===
+// ---------- VK START ----------
 router.get('/vk/start', async (req, res) => {
   try {
     const { clientId, redirectUri } = getenv();
 
-    const state         = crypto.randomBytes(16).toString('hex');
-    const codeVerifier  = createCodeVerifier();
+    const state        = crypto.randomBytes(16).toString('hex');
+    const codeVerifier = createCodeVerifier();
     const codeChallenge = createCodeChallenge(codeVerifier);
 
-    // сохраняем в куках (SameSite=None чтобы точно вернулись на callback)
-    res.cookie('vk_state', state, samesiteNone);
-    res.cookie('vk_code_verifier', codeVerifier, samesiteNone);
+    // Важное изменение: SameSite:'none' (а не 'lax'), чтобы куки точно вернулись после редиректа
+    const cookieOpts = {
+      httpOnly: true,
+      sameSite: 'none',
+      secure: true,
+      path: '/',
+      maxAge: 10 * 60 * 1000,
+    };
+    res.cookie('vk_state', state, cookieOpts);
+    res.cookie('vk_code_verifier', codeVerifier, cookieOpts);
 
     await logEvent({
       user_id: null,
@@ -66,91 +65,110 @@ router.get('/vk/start', async (req, res) => {
     u.searchParams.set('state', state);
     u.searchParams.set('code_challenge', codeChallenge);
     u.searchParams.set('code_challenge_method', 'S256');
-    // базовый набор для VK ID (email — по желанию)
-    u.searchParams.set('scope', 'openid vkid.personal_info email');
+    // минимум достаточно vkid.personal_info; можно добавить email при необходимости
+    u.searchParams.set('scope', 'vkid.personal_info');
 
-    console.log('[VK START] redirect to:', u.toString());
     return res.redirect(u.toString());
   } catch (e) {
-    console.error('vk/start error:', e?.response?.data || e?.message);
+    console.error('vk/start error:', e?.response?.data || e.message);
     return res.status(500).send('auth start failed');
   }
 });
 
-// === VK ID: callback ===
+// ---------- VK CALLBACK ----------
 router.get('/vk/callback', async (req, res) => {
   const { code, state } = req.query;
+
   try {
     const savedState   = req.cookies['vk_state'];
-    const codeVerifier = req.cookies['vk_code_verifier'];
+    const codeVerifier = req.cookies['vk_code_verifier']; // может отсутствовать в некоторых браузерах/настройках cookies
 
-    if (!code || !state || !savedState || savedState !== state || !codeVerifier) {
-      console.warn('[VK CALLBACK] invalid state check', {
-        hasCode: !!code, state, savedState: !!savedState, codeVerifier: !!codeVerifier,
+    // Проверяем только соответствие state (codeVerifier не делаем обязательным — если его нет, уйдем на legacy OAuth)
+    if (!code || !state || !savedState || savedState !== state) {
+      console.error('[VK CALLBACK] invalid state check', {
+        hasCode: !!code,
+        state,
+        savedState: !!savedState,
+        codeVerifier: !!codeVerifier,
       });
       return res.status(400).send('Invalid state');
     }
 
-    // почистим одноразовые куки
-    res.clearCookie('vk_state', { path: '/' });
-    res.clearCookie('vk_code_verifier', { path: '/' });
+    // Чистим временные куки (нужно указывать те же атрибуты, что при установке)
+    const clearOpts = { path: '/', sameSite: 'none', secure: true };
+    res.clearCookie('vk_state', clearOpts);
+    res.clearCookie('vk_code_verifier', clearOpts);
 
     const { clientId, clientSecret, redirectUri, frontendUrl } = getenv();
 
-    // 1) обмен кода на токены на VK ID
-    let tokenData;
-    try {
-      const body = new URLSearchParams({
-        grant_type: 'authorization_code',
-        code: String(code),
-        client_id: clientId,
-        redirect_uri: redirectUri,
-        code_verifier: codeVerifier,
-      });
-      // передаём secret, если есть (для конфиденциальных клиентов это ок)
-      if (clientSecret) body.set('client_secret', clientSecret);
+    // 1) Пытаемся по VK ID + PKCE (если есть code_verifier)
+    let tokenData = null;
+    if (codeVerifier) {
+      try {
+        const resp = await axios.post(
+          'https://id.vk.com/oauth2/token',
+          new URLSearchParams({
+            grant_type: 'authorization_code',
+            code,
+            client_id: clientId,
+            redirect_uri: redirectUri,
+            code_verifier: codeVerifier,
+          }).toString(),
+          { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
+        );
+        tokenData = resp.data;
+      } catch (err) {
+        console.warn('[VK CALLBACK] id.vk.com token fail:', err?.response?.status, err?.response?.data || err.message);
+      }
+    }
 
-      const resp = await axios.post(
-        'https://id.vk.com/oauth2/token',
-        body.toString(),
-        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
-      );
-      tokenData = resp.data;
-    } catch (err) {
-      console.error('[VK CALLBACK] token exchange failed:', err?.response?.data || err?.message);
+    // 2) Фоллбек на классический OAuth, если PKCE не взлетел или code_verifier отсутствует
+    if (!tokenData || !tokenData.access_token) {
+      try {
+        const resp = await axios.get('https://oauth.vk.com/access_token', {
+          params: {
+            client_id: clientId,
+            client_secret: clientSecret,
+            redirect_uri: redirectUri,
+            code,
+            v: '5.199',
+          },
+          timeout: 10000,
+        });
+        tokenData = resp.data;
+      } catch (err) {
+        console.error('[VK CALLBACK] oauth.vk.com token fail:', err?.response?.status, err?.response?.data || err.message);
+      }
+    }
+
+    if (!tokenData || !tokenData.access_token) {
       return res.status(500).send('auth callback failed');
     }
 
-    const accessToken = tokenData?.access_token;
-    const idToken     = tokenData?.id_token;
-    if (!accessToken && !idToken) {
-      console.error('[VK CALLBACK] no tokens in response:', tokenData);
-      return res.status(500).send('auth callback failed');
-    }
+    const accessToken = tokenData.access_token;
 
-    // 2) userinfo (надёжно и просто)
-    let ui;
+    // Профиль
+    let first_name = '', last_name = '', avatar = '';
     try {
-      const r = await axios.get('https://id.vk.com/oauth2/userinfo', {
-        headers: { Authorization: `Bearer ${accessToken}` },
+      const prof = await axios.get('https://api.vk.com/method/users.get', {
+        params: {
+          access_token: accessToken,
+          v: '5.199',
+          fields: 'photo_200,first_name,last_name',
+        },
         timeout: 10000,
       });
-      ui = r.data || {};
+      const r = prof.data?.response?.[0];
+      if (r) {
+        first_name = r.first_name || '';
+        last_name = r.last_name || '';
+        avatar = r.photo_200 || '';
+      }
     } catch (e) {
-      console.error('[VK CALLBACK] userinfo failed:', e?.response?.data || e?.message);
-      return res.status(500).send('auth callback failed');
+      console.warn('users.get fail:', e?.response?.data || e.message);
     }
 
-    const vk_id = String(ui?.sub || '');
-    const first_name = ui?.given_name || '';
-    const last_name  = ui?.family_name || '';
-    const avatar     = ui?.picture || '';
-
-    if (!vk_id) {
-      console.error('[VK CALLBACK] missing sub in userinfo:', ui);
-      return res.status(500).send('auth callback failed');
-    }
-
+    const vk_id = String(tokenData?.user_id || tokenData?.user?.id || 'unknown');
     const user = await upsertUser({ vk_id, first_name, last_name, avatar });
 
     await logEvent({
@@ -161,8 +179,8 @@ router.get('/vk/callback', async (req, res) => {
       ua: (req.headers['user-agent'] || '').slice(0, 256),
     });
 
-    const sessionJwt = signSession({ uid: user.id, vk_id: user.vk_id });
-    res.cookie('sid', sessionJwt, {
+    // Сессионная кука для API (/api/me и т.п.). Она нужна кросс-сайтово — ставим SameSite=None
+    res.cookie('sid', signSession({ uid: user.id, vk_id: user.vk_id }), {
       httpOnly: true,
       sameSite: 'none',
       secure: true,
@@ -170,11 +188,11 @@ router.get('/vk/callback', async (req, res) => {
       maxAge: 30 * 24 * 3600 * 1000,
     });
 
-    const url = new URL((process.env.FRONTEND_URL || '').trim() || 'https://sweet-twilight-63a9b6.netlify.app');
+    const url = new URL(frontendUrl);
     url.searchParams.set('logged', '1');
     return res.redirect(url.toString());
   } catch (e) {
-    console.error('vk/callback error:', e?.response?.data || e?.message);
+    console.error('vk/callback error:', e?.response?.data || e.message);
     return res.status(500).send('auth callback failed');
   }
 });
