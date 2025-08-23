@@ -7,7 +7,10 @@ import geoip from 'geoip-lite';
 import { ensureTables, getUserById, logEvent, updateUserCountryIfNull } from './src/db.js';
 import authRouter from './src/routes_auth.js';
 import linkRouter from './src/routes_link.js';
-import tgRouter from './src/routes_tg.js'; // ← Добавили
+import tgRouter from './src/routes_tg.js';
+
+// ↓↓↓ ДОБАВЛЕНО: безопасный старт для VK (ставит httpOnly-куку с did и редиректит на oauth.vk.com)
+import makeVkStartRouter from './routes/vk_start_router.js';
 
 dotenv.config();
 
@@ -23,22 +26,26 @@ app.use(cors({
   ].filter(Boolean),
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Password'],
+  // ↓↓↓ ДОБАВЛЕНО: X-Device-Id пригодится, если когда-нибудь решим слать did заголовком
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Password', 'X-Device-Id'],
   maxAge: 86400,
 }));
 app.options('*', cors());
 
 app.use(express.json());
-app.use(express.urlencoded({ extended: true })); // ← Добавили для form-urlencoded
+app.use(express.urlencoded({ extended: true })); // form-urlencoded для некоторых провайдеров
 app.use(cookieParser());
 
 // Health (прогрев)
 app.get('/health', (_, res) => res.status(200).send('ok'));
 
-// Telegram auth callback (НОВОЕ)
+// Telegram auth callback (как и было)
 app.use('/api/auth/tg', tgRouter);
 
-// Остальные маршруты
+// ↓↓↓ ДОБАВЛЕНО: старт VK. Используй на фронте ссылку на /api/auth/vk/start?did=<uuid из localStorage>
+app.use('/api/auth/vk', makeVkStartRouter());
+
+// Остальные маршруты (как и было)
 app.use('/api', linkRouter);
 app.use('/api/auth', authRouter);
 
