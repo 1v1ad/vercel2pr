@@ -9,7 +9,7 @@ import authRouter from './src/routes_auth.js';
 import linkRouter from './src/routes_link.js';
 import tgRouter from './src/routes_tg.js';
 
-// ↓↓↓ ДОБАВЛЕНО: безопасный старт для VK (ставит httpOnly-куку с did и редиректит на oauth.vk.com)
+// Старт VK (редирект на oauth.vk.com, ставим httpOnly куки со state и did)
 import makeVkStartRouter from './routes/vk_start_router.js';
 
 dotenv.config();
@@ -26,26 +26,38 @@ app.use(cors({
   ].filter(Boolean),
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
-  // ↓↓↓ ДОБАВЛЕНО: X-Device-Id пригодится, если когда-нибудь решим слать did заголовком
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Password', 'X-Device-Id'],
   maxAge: 86400,
 }));
 app.options('*', cors());
 
 app.use(express.json());
-app.use(express.urlencoded({ extended: true })); // form-urlencoded для некоторых провайдеров
+app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// Health (прогрев)
+// Health
 app.get('/health', (_, res) => res.status(200).send('ok'));
 
-// Telegram auth callback (как и было)
+// === TG FIX: до роутера вычищаем НЕ-Telegram параметры, чтобы не ломать подпись ===
+app.use('/api/auth/tg/callback', (req, _res, next) => {
+  if (req.query) {
+    const allowed = new Set([
+      'id','first_name','last_name','username','photo_url','auth_date','hash'
+    ]);
+    for (const k of Object.keys(req.query)) {
+      if (!allowed.has(k)) delete req.query[k]; // выкидываем did и прочее
+    }
+  }
+  next();
+});
+
+// Telegram auth callback (как было)
 app.use('/api/auth/tg', tgRouter);
 
-// ↓↓↓ ДОБАВЛЕНО: старт VK. Используй на фронте ссылку на /api/auth/vk/start?did=<uuid из localStorage>
+// Старт VK (наш новый эндпоинт)
 app.use('/api/auth/vk', makeVkStartRouter());
 
-// Остальные маршруты (как и было)
+// Остальные маршруты
 app.use('/api', linkRouter);
 app.use('/api/auth', authRouter);
 
@@ -129,11 +141,9 @@ app.post('/api/events', async (req, res) => {
 app.get('/', (_, res) => res.send('VK Auth backend up'));
 
 const PORT = process.env.PORT || 3001;
-
-// слушаем порт сразу, чтобы Render не «висел» при пробуждении
 app.listen(PORT, () => console.log(`API on :${PORT}`));
 
-// Инициализацию БД запускаем асинхронно, без блокировки старта
+// Инициализация БД асинхронно
 (async () => {
   try {
     await ensureTables();
