@@ -1,7 +1,6 @@
 import express from 'express';
 import axios from 'axios';
 import crypto from 'crypto';
-import { createCodeVerifier, createCodeChallenge } from './pkce.js';
 import { signSession } from './jwt.js';
 import { upsertUser, logEvent } from './db.js';
 
@@ -30,46 +29,36 @@ function firstIp(req) {
   return ipHeader.split(',')[0].trim();
 }
 
-// ====================== VK START (PKCE) ======================
+// ====================== VK START (legacy OAuth) ======================
 router.get('/vk/start', async (req, res) => {
   try {
     const { clientId, redirectUri } = getenv();
 
-    // device id (для фоновой склейки)
-    const did = (req.query?.did || '').toString().slice(0, 200) || null;
+    const did = (req.query?.did || '').toString().slice(0, 200) || null; // для фоновой склейки
+    const state = crypto.randomBytes(16).toString('hex');
 
-    const state        = crypto.randomBytes(16).toString('hex');
-    const codeVerifier = createCodeVerifier();
-    const codeChallenge = createCodeChallenge(codeVerifier);
-
-    // Куки на короткое время
     const tmpCookie = { httpOnly: true, sameSite: 'none', secure: true, path: '/', maxAge: 10 * 60 * 1000 };
     res.cookie('vk_state', state, tmpCookie);
-    res.cookie('vk_code_verifier', codeVerifier, tmpCookie);
     if (did) res.cookie('vk_did', did, tmpCookie);
 
     await logEvent({
       user_id: null,
       event_type: 'auth_start',
-      payload: null,
+      payload: { provider: 'vk', did: did || undefined },
       ip: firstIp(req),
       ua: (req.headers['user-agent'] || '').slice(0, 256),
     });
 
-    // Авторизация через VK ID
-    const u = new URL('https://id.vk.com/authorize');
+    // Классический OAuth
+    const u = new URL('https://oauth.vk.com/authorize');
     u.searchParams.set('response_type', 'code');
     u.searchParams.set('client_id', clientId);
     u.searchParams.set('redirect_uri', redirectUri);
+    u.searchParams.set('scope', 'email'); // минимальный набор
     u.searchParams.set('state', state);
-    u.searchParams.set('code_challenge', codeChallenge);
-    u.searchParams.set('code_challenge_method', 'S256');
-    // Просим только email — безопасно для большинства приложений
-    u.searchParams.set('scope', 'email');
-    u.searchParams.set('v', '5.199');
+    u.searchParams.set('v', '5.199');     // версия API (не обязат., но полезно)
 
-    try { console.log('[VK START] redirect to:', u.toString()); } catch {}
-
+    try { console.log('[VK START legacy] ->', u.toString()); } catch {}
     return res.redirect(u.toString());
   } catch (e) {
     console.error('vk/start error:', e?.message || e);
@@ -81,48 +70,23 @@ router.get('/vk/start', async (req, res) => {
 router.get('/vk/callback', async (req, res) => {
   const { code = '', state = '' } = req.query || {};
   try {
-    const savedState   = req.cookies['vk_state'] || '';
-    const codeVerifier = req.cookies['vk_code_verifier'] || '';
+    if (!code || !state) return res.status(400).send('Missing code/state');
 
-    // «Мягкая» проверка state — логируем, но не ломаем флоу
-    if (!code) return res.status(400).send('Missing code');
-    if (savedState && state && savedState !== state) {
+    const savedState = req.cookies['vk_state'] || '';
+    if (!savedState || savedState !== state) {
       console.warn('[VK CALLBACK] state mismatch', { cookieState: savedState, state });
+      return res.status(400).send('Invalid state');
     }
-    // Чистим временные куки
+
     try {
       res.clearCookie('vk_state', { path: '/', httpOnly: true, sameSite: 'none', secure: true });
-      res.clearCookie('vk_code_verifier', { path: '/', httpOnly: true, sameSite: 'none', secure: true });
     } catch {}
 
     const { clientId, clientSecret, redirectUri, frontendUrl } = getenv();
 
-    // ---------- Обмен кода на токен ----------
-    let tokenData = null;
-
-    // 1) Новый стек VK ID (PKCE)
+    // ---------- Обмен кода на токен (oauth.vk.com) ----------
+    let tokenData;
     try {
-      const body = new URLSearchParams({
-        grant_type: 'authorization_code',
-        code: String(code),
-        client_id: clientId,
-        redirect_uri: redirectUri,
-      });
-      if (clientSecret) body.set('client_secret', clientSecret);
-      if (codeVerifier) body.set('code_verifier', codeVerifier);
-
-      const resp = await axios.post(
-        'https://id.vk.com/oauth2/token',
-        body.toString(),
-        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
-      );
-      tokenData = resp.data;
-    } catch (err) {
-      console.warn('[VK CALLBACK] id.vk.com token fail:', err?.response?.data || err?.message);
-    }
-
-    // 2) Фоллбэк на старый oauth
-    if (!tokenData?.access_token) {
       const resp = await axios.get('https://oauth.vk.com/access_token', {
         params: {
           client_id: clientId,
@@ -133,6 +97,9 @@ router.get('/vk/callback', async (req, res) => {
         timeout: 10000,
       });
       tokenData = resp.data;
+    } catch (err) {
+      console.error('[VK CALLBACK] access_token fail:', err?.response?.data || err?.message);
+      return res.status(500).send('auth callback failed');
     }
 
     const accessToken = tokenData?.access_token;
@@ -160,17 +127,17 @@ router.get('/vk/callback', async (req, res) => {
 
     const vk_id = String(tokenData?.user_id || tokenData?.user?.id || 'unknown');
 
-    // ---------- Апсерт пользователя + лог ----------
+    // ---------- Апсерт + лог ----------
     const user = await upsertUser({ vk_id, first_name, last_name, avatar });
     await logEvent({
       user_id: user.id,
       event_type: 'auth_success',
-      payload: { vk_id },
+      payload: { provider: 'vk', vk_id },
       ip: firstIp(req),
       ua: (req.headers['user-agent'] || '').slice(0, 256),
     });
 
-    // ---------- Ставим сессию ----------
+    // ---------- Сессия ----------
     const sessionJwt = signSession({ uid: user.id, vk_id: user.vk_id });
     res.cookie('sid', sessionJwt, {
       httpOnly: true,
