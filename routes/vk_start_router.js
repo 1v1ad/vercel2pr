@@ -21,7 +21,7 @@ export default function makeVkStartRouter() {
     u.searchParams.set('response_type', 'code');
     u.searchParams.set('client_id', CLIENT_ID);
     u.searchParams.set('redirect_uri', REDIRECT_URI);
-    u.searchParams.set('scope', 'email,phone');
+    u.searchParams.set('scope', 'email');   // <- важно: без phone
     u.searchParams.set('v', '5.199');
     u.searchParams.set('state', state);
     return res.redirect(302, u.toString());
