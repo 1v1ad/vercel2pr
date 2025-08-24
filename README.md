@@ -1,24 +1,24 @@
-# VK Auth Backend (Express)
+# VK + TG Auth (reference)
 
-- VK ID OAuth 2.1 (Authorization Code + PKCE) with **server-side** token exchange.
-- Stores users in **Postgres (Neon)**.
-- Issues **HttpOnly** session cookie `sid` on the backend domain.
+Файлы в этой папке — «эталонная» сборка бэкенда с двумя провайдерами:
+- VK ID (через `id.vk.com` + fallback на `oauth.vk.com`)
+- Telegram Login Widget
 
-## ENV
-See `.env.example`. Critical:
-- `VK_REDIRECT_URI` must be EXACTLY the one in VK app settings.
-- `FRONTEND_URL` is your Netlify URL (CORS + post-login redirect).
-- `DATABASE_URL` must include `sslmode=require` for Neon.
+## Важные ENV
+- `JWT_SECRET` — любой длинный секрет (рекомендуется 64-символов)
+- `VK_CLIENT_ID`
+- `VK_CLIENT_SECRET`
+- `VK_REDIRECT_URI` — должен побайтно совпадать с настройкой Redirect URI в VK
+- `FRONTEND_URL` — базовый URL фронта (для финального редиректа)
+- `TELEGRAM_BOT_TOKEN` — токен бота
 
-## Render
-- Runtime: Node 18+
-- Build Command: `npm ci`
-- Start Command: `npm start`
+## Маршруты
+- `GET /api/auth/vk/start` → редирект на VK
+- `GET /api/auth/vk/callback?code=...&state=...` → обмен кода на токен, установка cookie `sid`
+- `ALL /api/auth/tg/callback` → проверка хэша Telegram, редирект на фронт
+- `GET /api/me` → простая проверка cookie-сессии
 
-(Миграций нет — таблицы создаются автоматически при старте.)
-
-## Endpoints
-- `GET /api/auth/vk/start` → sets `state` + `code_verifier` cookies, redirects to `id.vk.com/authorize`.
-- `GET /api/auth/vk/callback` → exchanges `code` (+`device_id`) for tokens, creates/updates user, sets `sid` cookie, redirects to `FRONTEND_URL?logged=1`.
-- `GET /api/me` → returns user based on `sid` cookie.
-- `GET /health` → healthcheck.
+## Примечания
+- В cookies для state/PKCE используются `SameSite=Lax`, `Secure`, `HttpOnly`.
+- Сессионная cookie `sid` — `SameSite=None`, `Secure` и `HttpOnly`.
+- На странице VK возможны 429 на их Sentry — не влияет на поток авторизации.
