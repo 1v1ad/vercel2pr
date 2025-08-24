@@ -1,5 +1,22 @@
+// src/jwt.js
 import jwt from 'jsonwebtoken';
-const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
+
+function pickSecret() {
+  const s = (process.env.JWT_SECRET || '').trim();
+  return s;
+}
+
 export function signSession(payload) {
-  return jwt.sign(payload, JWT_SECRET, { algorithm: 'HS256', expiresIn: '30d' });
+  const secret = pickSecret();
+  if (!secret) {
+    console.error('[JWT] missing JWT_SECRET');
+    throw new Error('JWT_SECRET missing');
+  }
+  return jwt.sign(payload, secret, { algorithm: 'HS256', expiresIn: '30d' });
+}
+
+export function verifySession(token) {
+  const secret = pickSecret();
+  if (!secret) throw new Error('JWT_SECRET missing');
+  return jwt.verify(token, secret);
 }

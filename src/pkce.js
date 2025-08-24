@@ -1,9 +1,13 @@
+// src/pkce.js
 import crypto from 'crypto';
-function base64url(input){
-  return Buffer.from(input).toString('base64').replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+
+export function createCodeVerifier(length = 64) {
+  // length 43..128
+  const raw = crypto.randomBytes(length);
+  return raw.toString('base64url').slice(0, length);
 }
-export function createCodeVerifier(){ return base64url(crypto.randomBytes(64)); }
-export function createCodeChallenge(verifier){
+
+export function createCodeChallenge(verifier) {
   const hash = crypto.createHash('sha256').update(verifier).digest();
-  return base64url(hash);
+  return Buffer.from(hash).toString('base64url');
 }
