@@ -14,6 +14,7 @@ function getenv() {
   const clientSecret = env.VK_CLIENT_SECRET;
   const redirectUri  = env.VK_REDIRECT_URI || env.REDIRECT_URI;
   const frontendUrl  = env.FRONTEND_URL  || env.CLIENT_URL;
+  const stateSecret  = env.JMT_SECRET || env.JWT_SECRET; // секрет для подписи state
 
   for (const [k, v] of Object.entries({
     VK_CLIENT_ID: clientId,
@@ -23,7 +24,7 @@ function getenv() {
   })) {
     if (!v) throw new Error(`Missing env ${k}`);
   }
-  return { clientId, clientSecret, redirectUri, frontendUrl };
+  return { clientId, clientSecret, redirectUri, frontendUrl, stateSecret };
 }
 
 function firstIp(req) {
@@ -31,37 +32,72 @@ function firstIp(req) {
   return ipHeader.split(',')[0].trim();
 }
 
-// Унифицированные опции кук, чтобы точно вернулись после редиректа с id.vk.com
+// ===== base64url helpers =====
+const b64u = {
+  enc: (buf) => Buffer.from(buf).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''),
+  dec: (str) => Buffer.from(str.replace(/-/g,'+').replace(/_/g,'/'), 'base64'),
+};
+
+// Подписываем state (HMAC-SHA256), чтобы не тащить хранение на сервере.
+function signState(payloadObj, secret) {
+  const payloadBuf = Buffer.from(JSON.stringify(payloadObj));
+  const sigBuf = crypto.createHmac('sha256', secret).update(payloadBuf).digest();
+  return `${b64u.enc(payloadBuf)}.${b64u.enc(sigBuf)}`;
+}
+
+function verifyState(stateStr, secret, maxAgeSec = 600) {
+  if (!stateStr || !secret || !stateStr.includes('.')) return null;
+  const [p, s] = stateStr.split('.');
+  try {
+    const payloadBuf = b64u.dec(p);
+    const expectedSig = b64u.enc(crypto.createHmac('sha256', secret).update(payloadBuf).digest());
+    if (s !== expectedSig) return null;
+    const obj = JSON.parse(payloadBuf.toString('utf8'));
+    if (!obj.ts || Math.abs(Date.now()/1000 - Number(obj.ts)) > maxAgeSec) return null;
+    return obj;
+  } catch {
+    return null;
+  }
+}
+
+// На всякий случай — куки как запасной вариант
 const cookieOpts = {
   httpOnly: true,
-  sameSite: 'none', // важно: кросс-сайтовый редирект
+  sameSite: 'none',
   secure: true,
   path: '/',
-  maxAge: 10 * 60 * 1000, // 10 минут на весь PKCE-обмен
+  maxAge: 10 * 60 * 1000,
 };
 
 router.get('/vk/start', async (req, res) => {
   try {
-    const { clientId, redirectUri } = getenv();
+    const { clientId, redirectUri, stateSecret } = getenv();
 
-    // PKCE
-    const state        = crypto.randomBytes(16).toString('hex');
+    const deviceId = typeof req.query.did === 'string' ? req.query.did.trim() : '';
     const codeVerifier = createCodeVerifier();
     const codeChallenge = createCodeChallenge(codeVerifier);
 
-    // сохраняем в куках (host-only, без домена)
+    // Статлесс state: несём cv + таймштамп (+ did для симметрии)
+    const rawState = {
+      cv: codeVerifier,
+      did: deviceId || undefined,
+      ts: Math.floor(Date.now()/1000),
+      n: crypto.randomBytes(8).toString('hex'), // nonce
+    };
+    const state = stateSecret ? signState(rawState, stateSecret) : crypto.randomBytes(16).toString('hex');
+
+    // Кладём куки только как резерв
     res.cookie('vkid_state', state, cookieOpts);
     res.cookie('vkid_code_verifier', codeVerifier, cookieOpts);
 
     await logEvent({
       user_id: null,
       event_type: 'auth_start',
-      payload: null,
+      payload: { did: deviceId ? 'set' : 'none' },
       ip: firstIp(req),
       ua: (req.headers['user-agent'] || '').slice(0, 256),
     });
 
-    // строим ссылку на VK ID
     const u = new URL('https://id.vk.com/authorize');
     u.searchParams.set('response_type', 'code');
     u.searchParams.set('client_id', clientId);
@@ -69,15 +105,9 @@ router.get('/vk/start', async (req, res) => {
     u.searchParams.set('state', state);
     u.searchParams.set('code_challenge', codeChallenge);
     u.searchParams.set('code_challenge_method', 'S256');
-    // если фронт передаст device id (did), пробросим его
-    if (typeof req.query.did === 'string' && req.query.did.trim()) {
-      u.searchParams.set('device_id', req.query.did.trim());
-    }
-    // можно добавить скоупы по необходимости
-    // u.searchParams.set('scope', 'email'); // пример
+    if (deviceId) u.searchParams.set('device_id', deviceId);
 
-    console.log('[VK START] redirect to:', u.toString());
-
+    console.log('[VK START] →', u.toString());
     return res.redirect(u.toString());
   } catch (e) {
     console.error('vk/start error:', e?.message || e);
@@ -87,45 +117,49 @@ router.get('/vk/start', async (req, res) => {
 
 router.get('/vk/callback', async (req, res) => {
   const { code, state } = req.query;
+  const cookies = { st: req.cookies['vkid_state'], cv: req.cookies['vkid_code_verifier'] };
 
-  // снимаем куки в самом начале, чтобы не протекали дальше
-  const savedState    = req.cookies['vkid_state'];
-  const codeVerifier  = req.cookies['vkid_code_verifier'];
+  // Сразу стираем куки (не зависим от них)
   res.clearCookie('vkid_state', { path: '/' });
   res.clearCookie('vkid_code_verifier', { path: '/' });
 
+  const { clientId, clientSecret, redirectUri, frontendUrl, stateSecret } = getenv();
+
+  // Пытаемся достать cv из state (приоритизируем это)
+  const parsed = stateSecret ? verifyState(String(state || ''), stateSecret) : null;
+  const codeVerifier = parsed?.cv || cookies.cv || null;
+
   const stateCheck = {
     hasCode: !!code,
-    hasState: !!state,
-    savedState: !!savedState,
-    codeVerifier: !!codeVerifier,
+    echoedState: !!state,
+    stateParsed: !!parsed,
+    hasCV: !!codeVerifier,
+    cookieState: !!cookies.st,
+    cookieCV: !!cookies.cv,
   };
-  console.log('[VK CALLBACK] state check {', stateCheck, '}');
+  console.log('[VK CALLBACK] state check:', stateCheck);
 
-  if (!code || !state || !savedState || savedState !== state || !codeVerifier) {
+  if (!code || !codeVerifier) {
     return res.status(400).send('Invalid state');
   }
 
   try {
-    const { clientId, clientSecret, redirectUri, frontendUrl } = getenv();
+    // Обмен кода на токен (именно token-эндпоинт VK ID)
+    const form = new URLSearchParams({
+      grant_type: 'authorization_code',
+      code: String(code),
+      client_id: clientId,
+      client_secret: clientSecret,
+      redirect_uri: redirectUri,
+      code_verifier: codeVerifier,
+    }).toString();
 
-    // ===== обмен кода на токен у VK ID (правильный токен-эндпоинт) =====
     let tokenData;
     try {
-      const form = new URLSearchParams({
-        grant_type: 'authorization_code',
-        code: String(code),
-        client_id: clientId,
-        client_secret: clientSecret,
-        redirect_uri: redirectUri,
-        code_verifier: codeVerifier,
+      const resp = await axios.post('https://id.vk.com/oauth2/token', form, {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: 10000,
       });
-
-      const resp = await axios.post(
-        'https://id.vk.com/oauth2/token',
-        form.toString(),
-        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 },
-      );
       tokenData = resp.data;
     } catch (err) {
       const status = err?.response?.status;
@@ -134,23 +168,17 @@ router.get('/vk/callback', async (req, res) => {
       return res.status(500).send('auth callback failed');
     }
 
-    const accessToken =
-      tokenData?.access_token || tokenData?.token || tokenData?.access_token_value;
-
+    const accessToken = tokenData?.access_token || tokenData?.token || tokenData?.access_token_value;
     if (!accessToken) {
       console.error('no access_token in tokenData:', tokenData);
       return res.status(500).send('auth callback failed');
     }
 
-    // ===== профиль =====
+    // Профиль
     let first_name = '', last_name = '', avatar = '';
     try {
       const u = await axios.get('https://api.vk.com/method/users.get', {
-        params: {
-          access_token: accessToken,
-          v: '5.199',
-          fields: 'photo_200,first_name,last_name',
-        },
+        params: { access_token: accessToken, v: '5.199', fields: 'photo_200,first_name,last_name' },
         timeout: 10000,
       });
       const r = u.data?.response?.[0];
@@ -163,9 +191,7 @@ router.get('/vk/callback', async (req, res) => {
       console.warn('users.get failed:', e?.response?.data || e?.message);
     }
 
-    // некоторые ответы VK ID возвращают user.id внутри tokenData.user
     const vk_id = String(tokenData?.user_id || tokenData?.user?.id || 'unknown');
-
     const user = await upsertUser({ vk_id, first_name, last_name, avatar });
 
     await logEvent({
@@ -186,7 +212,6 @@ router.get('/vk/callback', async (req, res) => {
       maxAge: 30 * 24 * 3600 * 1000,
     });
 
-    // редирект на фронт
     const url = new URL(frontendUrl);
     url.searchParams.set('logged', '1');
     return res.redirect(url.toString());
