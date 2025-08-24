@@ -1,50 +1,35 @@
-// server.js
 import express from 'express';
 import cookieParser from 'cookie-parser';
-import cors from 'cors';
-import vkAuthRouter from './src/routes_auth.js';
-import tgAuthRouter from './src/routes_tg.js';
-import { verifySession } from './src/jwt.js';
+import authRouter from './src/routes_auth.js';
 
 const app = express();
-app.use(express.json());
-app.use(cookieParser());
 
-// CORS: allow your front if set
-const FRONTEND_URL = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
-if (FRONTEND_URL) {
-  app.use(cors({
-    origin: FRONTEND_URL,
-    credentials: true,
-  }));
-}
-
-// Boot env check (doesn't print secrets)
+// Minimal env sanity log
 console.log('[BOOT] env check:', {
-  JWT_SECRET: !!(process.env.JWT_SECRET && process.env.JWT_SECRET.trim()),
+  JWT_SECRET: !!process.env.JWT_SECRET,
   VK_CLIENT_ID: !!process.env.VK_CLIENT_ID,
   VK_CLIENT_SECRET: !!process.env.VK_CLIENT_SECRET,
   VK_REDIRECT_URI: !!process.env.VK_REDIRECT_URI,
   FRONTEND_URL: !!process.env.FRONTEND_URL,
 });
 
-app.use('/api/auth/vk', vkAuthRouter);
-app.use('/api/auth/tg', tgAuthRouter);
+app.use(cookieParser());
 
-// Minimal /api/me to test cookie session
-app.get('/api/me', (req, res) => {
-  const token = req.cookies?.sid;
-  if (!token) return res.status(401).json({ ok:false, reason:'no sid' });
-  try {
-    const data = verifySession(token);
-    return res.json({ ok:true, user: data });
-  } catch (e) {
-    return res.status(401).json({ ok:false, reason:'bad sid' });
-  }
+// Health checks
+app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
+app.get('/api/auth/healthz', (_req, res) => res.type('text/plain').send('ok'));
+app.get('/auth/healthz', (_req, res) => res.type('text/plain').send('ok'));
+
+// Mount the auth router on BOTH prefixes to avoid 404 due to prefix mismatches
+app.use(['/api/auth', '/auth'], authRouter);
+
+// Fallback 404 visibility
+app.use((req, res, _next) => {
+  res.status(404).type('text/plain').send(`Not found: ${req.method} ${req.originalUrl}`);
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log('API on :' + PORT);
-  console.log('==> Your service is live ✨');
+const port = process.env.PORT || 10000;
+app.listen(port, () => {
+  console.log('API on :' + port);
+  console.log('==> Try /api/auth/healthz and /auth/healthz');
 });
