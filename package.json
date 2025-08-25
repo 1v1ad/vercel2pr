@@ -1,8 +1,8 @@
 {
   "name": "vk-auth-backend",
-  "version": "1.0.0",
+  "version": "0.0.0",
   "type": "module",
-  "private": true,
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
@@ -10,8 +10,5 @@
     "cookie-parser": "^1.4.6",
     "express": "^4.19.2",
     "jsonwebtoken": "^9.0.2"
-  },
-  "engines": {
-    "node": ">=18"
   }
 }
