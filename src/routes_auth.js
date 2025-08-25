@@ -1,130 +1,152 @@
 import express from 'express';
-import crypto from 'crypto';
 
 const router = express.Router();
 
-// Helpers
-const b64url = (buf) =>
-  buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+// --- Utilities --------------------------------------------------------------
+const base64url = (buf) =>
+  Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
-const sha256 = (input) => crypto.createHash('sha256').update(input).digest();
+function randomVerifier() {
+  return base64url(crypto.getRandomValues(new Uint8Array(32)));
+}
 
-const randomString = (len = 32) => b64url(crypto.randomBytes(len)).slice(0, len);
+async function sha256Base64Url(input) {
+  const enc = new TextEncoder();
+  const data = enc.encode(input);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return base64url(Buffer.from(digest));
+}
 
-// Cookie options (Path is critical so the cookie reaches the callback)
-const cookieBase = {
-  httpOnly: true,
-  secure: true,        // Render uses HTTPS
-  sameSite: 'none',
-  path: '/api/auth',
-  maxAge: 10 * 60 * 1000, // 10 minutes
-};
+// Polyfill Web Crypto in Node
+import { webcrypto as _webcrypto } from 'crypto';
+const crypto = _webcrypto;
 
-const VK_AUTH_URL = 'https://id.vk.com/authorize';
-const VK_TOKEN_URL = 'https://id.vk.com/oauth2/v2.0/token';
+// --- Config -----------------------------------------------------------------
+const {
+  VK_CLIENT_ID,
+  VK_CLIENT_SECRET,
+  VK_REDIRECT_URI,
+  FRONTEND_URL,
+} = process.env;
 
-// GET /api/auth/start
-router.get('/start', async (req, res) => {
+// Cookie key to keep PKCE state
+const STATE_COOKIE = 'vk_oauth_state';
+
+// --- Routes -----------------------------------------------------------------
+router.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
+
+// Support BOTH /start and /vk/start to match old and new links
+router.get(['/start', '/vk/start'], async (req, res) => {
   try {
-    const state = randomString(32);
-    const verifier = randomString(64);
-    const challenge = b64url(sha256(verifier));
+    if (!VK_CLIENT_ID || !VK_REDIRECT_URI) {
+      return res.status(500).type('text/plain').send('VK env not configured');
+    }
+    // PKCE
+    const code_verifier = randomVerifier();
+    const code_challenge = await sha256Base64Url(code_verifier);
+    const state = base64url(crypto.getRandomValues(new Uint8Array(16)));
 
-    // Save to cookies for the callback to validate
-    res.cookie('vk_oauth_state', state, cookieBase);
-    res.cookie('vk_pkce_verifier', verifier, cookieBase);
-
-    const params = new URLSearchParams({
-      response_type: 'code',
-      client_id: String(process.env.VK_CLIENT_ID || ''),
-      redirect_uri: String(process.env.VK_REDIRECT_URI || ''),
-      scope: 'email',
-      state,
-      code_challenge: challenge,
-      code_challenge_method: 'S256',
+    // Save state data in httpOnly cookie for verification on callback
+    const statePayload = { state, code_verifier, t: Date.now() };
+    res.cookie(STATE_COOKIE, JSON.stringify(statePayload), {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 10 * 60 * 1000, // 10 min
     });
 
-    const redirectTo = `${VK_AUTH_URL}?${params.toString()}`;
-    console.log('[VK START] redirect to:', redirectTo.replace(/client_id=\d+/,'client_id=*'));
-    return res.redirect(302, redirectTo);
+    // Build VK authorize URL
+    const u = new URL('https://id.vk.com/authorize');
+    u.searchParams.set('response_type', 'code');
+    u.searchParams.set('client_id', VK_CLIENT_ID);
+    u.searchParams.set('redirect_uri', VK_REDIRECT_URI);
+    u.searchParams.set('code_challenge', code_challenge);
+    u.searchParams.set('code_challenge_method', 'S256');
+    u.searchParams.set('state', state);
+    // Optional scopes
+    if (req.query.scope) u.searchParams.set('scope', String(req.query.scope));
+
+    console.log('[VK START] redirect to:', u.toString());
+    return res.redirect(u.toString());
   } catch (e) {
-    console.error('[VK START] error', e);
-    return res.status(500).type('text/plain').send('auth start failed');
+    console.error('start error', e);
+    return res.status(500).type('text/plain').send('start failed');
   }
 });
 
-// GET /api/auth/vk/callback
-router.get('/vk/callback', async (req, res) => {
-  const { code, state } = req.query;
+// Support BOTH /callback and /vk/callback
+router.get(['/callback', '/vk/callback'], async (req, res) => {
   try {
-    const savedState = req.cookies['vk_oauth_state'];
-    const verifier = req.cookies['vk_pkce_verifier'];
+    const { code, state } = req.query;
+    if (!code || !state) {
+      return res.status(400).type('text/plain').send('Invalid callback params');
+    }
 
-    console.log('[VK CALLBACK] state check:', {
-      hasCode: !!code,
-      hasState: !!state,
-      savedState: !!savedState,
-      codeVerifier: !!verifier,
-    });
-
-    if (!code || !state || !savedState || !verifier || state !== savedState) {
-      console.warn('[VK CALLBACK] invalid state check', { state, savedState });
+    const savedRaw = req.cookies?.[STATE_COOKIE];
+    let saved;
+    try { saved = savedRaw ? JSON.parse(savedRaw) : null; } catch {}
+    if (!saved || saved.state !== state) {
+      console.warn('[VK CALLBACK] invalid state', { state, hasSaved: !!saved });
       return res.status(400).type('text/plain').send('Invalid state');
     }
 
-    // Clean the cookies to avoid reuse
-    res.clearCookie('vk_oauth_state', cookieBase);
-    res.clearCookie('vk_pkce_verifier', cookieBase);
-
-    // Exchange code for tokens. IMPORTANT: do NOT send device_id for web flow.
-    const body = new URLSearchParams({
+    // Exchange code -> token
+    const tokenBody = new URLSearchParams({
       grant_type: 'authorization_code',
+      client_id: VK_CLIENT_ID,
+      client_secret: VK_CLIENT_SECRET,
+      redirect_uri: VK_REDIRECT_URI,
       code: String(code),
-      client_id: String(process.env.VK_CLIENT_ID || ''),
-      client_secret: String(process.env.VK_CLIENT_SECRET || ''),
-      redirect_uri: String(process.env.VK_REDIRECT_URI || ''),
-      code_verifier: String(verifier),
+      code_verifier: saved.code_verifier,
     });
 
-    const tokenResp = await fetch(VK_TOKEN_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json',
-      },
-      body,
-    });
+    // Try new VK ID endpoint first
+    const tokenEndpoints = [
+      'https://id.vk.com/oauth2/token',          // VK ID (new)
+      'https://oauth.vk.com/access_token',       // Legacy
+    ];
 
-    let data;
-    const text = await tokenResp.text();
-    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    let tokenJson;
+    let lastErr;
+    for (const ep of tokenEndpoints) {
+      try {
+        const resp = await fetch(ep, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: tokenBody.toString(),
+        });
+        const txt = await resp.text();
+        let json;
+        try { json = JSON.parse(txt); } catch { json = { raw: txt }; }
+        if (!resp.ok || json.error) {
+          lastErr = { status: resp.status, json };
+          console.warn('[VK TOKEN] failed @', ep, lastErr);
+          continue;
+        }
+        tokenJson = json;
+        break;
+      } catch (e) {
+        lastErr = { message: String(e) };
+        console.warn('[VK TOKEN] fetch error @', ep, lastErr);
+      }
+    }
 
-    if (!tokenResp.ok || data.error) {
-      console.error('[VK CALLBACK] token exchange failed:', data);
+    if (!tokenJson) {
       return res.status(400).type('text/plain').send('Token exchange failed');
     }
 
-    console.log('[VK CALLBACK] token ok, scope:', data.scope);
+    // Clear state cookie (one-time)
+    res.clearCookie(STATE_COOKIE, { path: '/' });
 
-    // Success: redirect to frontend if configured, or say ok
-    const to = process.env.FRONTEND_URL;
-    if (to) {
-      const url = new URL(to);
-      url.hash = 'auth=ok';
-      return res.redirect(302, url.toString());
-    }
-    return res.type('text/plain').send('ok');
+    // Redirect back to frontend with a tiny success flag (you can swap for JWT/session)
+    const redirect = new URL(FRONTEND_URL || '/', 'https://dummy.local');
+    redirect.searchParams.set('auth', 'ok');
+    return res.redirect(redirect.pathname + redirect.search);
   } catch (e) {
-    console.error('[VK CALLBACK] error', e);
+    console.error('vk/callback error:', e);
     return res.status(500).type('text/plain').send('auth callback failed');
   }
-});
-
-// Optional: tiny logout helper that clears cookies
-router.post('/logout', (req, res) => {
-  res.clearCookie('vk_oauth_state', cookieBase);
-  res.clearCookie('vk_pkce_verifier', cookieBase);
-  res.status(204).end();
 });
 
 export default router;
