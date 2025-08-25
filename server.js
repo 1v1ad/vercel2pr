@@ -4,6 +4,12 @@ import authRouter from './src/routes_auth.js';
 
 const app = express();
 
+// Behind Render/Netlify proxies we want correct protocol/ip for secure cookies
+app.set('trust proxy', 1);
+
+app.use(express.json());
+app.use(cookieParser());
+
 // Minimal env sanity log
 console.log('[BOOT] env check:', {
   JWT_SECRET: !!process.env.JWT_SECRET,
@@ -13,15 +19,12 @@ console.log('[BOOT] env check:', {
   FRONTEND_URL: !!process.env.FRONTEND_URL,
 });
 
-app.use(cookieParser());
-
 // Health checks
 app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
 app.get('/api/auth/healthz', (_req, res) => res.type('text/plain').send('ok'));
-app.get('/auth/healthz', (_req, res) => res.type('text/plain').send('ok'));
 
-// Mount the auth router on BOTH prefixes to avoid 404 due to prefix mismatches
-app.use(['/api/auth', '/auth'], authRouter);
+// Mount the auth router ONLY on /api/auth to keep cookie Path predictable
+app.use('/api/auth', authRouter);
 
 // Fallback 404 visibility
 app.use((req, res, _next) => {
@@ -31,5 +34,5 @@ app.use((req, res, _next) => {
 const port = process.env.PORT || 10000;
 app.listen(port, () => {
   console.log('API on :' + port);
-  console.log('==> Try /api/auth/healthz and /auth/healthz');
+  console.log('==> Try /api/auth/healthz and /api/auth/start');
 });
