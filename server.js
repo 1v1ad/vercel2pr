@@ -1,11 +1,10 @@
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import authRouter from './src/routes_auth.js';
-// Optional: alias so /api/auth/tg/* forwards to existing /api/tg/* routes you already have
-import tgAlias from './src/tg_alias.js';
 
 const app = express();
 
+// Minimal env sanity log
 console.log('[BOOT] env check:', {
   JWT_SECRET: !!process.env.JWT_SECRET,
   VK_CLIENT_ID: !!process.env.VK_CLIENT_ID,
@@ -16,20 +15,16 @@ console.log('[BOOT] env check:', {
 
 app.use(cookieParser());
 
-// health
+// Health checks
 app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
 app.get('/api/auth/healthz', (_req, res) => res.type('text/plain').send('ok'));
 app.get('/auth/healthz', (_req, res) => res.type('text/plain').send('ok'));
 
-// mount auth
+// Mount the auth router on BOTH prefixes to avoid 404 due to prefix mismatches
 app.use(['/api/auth', '/auth'], authRouter);
 
-// keep TG login working if your real router lives on /api/tg/**
-// (/api/auth/tg/* -> /api/tg/*)
-app.use('/api/auth/tg', tgAlias);
-
-// 404 fallback
-app.use((req, res) => {
+// Fallback 404 visibility
+app.use((req, res, _next) => {
   res.status(404).type('text/plain').send(`Not found: ${req.method} ${req.originalUrl}`);
 });
 
