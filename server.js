@@ -1,4 +1,10 @@
-// server.js (adaptive IDs + explicit CORS preflight handler)
+// server.js — VK OAuth Code Flow + Telegram verify + background linking
+// - CORS preflight fixed
+// - DB schema adapts to users.id type (uuid vs int)
+// - /api/auth/vk/login and /api/auth/vk/callback for VK code flow
+// - /api/log-auth for Telegram (with signature verify)
+// - /api/me to read current user by signed 'aid' cookie
+
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
@@ -13,6 +19,12 @@ const AID_COOKIE_NAME = 'aid';
 const AID_SECRET = process.env.AID_SECRET || 'dev_aid_secret_change_me';
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+
+// VK OAuth (code flow)
+const VK_CLIENT_ID = process.env.VK_CLIENT_ID || process.env.VITE_VK_APP_ID || '';
+const VK_CLIENT_SECRET = process.env.VK_CLIENT_SECRET || '';
+const VK_REDIRECT_URI = process.env.VK_REDIRECT_URI || ''; // e.g. https://vercel2pr.onrender.com/api/auth/vk/callback
+const FRONTEND_RETURN_URL = process.env.FRONTEND_RETURN_URL || (CORS_ORIGINS[0] || '');
 
 app.use(express.json());
 app.use(cookieParser(AID_SECRET));
@@ -29,8 +41,9 @@ const corsOptions = {
   allowedHeaders: ['Content-Type', 'Authorization']
 };
 app.use(cors(corsOptions));
-// Explicitly answer all preflight requests even if route is missing during cold start
 app.options('*', cors(corsOptions));
+
+const { URLSearchParams } = require('url');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -232,6 +245,74 @@ function verifyTelegramAuth(data) {
   return { ok: computed === String(hash).toLowerCase(), reason: computed };
 }
 
+// === VK OAuth Code Flow endpoints ===
+app.get('/api/auth/vk/login', (req, res) => {
+  if (!VK_CLIENT_ID || !VK_REDIRECT_URI) {
+    return res.status(500).send('VK OAuth not configured');
+  }
+  const state = crypto.randomBytes(12).toString('hex');
+  const next = req.query.next || FRONTEND_RETURN_URL || '';
+  const isProd = (process.env.NODE_ENV === 'production');
+  res.cookie('vk_oauth_state', state, {
+    httpOnly: true, sameSite: 'lax', secure: isProd, signed: true, maxAge: 10 * 60 * 1000
+  });
+  if (next) {
+    res.cookie('vk_oauth_next', String(next), { httpOnly: true, sameSite: 'lax', secure: isProd, signed: true, maxAge: 10*60*1000 });
+  }
+  const params = new URLSearchParams({
+    client_id: String(VK_CLIENT_ID),
+    display: 'page',
+    redirect_uri: VK_REDIRECT_URI,
+    response_type: 'code',
+    scope: '0',
+    state
+  });
+  const url = `https://oauth.vk.com/authorize?${params.toString()}`;
+  res.redirect(url);
+});
+
+app.get('/api/auth/vk/callback', async (req, res) => {
+  try {
+    const { code, state, error, error_description } = req.query;
+    if (error) return res.status(400).send(`VK error: ${error} ${error_description || ''}`);
+    const saved = req.signedCookies['vk_oauth_state'];
+    if (!state || !saved || String(state) !== String(saved)) return res.status(400).send('Invalid state');
+
+    // exchange code for token
+    const params = new URLSearchParams({
+      client_id: String(VK_CLIENT_ID),
+      client_secret: String(VK_CLIENT_SECRET),
+      redirect_uri: VK_REDIRECT_URI,
+      code: String(code || '')
+    });
+    const r = await fetch(`https://oauth.vk.com/access_token?${params.toString()}`);
+    const json = await r.json();
+    if (json.error) {
+      return res.status(400).send(`Token exchange failed: ${json.error_description || json.error}`);
+    }
+    const vkUserId = json.user_id;
+    if (!vkUserId) return res.status(400).send('No user_id in token response');
+
+    // create/attach identity + set aid cookie
+    const { userId } = await ensureUserAndIdentity({
+      provider: 'vk', providerUserId: String(vkUserId), userData: { provider: 'vk', id: vkUserId }, req
+    });
+    await pool.query(
+      'INSERT INTO user_actions (user_id, action, metadata) VALUES ($1,$2,$3)',
+      [userId, 'vk_login_codeflow', { vk_user_id: vkUserId }]
+    );
+
+    // redirect back to frontend
+    const next = req.signedCookies['vk_oauth_next'] || FRONTEND_RETURN_URL || '/';
+    const sep = (next && next.includes('?')) ? '&' : '?';
+    res.redirect(`${next}${sep}vk=ok`);
+  } catch (e) {
+    console.error('[vk/callback] error:', e);
+    res.status(500).send('VK callback failed');
+  }
+});
+
+// Health & auth APIs
 app.get('/api/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
 app.post('/api/log-auth', async (req, res) => {
@@ -275,7 +356,6 @@ app.get('/api/me', async (req, res) => {
   }
 });
 
-app.get('/api/auth/vk/callback', (req, res) => res.status(200).send('VK callback OK'));
 app.get('/', (req, res) => res.send('Auth/linking backend is alive'));
 
 initDB().then(() => app.listen(PORT, () => console.log(`[BOOT] Listening on ${PORT}`)))
