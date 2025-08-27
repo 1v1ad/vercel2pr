@@ -1,7 +1,4 @@
-// server.js (adaptive IDs)
-// Detects existing users.id type (uuid vs integer) and aligns foreign keys accordingly.
-// Adds a VK callback stub. Keeps background linking via signed 'aid' cookie.
-
+// server.js (adaptive IDs + explicit CORS preflight handler)
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
@@ -32,6 +29,8 @@ const corsOptions = {
   allowedHeaders: ['Content-Type', 'Authorization']
 };
 app.use(cors(corsOptions));
+// Explicitly answer all preflight requests even if route is missing during cold start
+app.options('*', cors(corsOptions));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -40,9 +39,7 @@ const pool = new Pool({
     : undefined
 });
 
-function hmac(data) {
-  return crypto.createHmac('sha256', AID_SECRET).update(data).digest('hex');
-}
+function hmac(data) { return crypto.createHmac('sha256', AID_SECRET).update(data).digest('hex'); }
 function hashUA(ua='') { return hmac('ua:' + ua); }
 function hashIP(ip='') { return hmac('ip:' + ip); }
 function newAidToken() { return crypto.randomBytes(16).toString('hex'); }
@@ -55,8 +52,7 @@ async function getUsersIdType(client) {
     LIMIT 1;
   `);
   if (q.rows.length === 0) return null;
-  const t = q.rows[0].data_type;
-  if (!t) return null;
+  const t = q.rows[0].data_type || '';
   if (t.includes('uuid')) return 'uuid';
   if (t.includes('integer') || t.includes('bigint')) return 'int';
   return 'int';
@@ -68,7 +64,6 @@ async function initDB() {
     await client.query('BEGIN');
     await client.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
 
-    // Ensure users table exists; prefer to keep existing type if present
     let idType = await getUsersIdType(client);
     if (!idType) {
       await client.query(`
@@ -80,7 +75,6 @@ async function initDB() {
       `);
       idType = 'int';
     }
-
     const USER_ID_SQLTYPE = idType === 'uuid' ? 'UUID' : 'BIGINT';
 
     await client.query(`
@@ -174,7 +168,7 @@ async function ensureUserAndIdentity({ provider, providerUserId, userData, req }
       userId = identityRes.rows[0].user_id;
       await client.query('UPDATE identities SET user_data = $1 WHERE id = $2', [userData, identityId]);
     } else {
-      let u = await client.query('INSERT INTO users DEFAULT VALUES RETURNING id');
+      const u = await client.query('INSERT INTO users DEFAULT VALUES RETURNING id');
       userId = u.rows[0].id;
       const i = await client.query(
         `INSERT INTO identities (user_id, provider, provider_user_id, user_data)
@@ -185,8 +179,7 @@ async function ensureUserAndIdentity({ provider, providerUserId, userData, req }
       isNewUser = true;
     }
 
-    const signedAid = req.signedCookies[AID_COOKIE_NAME];
-    let aid = signedAid;
+    let aid = req.signedCookies[AID_COOKIE_NAME];
     if (!aid) {
       aid = newAidToken();
       const isProd = (process.env.NODE_ENV === 'production');
@@ -233,7 +226,7 @@ function verifyTelegramAuth(data) {
   if (!TELEGRAM_BOT_TOKEN) return { ok: false, reason: 'No TELEGRAM_BOT_TOKEN set' };
   const { hash, ...fields } = data || {};
   if (!hash) return { ok: false, reason: 'No hash provided' };
-  const pairs = Object.keys(fields).sort().map(k => `${k}=${fields[k]}`).join('\\n');
+  const pairs = Object.keys(fields).sort().map(k => `${k}=${fields[k]}`).join('\n');
   const secret = crypto.createHash('sha256').update(TELEGRAM_BOT_TOKEN).digest();
   const computed = crypto.createHmac('sha256', secret).update(pairs).digest('hex');
   return { ok: computed === String(hash).toLowerCase(), reason: computed };
@@ -282,7 +275,6 @@ app.get('/api/me', async (req, res) => {
   }
 });
 
-// VK callback stub
 app.get('/api/auth/vk/callback', (req, res) => res.status(200).send('VK callback OK'));
 app.get('/', (req, res) => res.send('Auth/linking backend is alive'));
 
