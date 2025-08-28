@@ -1,59 +1,41 @@
-
-import express from 'express';
-import cors from 'cors';
-import cookieParser from 'cookie-parser';
-import { ensureTables, getUserById, logEvent } from './src/db.js';
-import { signSession } from './src/jwt.js';
-import authRoutes from './src/routes_auth.js';
-import tgRoutes from './src/routes_tg.js';
+// server.js
+import express from "express";
+import cookieParser from "cookie-parser";
+import cors from "cors";
+import routes from "./src/routes_auth.js";
 
 const app = express();
 
-const FRONTEND = process.env.FRONTEND_URL || process.env.FRONTEND_RETURN_URL || 'http://localhost:5173';
-const CORS_ORIGINS = (process.env.CORS_ORIGINS || FRONTEND).split(',').map(s => s.trim());
+const FRONTEND_URL = process.env.FRONTEND_URL; // https://sweet-twilight-63a9b6.netlify.app
 
-app.use(cors({
-  origin: (origin, cb)=> cb(null, true),
-  credentials: true,
-}));
-app.use(express.json());
 app.use(cookieParser());
+app.use(
+  cors({
+    origin: FRONTEND_URL,
+    credentials: true, // <-- обязательно
+  })
+);
 
-// Health
-app.get('/', (req,res)=> res.type('text/plain').send('Backend up'));
-app.get('/health', (req,res)=> res.json({ok:true}));
+// health
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-// API
-app.get('/api/me', async (req,res)=>{
+// текущий пользователь (из куки sid)
+app.get("/api/me", (req, res) => {
+  const b64 = req.cookies?.sid;
+  if (!b64) return res.status(401).json({ ok: false });
   try {
-    const sid = req.cookies.sid;
-    if(!sid) return res.status(401).json({ ok:false, reason:'no-cookie' });
-    const user = await getUserById(sid);
-    if(!user) return res.status(401).json({ ok:false, reason:'no-user' });
-    res.json({ ok:true, user });
-  } catch(err){
-    console.error('[ME]', err);
-    res.status(500).json({ ok:false, error: String(err) });
+    const user = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
+    return res.json({ ok: true, user });
+  } catch {
+    return res.status(401).json({ ok: false });
   }
 });
 
-app.post('/api/events', async (req,res)=>{
-  const { type, data } = req.body || {};
-  const sid = req.cookies.sid || null;
-  try{
-    await logEvent(sid, type || 'event', data || {});
-    res.json({ ok:true });
-  }catch(err){
-    res.status(500).json({ ok:false, error:String(err)});
-  }
+// роуты авторизации
+app.use("/api", routes);
+
+// порт Render игнорирует; слушаем 10000 или любой
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`[BOOT] listening on :${PORT}`);
 });
-
-app.use(authRoutes);
-app.use(tgRoutes);
-
-const start = async ()=>{
-  await ensureTables();
-  const port = process.env.PORT || 3001;
-  app.listen(port, ()=> console.log(`[BOOT] listening on :${port}`));
-};
-start();
