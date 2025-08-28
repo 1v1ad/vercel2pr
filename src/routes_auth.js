@@ -1,196 +1,177 @@
-// src/routes_auth.js — VK + TG маршруты, PKCE, линковка
-import express from 'express';
-import cookieParser from 'cookie-parser'; // на всякий случай, если сервер не подключил
-import { createCodeVerifier, createCodeChallenge } from './pkce.js';
+// src/routes_auth.js
+import fetch from "node-fetch";
+import crypto from "crypto";
+import express from "express";
 
 const router = express.Router();
 
-// Если сервер не сделал app.use(cookieParser()), подключим локально.
-// (Повторное подключение безвредно.)
-router.use(cookieParser());
-
-// ENV
 const {
   FRONTEND_URL,
   VK_CLIENT_ID,
   VK_CLIENT_SECRET,
   VK_REDIRECT_URI,
+  TELEGRAM_BOT_TOKEN,
 } = process.env;
 
-// Константы VK ID (именно id.vk.com, не oauth.vk.com)
-const VK_AUTH_URL  = 'https://id.vk.com/oauth2/auth';
-const VK_TOKEN_URL = 'https://id.vk.com/oauth2/token';
+// ========== VK AUTH (oauth.vk.com) ==========
 
-// Утилита: безопасно читаем JSON, иначе возвращаем текст
-async function readJsonSafe(resp) {
-  const text = await resp.text();
-  try {
-    return { json: JSON.parse(text), raw: text };
-  } catch {
-    return { json: null, raw: text };
-  }
-}
+// Запуск авторизации VK
+router.get("/auth/vk/start", (req, res) => {
+  // Генерируем state для защиты от CSRF
+  const state = crypto.randomBytes(16).toString("hex");
+  res.cookie("vk_state", state, {
+    httpOnly: true,
+    sameSite: "none",
+    secure: true,
+    path: "/",
+  });
 
-// Утилита: редирект на фронт с параметром ?error=vk|tg и опциональным msg
-function redirectError(res, code, msg) {
-  const u = new URL(FRONTEND_URL);
-  u.searchParams.set('error', code);
-  if (msg) u.searchParams.set('msg', msg.toString().slice(0, 200));
-  return res.redirect(302, u.toString());
-}
+  const params = new URLSearchParams({
+    client_id: VK_CLIENT_ID,
+    redirect_uri: VK_REDIRECT_URI,
+    response_type: "code",
+    scope: "email",
+    state,
+    v: "5.199",
+  });
 
-// Утилита: редирект на фронт с флагом успеха
-function redirectOk(res, provider) {
-  const u = new URL(FRONTEND_URL);
-  u.searchParams.set(provider, 'ok');
-  return res.redirect(302, u.toString());
-}
-
-/**
- * GET /api/auth/vk/start
- * 1) генерим PKCE verifier/challenge и state
- * 2) кладём их в httpOnly cookies
- * 3) редиректим на VK ID /oauth2/auth
- */
-router.get('/api/auth/vk/start', async (req, res) => {
-  try {
-    const verifier = createCodeVerifier(64);
-    const challenge = await createCodeChallenge(verifier);
-    const state = crypto.randomUUID();
-
-    // Куки живут 10 минут, только для пути callback.
-    const cookieOpts = {
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: true,
-      maxAge: 10 * 60 * 1000,
-      path: '/api/auth/vk',
-    };
-
-    res.cookie('vk_verifier', verifier, cookieOpts);
-    res.cookie('vk_state', state, cookieOpts);
-
-    const authUrl = new URL(VK_AUTH_URL);
-    authUrl.searchParams.set('response_type', 'code');
-    authUrl.searchParams.set('client_id', VK_CLIENT_ID);
-    authUrl.searchParams.set('redirect_uri', VK_REDIRECT_URI);
-    authUrl.searchParams.set('state', state);
-    // Если нужны доп.разрешения — добавь:
-    // authUrl.searchParams.set('scope', 'email,offline');
-
-    // PKCE
-    authUrl.searchParams.set('code_challenge', challenge);
-    authUrl.searchParams.set('code_challenge_method', 'S256');
-
-    return res.redirect(302, authUrl.toString());
-  } catch (e) {
-    console.error('[vk/start] error', e);
-    return redirectError(res, 'vk', 'start_failed');
-  }
+  const url = `https://oauth.vk.com/authorize?${params.toString()}`;
+  return res.redirect(url);
 });
 
-/**
- * GET /api/auth/vk/callback?code=...&state=...
- * 1) проверяем state из куки
- * 2) обмениваем code на access_token с помощью x-www-form-urlencoded + code_verifier
- * 3) создаём/находим пользователя, шьём сессии, линковка с TG (если была pending)
- * 4) редиректим на фронт
- */
-router.get('/api/auth/vk/callback', async (req, res) => {
-  const { code, state } = req.query ?? {};
-
+// Callback VK → обмен code на токен и получение профиля
+router.get("/auth/vk/callback", async (req, res) => {
   try {
+    const { code, state } = req.query;
     const cookieState = req.cookies?.vk_state;
-    const verifier = req.cookies?.vk_verifier;
-
-    if (!code || !state || !cookieState || !verifier || state !== cookieState) {
-      return redirectError(res, 'vk', 'bad_state_or_no_verifier');
+    if (!code || !state || state !== cookieState) {
+      return res.redirect(`${FRONTEND_URL}/?error=vk_state`);
     }
 
-    // Обмен кода на токен — ТОЛЬКО urlencoded-формат!
-    const body = new URLSearchParams({
-      grant_type: 'authorization_code',
+    // Обмениваем code на access_token
+    const tokenParams = new URLSearchParams({
       client_id: VK_CLIENT_ID,
       client_secret: VK_CLIENT_SECRET,
       redirect_uri: VK_REDIRECT_URI,
-      code: code.toString(),
-      code_verifier: verifier,
+      code: String(code),
     });
 
-    const tokenResp = await fetch(VK_TOKEN_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json',
-      },
-      body,
+    const tokenResp = await fetch(
+      `https://oauth.vk.com/access_token?${tokenParams.toString()}`
+    );
+
+    const text = await tokenResp.text();
+    let tokenJson;
+    try {
+      tokenJson = JSON.parse(text);
+    } catch {
+      // Пробрасываем текст ошибки как есть для отладки
+      console.error("[VK token HTML error]", text.slice(0, 300));
+      return res.redirect(`${FRONTEND_URL}/?error=vk_token_html`);
+    }
+
+    if (!tokenResp.ok || tokenJson.error) {
+      console.error("[VK token error]", tokenJson);
+      return res.redirect(`${FRONTEND_URL}/?error=vk_token`);
+    }
+
+    const { access_token, user_id } = tokenJson;
+
+    // Получаем профиль
+    const meParams = new URLSearchParams({
+      access_token,
+      user_ids: String(user_id),
+      fields: "photo_100,first_name,last_name",
+      v: "5.199",
     });
 
-    const { json: token, raw: tokenRaw } = await readJsonSafe(tokenResp);
+    const meResp = await fetch(
+      `https://api.vk.com/method/users.get?${meParams.toString()}`
+    );
+    const meJson = await meResp.json();
 
-    if (process.env.DEBUG_VK) {
-      console.log('[vk/callback] token status=', tokenResp.status, 'json=', token, 'raw=', tokenRaw?.slice(0, 300));
+    if (!meResp.ok || meJson.error) {
+      console.error("[VK users.get error]", meJson);
+      return res.redirect(`${FRONTEND_URL}/?error=vk_me`);
     }
 
-    if (!tokenResp.ok || !token || !token.access_token) {
-      console.error('[vk/callback] token exchange failed', tokenResp.status, token || tokenRaw);
-      return redirectError(res, 'vk', 'token_exchange_failed');
-    }
+    const u = meJson.response?.[0];
+    const user = {
+      id: String(user_id),
+      first_name: u?.first_name || "",
+      last_name: u?.last_name || "",
+      photo: u?.photo_100 || "",
+      provider: "vk",
+    };
 
-    // Получим профиль (минимально). Токен VK ID обычно подходит к vk api:
-    const infoResp = await fetch('https://api.vk.com/method/users.get?v=5.199&fields=photo_200', {
-      headers: { Authorization: `Bearer ${token.access_token}` },
-    });
-    const { json: info, raw: infoRaw } = await readJsonSafe(infoResp);
-
-    if (process.env.DEBUG_VK) {
-      console.log('[vk/callback] userinfo status=', infoResp.status, 'json=', info, 'raw=', infoRaw?.slice(0, 300));
-    }
-
-    let vkUserId = token.user_id || info?.response?.[0]?.id;
-    if (!vkUserId) {
-      console.warn('[vk/callback] no user id in token/info, continue anyway');
-    }
-
-    // === Ваши действия: создать/найти пользователя, зашить сессию и, если есть pending_TG, склеить ===
-    // Ниже — простая заготовка «выдать сессионную куку sid».
-    // В вашей сборке здесь, вероятно, идёт запись в БД и генерация собственных sid/jwt.
-    const sid = `vk:${vkUserId ?? 'unknown'}`;
-    res.cookie('sid', sid, {
+    // Сохраняем сессию (HTTP-only кука)
+    res.cookie("sid", Buffer.from(JSON.stringify(user)).toString("base64"), {
       httpOnly: true,
-      sameSite: 'lax',
+      sameSite: "none",
       secure: true,
-      path: '/',
+      path: "/",
       maxAge: 30 * 24 * 3600 * 1000,
     });
 
-    // почистим служебные куки PKCE
-    res.clearCookie('vk_verifier', { path: '/api/auth/vk' });
-    res.clearCookie('vk_state', { path: '/api/auth/vk' });
-
-    return redirectOk(res, 'vk');
+    return res.redirect(`${FRONTEND_URL}/lobby`);
   } catch (e) {
-    console.error('[vk/callback] error', e);
-    return redirectError(res, 'vk', 'callback_failed');
+    console.error("[VK callback fatal]", e);
+    return res.redirect(`${FRONTEND_URL}/?error=vk_fatal`);
   }
 });
 
-/**
- * Заглушки Telegram (пример): TG сам по себе логин «не завершает».
- * Мы сохраняем флаг pending, а финал делаем после VK.
- * Здесь просто показываю идею, реальные обработчики у вас уже есть.
- */
+// ========== Telegram AUTH ==========
 
-// Пример: POST /api/auth/tg — кладём флаг pending в куку и возвращаем 200
-router.post('/api/auth/tg', express.json(), (req, res) => {
-  res.cookie('tg_pending', '1', {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: true,
-    path: '/',
-    maxAge: 10 * 60 * 1000,
-  });
-  return res.status(200).json({ ok: true });
+function checkTelegramAuth(data) {
+  const { hash, ...rest } = data;
+  const payload = Object.keys(rest)
+    .sort()
+    .map((k) => `${k}=${rest[k]}`)
+    .join("\n");
+
+  const secret = crypto
+    .createHash("sha256")
+    .update(TELEGRAM_BOT_TOKEN)
+    .digest();
+
+  const signature = crypto
+    .createHmac("sha256", secret)
+    .update(payload)
+    .digest("hex");
+
+  return signature === hash;
+}
+
+// Принимаем данные из TG виджета
+router.post("/auth/telegram", express.json(), async (req, res) => {
+  try {
+    const data = req.body || {};
+    if (!checkTelegramAuth(data)) {
+      return res.status(401).json({ ok: false, error: "bad_signature" });
+    }
+
+    const user = {
+      id: String(data.id),
+      first_name: data.first_name || "",
+      last_name: data.last_name || "",
+      username: data.username || "",
+      photo: data.photo_url || "",
+      provider: "telegram",
+    };
+
+    res.cookie("sid", Buffer.from(JSON.stringify(user)).toString("base64"), {
+      httpOnly: true,
+      sameSite: "none",
+      secure: true,
+      path: "/",
+      maxAge: 30 * 24 * 3600 * 1000,
+    });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[TG auth fatal]", e);
+    return res.status(500).json({ ok: false });
+  }
 });
 
 export default router;
