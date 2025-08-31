@@ -4,6 +4,7 @@ import { db, getUserById } from './db.js';
 import { signSession } from './jwt.js';
 
 const router = Router();
+import { autoMergeByDevice } from './merge.js';
 
 // Telegram widget callback
 router.all('/callback', async (req, res) => {
