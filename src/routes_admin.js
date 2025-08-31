@@ -1,53 +1,57 @@
-// src/routes_admin.js
+// src/routes_admin.js — clean, full version
 import express from 'express';
 import adminAuth from './middleware_admin.js';
 import { db } from './db.js';
 
 const router = express.Router();
-
 router.use(adminAuth);
 
-// ensure users.meta column exists (idempotent)
-(async()=>{try{await db.query("alter table users add column if not exists meta jsonb default '{}'::jsonb");}catch{}})();
+// ensure meta
+(async()=>{ try{ await db.query("alter table users add column if not exists meta jsonb default '{}'::jsonb"); }catch{} })();
 
 // health
 router.get('/health', async (_req, res) => {
-  try {
-    await db.query('select 1');
-    res.json({ ok: true, time: new Date().toISOString() });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: 'db_error' });
-  }
+  try { await db.query('select 1'); res.json({ ok:true, time:new Date().toISOString() }); }
+  catch { res.status(500).json({ ok:false, error:'db_error' }); }
 });
 
-// users list
+// summary
+router.get('/summary', async (_req, res) => {
+  const [u, e] = await Promise.all([
+    db.query('select count(*)::int as c from users'),
+    db.query('select event_type, count(*)::int as c from events group by event_type')
+  ]);
+  const byType = Object.fromEntries(e.rows.map(r => [r.event_type, r.c]));
+  res.json({ users: u.rows?.[0]?.c ?? 0, eventsByType: byType });
+});
+
+// users list (hides merged)
 router.get('/users', async (req, res) => {
+  const search = String(req.query.search ?? '').trim();
   const take = Math.min(parseInt(req.query.take ?? '50', 10), 200);
   const skip = parseInt(req.query.skip ?? '0', 10);
-  const search = String(req.query.search ?? '').trim();
 
   const params = [];
-  let where = 'where coalesce(meta->>\'merged_into\', \'\') = \'\'';
-if (search) {
-  params.push(`%${search}%`);
-  where += ` and (cast(vk_id as text) ilike $1 or first_name ilike $1 or last_name ilike $1)`;
-}%`);
-    where = `where vk_id ilike $1 or first_name ilike $1 or last_name ilike $1`;
+  let where = "where coalesce(meta->>'merged_into','') = ''";
+  if (search) {
+    params.push('%' + search + '%');
+    where += ` and (cast(vk_id as text) ilike $${params.length} or first_name ilike $${params.length} or last_name ilike $${params.length})`;
   }
 
-  const users = await db.query(
-    `select id, vk_id, first_name, last_name, avatar, balance, country_code, country_name, created_at, updated_at
-     from users ${where}
-     order by id desc
-     limit ${take} offset ${skip}`, params
-  );
-  const total = await db.query(
-    `select count(*)::int as c from users ${where}`, params
-  );
-  res.json({ total: total.rows?.[0]?.c ?? 0, take, skip, items: users.rows });
+  const rows = await db.query(`
+    select id, vk_id, first_name, last_name, balance, country_code, created_at
+      from users
+      ${where}
+      order by id asc
+      limit ${take} offset ${skip}
+  `, params);
+
+  const tot = await db.query(`select count(*)::int as c from users ${where}`, params);
+
+  res.json({ total: tot.rows?.[0]?.c ?? 0, take, skip, items: rows.rows });
 });
 
-// events list
+// events
 router.get('/events', async (req, res) => {
   const take = Math.min(parseInt(req.query.take ?? '50', 10), 200);
   const skip = parseInt(req.query.skip ?? '0', 10);
@@ -56,43 +60,31 @@ router.get('/events', async (req, res) => {
 
   const params = [];
   const conds = [];
-  if (type) { params.push(type); conds.push(`event_type = $${params.length}`); }
-  if (user) { params.push(user); conds.push(`user_id = $${params.length}`); }
+  if (type) { params.push(type); conds.push(\`event_type = $\${params.length}\`); }
+  if (user) { params.push(user); conds.push(\`user_id = $\${params.length}\`); }
   const where = conds.length ? ('where ' + conds.join(' and ')) : '';
 
-  const q = `select id, user_id, event_type, payload, ip, ua, created_at
-             from events ${where}
-             order by id desc
-             limit ${take} offset ${skip}`;
-  const rows = await db.query(q, params);
-  const tot = await db.query(`select count(*)::int as c from events ${where}`, params);
+  const rows = await db.query(\`
+    select id, user_id, event_type, payload, ip, ua, created_at
+      from events ${where}
+      order by id desc
+      limit ${take} offset ${skip}
+  \`, params);
+  const tot = await db.query(\`select count(*)::int as c from events ${where}\`, params);
+
   res.json({ total: tot.rows?.[0]?.c ?? 0, take, skip, items: rows.rows });
 });
 
-// summary
-router.get('/summary', async (_req, res) => {
-  const [u, e] = await Promise.all([
-    db.query('select count(*)::int as c from users'),
-    db.query('select event_type, count(*)::int as c from events group by event_type'),
-  ]);
-  const byType = Object.fromEntries(e.rows.map(r => [r.event_type, r.c]));
-  res.json({ users: u.rows?.[0]?.c ?? 0, eventsByType: byType });
-});
-
-
-// manual topup/adjust balance
+// manual topup
 router.post('/users/:id/topup', async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
-    const amount = parseInt(req.body?.amount ?? req.query?.amount ?? '0', 10);
-    const reason = String(req.body?.reason ?? req.query?.reason ?? 'manual');
-    if (!id || !Number.isFinite(amount) || amount === 0) {
-      return res.status(400).json({ ok:false, error:'bad_args' });
-    }
+    const amount = parseInt(req.body?.amount ?? '0', 10);
+    const reason = String(req.body?.reason ?? 'manual').slice(0,120);
+    if (!Number.isFinite(id) || !Number.isFinite(amount)) return res.status(400).json({ ok:false, error:'bad_args' });
     await db.query('select 1 from users where id=$1', [id]);
-    // reuse helper
-    const { adminAdjustBalance } = await import('./db.js');
-    await adminAdjustBalance(id, amount, reason);
+    await db.query('update users set balance = coalesce(balance,0) + $2 where id=$1', [id, amount]);
+    await db.query('insert into transactions (user_id, type, amount, meta) values ($1,$2,$3,$4)', [id, 'admin_topup', amount, { reason }]);
     const r = await db.query('select id, vk_id, balance from users where id=$1', [id]);
     res.json({ ok:true, user: r.rows[0] });
   } catch (e) {
@@ -101,30 +93,21 @@ router.post('/users/:id/topup', async (req, res) => {
   }
 });
 
-export default router;
-
-
-// merge two users: secondary -> primary
+// merge endpoint
 router.post('/users/merge', async (req, res) => {
   try {
     const primaryId = parseInt(req.body?.primary_id ?? req.query?.primary_id, 10);
     const secondaryId = parseInt(req.body?.secondary_id ?? req.query?.secondary_id, 10);
-    if (!primaryId || !secondaryId || primaryId === secondaryId) {
-      return res.status(400).json({ ok:false, error:'bad_args' });
-    }
-    await db.query("alter table users add column if not exists meta jsonb default '{}'::jsonb");
+    if (!primaryId || !secondaryId || primaryId === secondaryId) return res.status(400).json({ ok:false, error:'bad_args' });
+
     const client = await db.connect();
     try {
       await client.query('BEGIN');
-      // move fks
       await client.query("update auth_accounts set user_id=$1 where user_id=$2", [primaryId, secondaryId]);
-      try { await client.query("update transactions set user_id=$1 where user_id=$2", [primaryId, secondaryId]); } catch(_){}
-      try { await client.query("update events set user_id=$1 where user_id=$2", [primaryId, secondaryId]); } catch(_){}
-      // sum balances
+      try { await client.query("update transactions set user_id=$1 where user_id=$2", [primaryId, secondaryId]); } catch {}
+      try { await client.query("update events set user_id=$1 where user_id=$2", [primaryId, secondaryId]); } catch {}
       await client.query("update users u set balance = coalesce(u.balance,0) + (select coalesce(balance,0) from users where id=$2) where id=$1", [primaryId, secondaryId]);
-      // fill empty fields
       await client.query("update users p set first_name = coalesce(nullif(p.first_name,''), s.first_name), last_name = coalesce(nullif(p.last_name,''), s.last_name), username = coalesce(nullif(p.username,''), s.username), avatar = coalesce(nullif(p.avatar,''), s.avatar), country_code = coalesce(nullif(p.country_code,''), s.country_code) from users s where p.id=$1 and s.id=$2", [primaryId, secondaryId]);
-      // mark secondary
       await client.query("update users set balance=0, meta = jsonb_set(coalesce(meta,'{}'::jsonb), '{merged_into}', to_jsonb($1)::jsonb), updated_at=now() where id=$2", [primaryId, secondaryId]);
       await client.query('COMMIT');
     } catch (e) {
@@ -139,12 +122,10 @@ router.post('/users/merge', async (req, res) => {
   }
 });
 
-
-// suggestions based on device_id overlap VK<->TG
+// suggestions
 router.get('/users/merge/suggestions', async (_req, res) => {
   try {
-    await db.query("alter table users add column if not exists meta jsonb default '{}'::jsonb");
-    const rows = await db.query(`
+    const rows = await db.query(\`
       with tg as (
         select user_id, max(meta->>'device_id') as did
           from auth_accounts
@@ -161,10 +142,12 @@ router.get('/users/merge/suggestions', async (_req, res) => {
          where coalesce(u.meta->>'merged_into','') = ''
       )
       select * from cand where primary_id is not null limit 200
-    `);
+    \`);
     res.json({ ok:true, list: rows.rows });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok:false, error:'server_error' });
   }
 });
+
+export default router;
