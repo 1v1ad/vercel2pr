@@ -1,4 +1,4 @@
-// src/merge.js — hotfix: ensure auth_accounts.meta exists + safe auto-merge
+// src/merge.js — fixed: exports mergeSuggestions (plus previous hotfixes)
 import { db } from './db.js';
 
 export async function ensureMetaColumns() {
@@ -99,4 +99,29 @@ export async function autoMergeByDevice({ deviceId, tgId }) {
   } finally {
     client.release();
   }
+}
+
+// NEW: export mergeSuggestions used by routes_admin.js
+export async function mergeSuggestions(limit = 200) {
+  await ensureMetaColumns();
+  const sql = [
+    'with tg as (',
+    "  select user_id, max(meta->>'device_id') as did",
+    '    from auth_accounts',
+    "   where provider = 'tg'",
+    '   group by user_id',
+    '),',
+    'cand as (',
+    '  select u.id as secondary_id,',
+    '         (select user_id from auth_accounts a',
+    "           where a.user_id is not null and (a.meta->>'device_id') = t.did",
+    '           order by updated_at desc limit 1) as primary_id',
+    '    from users u',
+    '    join tg t on t.user_id = u.id',
+    "   where coalesce(u.meta->>'merged_into','') = ''",
+    ')',
+    'select * from cand where primary_id is not null limit $1'
+  ].join('\n');
+  const r = await db.query(sql, [limit]);
+  return r.rows;
 }
