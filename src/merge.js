@@ -1,4 +1,4 @@
-// src/merge.js — fixed: exports mergeSuggestions (plus previous hotfixes)
+// src/merge.js — VK-first primary + robust helpers
 import { db } from './db.js';
 
 export async function ensureMetaColumns() {
@@ -18,9 +18,17 @@ export async function adminMergeUsersTx(client, primaryId, secondaryId) {
   await client.query("update users set balance=0, meta = jsonb_set(coalesce(meta,'{}'::jsonb), '{merged_into}', to_jsonb($1)::jsonb), updated_at=now() where id=$2", [primaryId, secondaryId]);
 }
 
+// PRIMARY: выбираем VK, если есть запись с таким device_id; иначе любой
 export async function findPrimaryByDeviceId(deviceId) {
   if (!deviceId) return null;
-  const r = await db.query(
+  // Пробуем отдать VK-пользователя как primary
+  let r = await db.query(
+    "select user_id from auth_accounts where provider='vk' and (meta->>'device_id') = $1 and user_id is not null order by updated_at desc limit 1",
+    [deviceId]
+  );
+  if (r.rows && r.rows[0] && r.rows[0].user_id) return r.rows[0].user_id;
+  // Фолбэк: любой провайдер
+  r = await db.query(
     "select user_id from auth_accounts where (meta->>'device_id') = $1 and user_id is not null order by updated_at desc limit 1",
     [deviceId]
   );
@@ -101,7 +109,6 @@ export async function autoMergeByDevice({ deviceId, tgId }) {
   }
 }
 
-// NEW: export mergeSuggestions used by routes_admin.js
 export async function mergeSuggestions(limit = 200) {
   await ensureMetaColumns();
   const sql = [
@@ -114,7 +121,7 @@ export async function mergeSuggestions(limit = 200) {
     'cand as (',
     '  select u.id as secondary_id,',
     '         (select user_id from auth_accounts a',
-    "           where a.user_id is not null and (a.meta->>'device_id') = t.did",
+    "           where a.user_id is not null and (a.meta->>'device_id') = t.did and a.provider='vk'",
     '           order by updated_at desc limit 1) as primary_id',
     '    from users u',
     '    join tg t on t.user_id = u.id',
