@@ -1,23 +1,31 @@
-
-// src/routes_admin.js — clean ESM, без бэктиков
+// src/routes_admin.js — clean ESM, без бэктиков, с встроенным adminAuth
 import { Router } from 'express';
 import { db } from './db.js';
-import adminAuth from './admin_auth.js';
 import { mergeSuggestions } from './merge.js';
 
 const router = Router();
+
+// Встроенная проверка админ-пароля.
+// Клиент (админка) присылает заголовок X-Admin-Password. На сервере в ENV: ADMIN_PASSWORD (или ADMIN_PWD).
+function adminAuth(req, res, next) {
+  const serverPass = (process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD || '').toString();
+  const given = (req.get('X-Admin-Password') || (req.body && req.body.pwd) || req.query.pwd || '').toString();
+  if (!serverPass) return res.status(401).json({ ok:false, error:'admin_password_not_set' });
+  if (given !== serverPass) return res.status(401).json({ ok:false, error:'unauthorized' });
+  next();
+}
 
 router.use(adminAuth);
 
 // health
 router.get('/health', (_req, res) => res.json({ ok: true }));
 
-// краткая сводка
+// summary
 router.get('/summary', async (_req, res) => {
   try {
     const u = await db.query('select count(*)::int as c from users');
     const e = await db.query('select count(*)::int as c from events');
-    const a7 = await db.query("select count(*)::int as c from events where event_type in ('auth','login','auth_start','auth_callback') and created_at > now() - interval '7 days'");
+    const a7 = await db.query("select count(*)::int as c from events where (event_type in ('auth','login','auth_start','auth_callback') or type in ('auth','login','auth_start','auth_callback')) and created_at > now() - interval '7 days'");
     const uniq7 = await db.query("select count(distinct user_id)::int as c from events where created_at > now() - interval '7 days'");
     res.json({ ok:true, users:u.rows[0].c, events:e.rows[0].c, auth7:a7.rows[0].c, unique7:uniq7.rows[0].c });
   } catch (e) {
@@ -25,7 +33,7 @@ router.get('/summary', async (_req, res) => {
   }
 });
 
-// пользователи
+// users list
 router.get('/users', async (req, res) => {
   try {
     const search = (req.query.search || '').toString().trim();
@@ -43,7 +51,6 @@ router.get('/users', async (req, res) => {
 
     const sql = 'select id, vk_id, first_name, last_name, avatar, balance, country_code, country_name, created_at, updated_at ' +
                 'from users ' + where + ' order by id desc limit ' + add(limit) + ' offset ' + add(offset);
-
     const r = await db.query(sql, params);
     res.json({ ok:true, users:r.rows });
   } catch (e) {
@@ -51,7 +58,7 @@ router.get('/users', async (req, res) => {
   }
 });
 
-// события
+// events list
 router.get('/events', async (req, res) => {
   try {
     const params = [];
@@ -85,7 +92,7 @@ router.get('/events', async (req, res) => {
   }
 });
 
-// пополнение баланса
+// manual topup
 router.post('/users/:id/topup', async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
@@ -98,7 +105,7 @@ router.post('/users/:id/topup', async (req, res) => {
   }
 });
 
-// ручная склейка
+// manual merge endpoint
 router.post('/users/merge', async (req, res) => {
   try {
     const primaryId = parseInt((req.body && req.body.primary_id) || (req.query && req.query.primary_id) || '0', 10);
@@ -131,7 +138,7 @@ router.post('/users/merge', async (req, res) => {
   }
 });
 
-// предложения для склейки
+// suggestions
 router.get('/users/merge/suggestions', async (_req, res) => {
   try {
     const list = await mergeSuggestions(200);
