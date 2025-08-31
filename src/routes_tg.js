@@ -1,4 +1,6 @@
 import { Router } from 'express';
+import { db, getUserById } from './db.js';
+import { signSession } from './jwt.js';
 import { verifyTelegramLogin } from './tg.js';
 
 const router = Router();
@@ -8,7 +10,7 @@ const router = Router();
  * Отвечаем быстро: валидируем hash и сразу редиректим на фронт
  * с параметрами, чтобы лобби могло отрисовать профиль TG.
  */
-router.all('/callback', (req, res) => {
+router.all('/callback', async (req, res) => {
   const data = req.method === 'POST' ? req.body : req.query;
 
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
@@ -29,7 +31,23 @@ router.all('/callback', (req, res) => {
 
   // Быстрый редирект на фронт с данными TG (без БД и без задержек)
   const frontBase = (process.env.FRONTEND_URL || 'https://sweet-twilight-63a9b6.netlify.app').replace(/\/$/, '');
-  const url = new URL(frontBase + '/');
+  
+  // If TG id is linked to a user, set session cookie to that user so balances are unified
+  try {
+    const tgid = String(data.id || '');
+    if (tgid) {
+      const r = await db.query("select user_id from auth_accounts where provider='tg' and provider_user_id=$1 and user_id is not null limit 1", [tgid]);
+      if (r.rows.length) {
+        const uid = r.rows[0].user_id;
+        const user = await getUserById(uid);
+        if (user) {
+          const sessionJwt = signSession({ uid: user.id });
+          res.cookie('sid', sessionJwt, { httpOnly:true, sameSite:'none', secure:true, path:'/', maxAge: 30*24*3600*1000 });
+        }
+      }
+    }
+  } catch(_){ /* ignore */ }
+const url = new URL(frontBase + '/');
 
   url.searchParams.set('logged', '1');
   url.searchParams.set('provider', 'tg');

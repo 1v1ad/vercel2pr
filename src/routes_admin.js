@@ -74,4 +74,26 @@ router.get('/summary', async (_req, res) => {
   res.json({ users: u.rows?.[0]?.c ?? 0, eventsByType: byType });
 });
 
+
+// manual topup/adjust balance
+router.post('/users/:id/topup', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const amount = parseInt(req.body?.amount ?? req.query?.amount ?? '0', 10);
+    const reason = String(req.body?.reason ?? req.query?.reason ?? 'manual');
+    if (!id || !Number.isFinite(amount) || amount === 0) {
+      return res.status(400).json({ ok:false, error:'bad_args' });
+    }
+    await db.query('select 1 from users where id=$1', [id]);
+    // reuse helper
+    const { adminAdjustBalance } = await import('./db.js');
+    await adminAdjustBalance(id, amount, reason);
+    const r = await db.query('select id, vk_id, balance from users where id=$1', [id]);
+    res.json({ ok:true, user: r.rows[0] });
+  } catch (e) {
+    console.error('admin topup error', e);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+});
+
 export default router;

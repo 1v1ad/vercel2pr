@@ -131,3 +131,25 @@ export async function updateUserCountryIfNull(userId, { country_code, country_na
     [userId, country_code, country_name || country_code]
   );
 }
+
+
+export async function adminAdjustBalance(userId, delta, reason) {
+  if (!userId || !Number.isInteger(delta)) throw new Error('bad_args');
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      "insert into transactions (user_id, type, amount, meta) values ($1, $2, $3, $4)",
+      [userId, (delta>=0?'admin_topup':'admin_adjust'), Math.abs(delta), JSON.stringify({ reason: reason || 'manual' })]
+    );
+    await client.query(
+      "update users set balance = coalesce(balance,0) + $2, updated_at = now() where id = $1",
+      [userId, delta]
+    );
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK'); throw e;
+  } finally {
+    client.release();
+  }
+}
