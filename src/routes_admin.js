@@ -230,13 +230,25 @@ router.get('/events', async (req, res) => {
   }
 });
 
-// --- пополнение баланса ---
+// --- пополнение баланса (всегда по primary) ---
 router.post('/users/:id/topup', async (req, res) => {
   try {
-    const id = parseInt(req.params.id, 10);
-    const amount = parseInt((req.body && req.body.amount) || '0', 10) || 0;
-    if (!id || !Number.isFinite(amount)) return res.status(400).json({ ok:false, error:'bad_args' });
-    await db.query(`update users set balance = coalesce(balance,0) + $1 where id=$2`, [amount, id]);
+    const rawId  = parseInt(req.params.id, 10);
+    // amount может быть отрицательным (для сторно): оставляем как есть
+    const amount = parseInt((req.body && req.body.amount) || '0', 10);
+    if (!rawId || !Number.isFinite(amount)) {
+      return res.status(400).json({ ok:false, error:'bad_args' });
+    }
+
+    const id = await resolvePrimaryUserId(rawId); // <- резолвим «голову»
+    await db.query(
+      `update users
+          set balance = coalesce(balance,0) + $1,
+              updated_at = now()
+        where id = $2`,
+      [amount, id]
+    );
+
     res.json({ ok:true });
   } catch (e) {
     res.status(500).json({ ok:false, error:String(e && e.message || e) });
