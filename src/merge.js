@@ -4,18 +4,39 @@
 
 import { db } from './db.js';
 
-/** Ensure users.meta exists */
+/**
+ * Ensure meta jsonb columns exist where we rely on them.
+ * - users.meta
+ * - auth_accounts.meta
+ * Safe to call multiple times.
+ */
+export async function ensureMetaColumns() {
+  try {
+    await db.query(`
+      alter table users
+        add column if not exists meta jsonb default '{}'::jsonb
+    `);
+  } catch {}
+  try {
+    await db.query(`
+      alter table auth_accounts
+        add column if not exists meta jsonb default '{}'::jsonb
+    `);
+  } catch {}
+}
+
+/**
+ * Backward-compat alias (old name used in some places).
+ * Keeps older imports working if они остались.
+ */
 export async function ensureMetaColumn() {
-  await db.query(`
-    alter table users
-      add column if not exists meta jsonb default '{}'::jsonb
-  `);
+  return ensureMetaColumns();
 }
 
 /** Follow meta.merged_into chain to find the real (primary) user id */
 export async function resolvePrimaryUserId(userId) {
   if (!userId) return null;
-  await ensureMetaColumn();
+  await ensureMetaColumns();
   let current = userId;
   // Follow at most 5 hops to avoid accidental cycles
   for (let i = 0; i < 5; i++) {
@@ -39,7 +60,7 @@ export async function mergeUsers(primaryId, secondaryId) {
   if (!primaryId || !secondaryId || primaryId === secondaryId) {
     throw new Error('mergeUsers: bad args');
   }
-  await ensureMetaColumn();
+  await ensureMetaColumns();
 
   const client = await db.connect();
   try {
@@ -92,7 +113,7 @@ export async function mergeUsers(primaryId, secondaryId) {
 
 /** Suggest merges by device_id across providers */
 export async function mergeSuggestions(limit = 100) {
-  await ensureMetaColumn();
+  await ensureMetaColumns();
   const r = await db.query(
     `select device_id,
             array_agg(distinct user_id) as users,
@@ -113,7 +134,7 @@ export async function mergeSuggestions(limit = 100) {
 
 /** Heuristic: choose primary for a given device among 2+ users. */
 async function pickPrimaryForDevice(userIds) {
-  // Prefer user with VK id (historically main), otherwise oldest account
+  // Prefer user with VK id (historically main), otherwise by richer balance, then oldest account
   const r = await db.query(
     `select id, vk_id, created_at, balance from users where id = any($1::int[])`,
     [userIds]
@@ -123,9 +144,9 @@ async function pickPrimaryForDevice(userIds) {
   rows.sort((a,b) => {
     const avk = a.vk_id ? 1 : 0;
     const bvk = b.vk_id ? 1 : 0;
-    if (avk !== bvk) return bvk - avk;         // VK first
+    if (avk !== bvk) return bvk - avk;                   // VK first
     const ab = Number(a.balance || 0), bb = Number(b.balance || 0);
-    if (ab !== bb) return bb - ab;             // richer first
+    if (ab !== bb) return bb - ab;                       // richer first
     return (new Date(a.created_at) - new Date(b.created_at)); // oldest first
   });
   return rows[0].id;
@@ -134,7 +155,7 @@ async function pickPrimaryForDevice(userIds) {
 /** Auto-merge by device: after new login/link, merge accounts on same device */
 export async function autoMergeByDevice(userId, deviceId) {
   if (!userId || !deviceId) return;
-  await ensureMetaColumn();
+  await ensureMetaColumns();
 
   // Find all users tied to the same device
   const r = await db.query(
