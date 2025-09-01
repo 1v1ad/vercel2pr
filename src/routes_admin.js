@@ -133,32 +133,36 @@ router.get('/users', async (req, res) => {
 // Events list (tolerant to schema)
 router.get('/events', async (req, res) => {
   try {
-    const cols = await db.query(\"select column_name from information_schema.columns where table_schema='public' and table_name='events'\");
+    const cols = await db.query(
+      `select column_name
+         from information_schema.columns
+        where table_schema='public' and table_name='events'`
+    );
     const set = new Set(cols.rows.map(r => r.column_name));
-    const hasType = set.has('type');
-    const hasEventType = set.has('event_type');
-    const hasIp = set.has('ip');
-    const hasUa = set.has('ua');
-    const hasCreated = set.has('created_at');
+    const hasType     = set.has('type');
+    const hasEventType= set.has('event_type');
+    const hasIp       = set.has('ip');
+    const hasUa       = set.has('ua');
+    const hasCreated  = set.has('created_at');
 
     const params = [];
-    function add(v){ params.push(v); return '$' + params.length; }
+    const add = v => (params.push(v), '$' + params.length);
 
-    const selectCols = ['id', 'user_id'];
-    if (hasEventType) selectCols.push('event_type'); else selectCols.push(\"NULL::text as event_type\");
-    if (hasType)      selectCols.push('\"type\"');    else selectCols.push(\"NULL::text as type\");
-    if (hasIp)        selectCols.push('ip');          else selectCols.push(\"NULL::text as ip\");
-    if (hasUa)        selectCols.push('ua');          else selectCols.push(\"NULL::text as ua\");
-    if (hasCreated)   selectCols.push('created_at');  else selectCols.push('now() as created_at');
+    const selectCols = ['id','user_id'];
+    if (hasEventType) selectCols.push('event_type');          else selectCols.push("NULL::text as event_type");
+    if (hasType)      selectCols.push('"type"');              else selectCols.push("NULL::text as type");
+    if (hasIp)        selectCols.push('ip');                  else selectCols.push("NULL::text as ip");
+    if (hasUa)        selectCols.push('ua');                  else selectCols.push("NULL::text as ua");
+    if (hasCreated)   selectCols.push('created_at');          else selectCols.push('now() as created_at');
 
     const conds = [];
-    const type = (req.query.type || '').toString().trim();
+    const type       = (req.query.type || '').toString().trim();
     const event_type = (req.query.event_type || '').toString().trim();
-    const user_id = parseInt((req.query.user_id || '').toString(), 10) || null;
-    const ip = (req.query.ip || '').toString().trim();
-    const ua = (req.query.ua || '').toString().trim();
+    const user_id    = parseInt((req.query.user_id || '').toString(), 10) || null;
+    const ip         = (req.query.ip || '').toString().trim();
+    const ua         = (req.query.ua || '').toString().trim();
 
-    if (type && hasType)            conds.push('\"type\" = ' + add(type));
+    if (type && hasType)            conds.push('"type" = ' + add(type));
     if (event_type && hasEventType) conds.push('event_type = ' + add(event_type));
     if (user_id)                    conds.push('user_id = ' + add(user_id));
     if (ip && hasIp)                conds.push('ip = ' + add(ip));
@@ -166,16 +170,21 @@ router.get('/events', async (req, res) => {
 
     const where = conds.length ? (' where ' + conds.join(' and ')) : '';
 
-    const limit  = Math.min(200, parseInt(req.query.limit || '50', 10) || 50);
-    const offset = Math.max(0, parseInt(req.query.offset || '0', 10) || 0);
+    const limit  = Math.min(200, parseInt(req.query.limit  || '50', 10) || 50);
+    const offset = Math.max(0,   parseInt(req.query.offset || '0',  10) || 0);
 
-    const sql = 'select ' + selectCols.join(', ') + ' from events' + where + ' order by id desc limit ' + add(limit) + ' offset ' + add(offset);
+    const sql = 'select ' + selectCols.join(', ')
+              + ' from events' + where
+              + ' order by id desc'
+              + ' limit ' + add(limit) + ' offset ' + add(offset);
+
     const r = await db.query(sql, params);
     res.json({ ok:true, events:r.rows });
   } catch (e) {
     res.status(500).json({ ok:false, error:String(e && e.message || e) });
   }
 });
+
 
 // Topup: automatically redirect to primary if user was merged
 router.post('/users/:id/topup', async (req, res) => {
