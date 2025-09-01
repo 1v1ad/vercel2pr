@@ -270,5 +270,79 @@ router.get('/users/merge/suggestions', async (_req, res) => {
     res.status(500).json({ ok:false, error:String(e && e.message || e) });
   }
 });
+// --- DAILY STATS (alias: /summary/daily и /daily) ---
+router.get(['/summary/daily', '/daily'], async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(31, parseInt(req.query.days || '7', 10) || 7));
+
+    // Таблица events может не существовать – быстро выходим нулями
+    const hasT = await db.query("select to_regclass('public.events') as r");
+    if (!hasT.rows[0].r) {
+      const labels = Array.from({ length: days }, (_, i) => {
+        const d = new Date(); d.setDate(d.getDate() - (days - 1 - i));
+        return d.toISOString().slice(0,10); // YYYY-MM-DD
+      });
+      return res.json({ ok:true, labels, auth:Array(days).fill(0), unique:Array(days).fill(0) });
+    }
+
+    // Определяем, какие поля в events есть
+    const cols = await db.query(
+      "select column_name from information_schema.columns where table_schema='public' and table_name='events'"
+    );
+    const set = new Set(cols.rows.map(r => r.column_name));
+    const hasType      = set.has('type');
+    const hasEventType = set.has('event_type');
+    const hasCreated   = set.has('created_at');
+
+    if (!hasCreated) {
+      const labels = Array.from({ length: days }, (_, i) => {
+        const d = new Date(); d.setDate(d.getDate() - (days - 1 - i));
+        return d.toISOString().slice(0,10);
+      });
+      return res.json({ ok:true, labels, auth:Array(days).fill(0), unique:Array(days).fill(0) });
+    }
+
+    const parts = [];
+    if (hasEventType) parts.push("event_type in ('auth','login','auth_start','auth_callback')");
+    if (hasType)      parts.push(' "type" in (\'auth\',\'login\',\'auth_start\',\'auth_callback\') ');
+    const authCond = parts.length ? '(' + parts.join(' or ') + ')' : 'true';
+
+    // Собираем последнюю неделю с нулями через generate_series
+    const sql = `
+      with days as (
+        select generate_series(date_trunc('day', now()) - ($1::int - 1) * interval '1 day',
+                               date_trunc('day', now()),
+                               interval '1 day') as d
+      ),
+      auth as (
+        select date_trunc('day', created_at) as d, count(*)::int as c
+          from events
+         where ${authCond}
+         group by 1
+      ),
+      uniq as (
+        select date_trunc('day', created_at) as d, count(distinct user_id)::int as c
+          from events
+         group by 1
+      )
+      select to_char(days.d, 'YYYY-MM-DD') as day,
+             coalesce(auth.c, 0)   as auth,
+             coalesce(uniq.c, 0)   as uniq
+        from days
+        left join auth on auth.d = days.d
+        left join uniq on uniq.d = days.d
+       order by days.d;
+    `;
+
+    const r = await db.query(sql, [days]);
+    const labels = r.rows.map(x => x.day);
+    const auth   = r.rows.map(x => x.auth);
+    const unique = r.rows.map(x => x.uniq);
+
+    res.json({ ok:true, labels, auth, unique });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e && e.message || e) });
+  }
+});
 
 export default router;
