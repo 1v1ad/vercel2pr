@@ -1,72 +1,74 @@
-// src/routes_tg.js — complete TG callback with device session + auto-merge
+// src/routes_tg.js
+// Telegram auth + account linking + device based auto-merge
+
 import { Router } from 'express';
-import { db, getUserById } from './db.js';
-import { signSession } from './jwt.js';
-import { autoMergeByDevice } from './merge.js';
+import crypto from 'crypto';
+import { db } from './db.js';
+import { autoMergeByDevice, resolvePrimaryUserId } from './merge.js';
 
 const router = Router();
 
-function safe(s){ return (s==null ? null : String(s)); }
+function tgVerify(data, botToken) {
+  const checkHash = data.hash;
+  const secretKey = crypto.createHash('sha256').update(botToken).digest();
+  const payload = Object.keys(data)
+    .filter(k => k !== 'hash')
+    .sort()
+    .map(k => `${k}=${data[k]}`)
+    .join('\\n');
+  const hmac = crypto.createHmac('sha256', secretKey).update(payload).digest('hex');
+  return hmac === checkHash;
+}
 
-router.all('/callback', async (req, res) => {
+// Telegram login callback
+router.get('/callback', async (req, res) => {
   try {
-    const data = { ...(req.query || {}), ...(req.body || {}) };
-    const deviceId = safe(req.query?.device_id || req.cookies?.device_id || '');
-    const tgId = safe(data.id || '');
+    const botToken = (process.env.TG_BOT_TOKEN || process.env.BOT_TOKEN || '').toString();
+    if (!botToken) return res.status(500).send('TG bot token not configured');
 
-    // set session to primary user by deviceId (if known)
+    const q = req.query || {};
+    const ok = tgVerify(q, botToken);
+    if (!ok) return res.status(401).send('invalid tg login');
+
+    // Find or create user
+    const tgid = String(q.id);
+    const deviceId = (q.device_id || req.get('X-Device-Id') || '').toString().trim();
+
+    // Create user if needed
+    let userId;
+    const u = await db.query('select id from users where username = $1 or (meta->>\'tg_id\') = $1 limit 1', [tgid]);
+    if (u.rowCount) {
+      userId = u.rows[0].id;
+    } else {
+      const ins = await db.query(
+        `insert into users(first_name, last_name, username, meta)
+             values($1,$2,$3, jsonb_build_object('tg_id',$4))
+          returning id`,
+        [q.first_name || '', q.last_name || '', q.username || '', tgid]
+      );
+      userId = ins.rows[0].id;
+    }
+
+    // Link auth account
+    await db.query(
+      `insert into auth_accounts(user_id, provider, provider_user_id, device_id)
+           values($1,'tg',$2,$3)
+       on conflict (provider, provider_user_id)
+       do update set user_id=excluded.user_id, device_id=coalesce(excluded.device_id, auth_accounts.device_id)`,
+      [userId, tgid, deviceId || null]
+    );
+
+    // Auto-merge by device (if same device already had VK user)
     if (deviceId) {
-      try {
-        const r = await db.query(
-          "select user_id from auth_accounts where (meta->>'device_id') = $1 and user_id is not null order by updated_at desc limit 1",
-          [deviceId]
-        );
-        if (r.rows.length) {
-          const user = await getUserById(r.rows[0].user_id);
-          if (user) {
-            const jwt = signSession({ uid: user.id });
-            res.cookie('sid', jwt, {
-              httpOnly:true, sameSite:'none', secure:true, path:'/', maxAge:30*24*3600*1000
-            });
-          }
-        }
-      } catch {}
+      await autoMergeByDevice(userId, deviceId);
+      userId = await resolvePrimaryUserId(userId);
     }
 
-    // upsert tg auth_account, remember device_id
-    if (tgId) {
-      try{
-        await db.query(`
-          insert into auth_accounts (user_id, provider, provider_user_id, username, phone_hash, meta)
-          values (null, 'tg', $1, $2, null, $3)
-          on conflict (provider, provider_user_id) do update set
-            username  = coalesce(excluded.username,  auth_accounts.username),
-            meta      = jsonb_strip_nulls(coalesce(auth_accounts.meta,'{}'::jsonb) || excluded.meta),
-            updated_at = now()
-        `, [
-          tgId,
-          safe(data.username),
-          JSON.stringify({ device_id: deviceId || null })
-        ]);
-      }catch(e){ console.warn('tg upsert failed', e?.message); }
-    }
-
-    // fire-and-forget auto-merge
-    try { if (deviceId) await autoMergeByDevice({ deviceId, tgId }); } catch {}
-
-    // redirect to frontend lobby with tg hints
-    const frontend = process.env.FRONTEND_URL || 'http://localhost:5173';
-    const url = new URL('/lobby.html', frontend);
-    url.searchParams.set('provider','tg');
-    if (tgId) url.searchParams.set('id', tgId);
-    if (data.first_name) url.searchParams.set('first_name', safe(data.first_name));
-    if (data.last_name) url.searchParams.set('last_name', safe(data.last_name));
-    if (data.username) url.searchParams.set('username', safe(data.username));
-    if (data.photo_url) url.searchParams.set('photo_url', safe(data.photo_url));
-    res.redirect(302, url.toString());
+    // Minimal session cookie (you likely already have middleware for that)
+    res.cookie('uid', String(userId), { httpOnly: true, sameSite: 'lax' });
+    res.redirect('/lobby.html?logged=1');
   } catch (e) {
-    console.error('tg/callback error', e);
-    res.redirect(302, (process.env.FRONTEND_URL || '') + '/lobby.html?provider=tg');
+    res.status(500).send(String(e && e.message || e));
   }
 });
 
