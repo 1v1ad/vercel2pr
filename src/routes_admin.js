@@ -104,7 +104,7 @@ router.get('/users', async (req, res) => {
     const params = [];
     function add(v){ params.push(v); return '$' + params.length; }
 
-    let where = \"where coalesce(u.meta->>'merged_into','') = ''\";
+    let where = `where coalesce(u.meta->>'merged_into','') = ''`;
     if (search) {
       const p = add('%' + search + '%');
       where += ' and (cast(u.vk_id as text) ilike ' + p + ' or u.first_name ilike ' + p + ' or u.last_name ilike ' + p + ')';
