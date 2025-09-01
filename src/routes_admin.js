@@ -18,16 +18,20 @@ router.use(adminAuth);
 
 router.get('/health', (_req, res) => res.json({ ok:true }));
 
-// Summary cards
+// /api/admin/summary
 router.get('/summary', async (_req, res) => {
   try {
     const u = await db.query('select count(*)::int as c from users');
-    let users = u.rows[0]?.c ?? 0;
+    const users = u.rows[0]?.c ?? 0;
 
     const hasT = await db.query("select to_regclass('public.events') as r");
-    if (!hasT.rows[0].r) return res.json({ ok:true, users, events:0, auth7:0, unique7:0 });
+    if (!hasT.rows[0].r) {
+      return res.json({ ok: true, users, events: 0, auth7: 0, unique7: 0 });
+    }
 
-    const cols = await db.query("select column_name from information_schema.columns where table_schema='public' and table_name='events'");
+    const cols = await db.query(
+      "select column_name from information_schema.columns where table_schema='public' and table_name='events'"
+    );
     const set = new Set(cols.rows.map(r => r.column_name));
     const hasType = set.has('type');
     const hasEventType = set.has('event_type');
@@ -38,19 +42,25 @@ router.get('/summary', async (_req, res) => {
     let auth7 = 0;
     if (hasType || hasEventType) {
       const parts = [];
-      if (hasEventType) parts.push(\"event_type in ('auth','login','auth_start','auth_callback')\");
-      if (hasType)      parts.push('\"type\" in (\\'auth\\',\\'login\\',\\'auth_start\\',\\'auth_callback\\')');
-      const sql = 'select count(*)::int as c from events where (' + parts.join(' or ') + \") and created_at > now() - interval '7 days'\";
+      // ВАЖНО: наружные двойные кавычки
+      if (hasEventType) parts.push("event_type in ('auth','login','auth_start','auth_callback')");
+      // здесь можно оставить одинарные, т.к. внутренние одинарные экранированы
+      if (hasType)      parts.push("\"type\" in ('auth','login','auth_start','auth_callback')");
+      const sql =
+        `select count(*)::int as c from events ` +
+        `where (${parts.join(' or ')}) and created_at > now() - interval '7 days'`;
       const r = await db.query(sql);
       auth7 = r.rows[0]?.c ?? 0;
     }
 
-    const uq = await db.query(\"select count(distinct user_id)::int as c from events where created_at > now() - interval '7 days'\");
+    const uq = await db.query(
+      "select count(distinct user_id)::int as c from events where created_at > now() - interval '7 days'"
+    );
     const unique7 = uq.rows[0]?.c ?? 0;
 
-    res.json({ ok:true, users, events, auth7, unique7 });
+    res.json({ ok: true, users, events, auth7, unique7 });
   } catch (e) {
-    res.status(500).json({ ok:false, error:String(e && e.message || e) });
+    res.status(500).json({ ok: false, error: String((e && e.message) || e) });
   }
 });
 
