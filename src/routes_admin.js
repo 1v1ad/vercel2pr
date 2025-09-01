@@ -51,6 +51,92 @@ router.get('/summary', async (_req, res) => {
   }
 });
 
+// Ежедневная сводка для графика: /api/admin/summary/daily?days=7
+router.get('/summary/daily', async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(31, parseInt(req.query.days || '7', 10) || 7));
+    const TZ = process.env.ADMIN_TZ || 'Europe/Moscow';
+
+    // Узнаем, какие колонки есть в events
+    const cols = await db.query(
+      "select column_name from information_schema.columns where table_schema='public' and table_name='events'"
+    );
+    const have = new Set(cols.rows.map(r => r.column_name));
+    const hasType = have.has('type');
+    const hasEventType = have.has('event_type');
+    const hasCreatedAt = have.has('created_at');
+    const hasUserId = have.has('user_id');
+
+    if (!hasCreatedAt || !hasUserId) {
+      // Без ключевых полей сводку не посчитаем — вернём окно из нулей
+      const today = new Date();
+      today.setHours(0,0,0,0);
+      const out = [];
+      for (let i = days - 1; i >= 0; i--) {
+        const d = new Date(today); d.setDate(today.getDate() - i);
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2,'0');
+        const dd = String(d.getDate()).padStart(2,'0');
+        out.push({ date: `${y}-${m}-${dd}`, auth: 0, unique: 0 });
+      }
+      return res.json({ ok: true, days: out });
+    }
+
+    // Фильтр "события авторизации"
+    const authFilters = [];
+    // те же типы, что ты считаешь в summary
+    const AUTH_SET = `('auth','login','auth_start','auth_callback','auth_success')`;
+    if (hasEventType) authFilters.push(`event_type in ${AUTH_SET}`);
+    if (hasType)      authFilters.push(`"type" in ${AUTH_SET}`);
+    // если нет ни одной типовой колонки — просто считаем 0 авторизаций
+    const AUTH_WHERE = authFilters.length ? '(' + authFilters.join(' or ') + ')' : 'false';
+
+    // Формируем SQL: окно дней, сегодня включительно, сегодня справа.
+    const sql = `
+      with bounds as (
+        select (date_trunc('day', (now() at time zone $2))::date) as today
+      ),
+      days as (
+        -- генерируем последовательность старейший..сегодня
+        select (select today from bounds) - s as day
+        from generate_series($1::int - 1, 0, -1) s
+        order by day asc
+      ),
+      agg_auth as (
+        select
+          (created_at at time zone $2)::date as day,
+          count(*) as auth
+        from events
+        where ${AUTH_WHERE}
+          and created_at >= ((select today from bounds)::timestamp - ($1::int - 1) * interval '1 day')
+        group by 1
+      ),
+      agg_uniq as (
+        select
+          (created_at at time zone $2)::date as day,
+          count(distinct user_id) as uniq
+        from events
+        where created_at >= ((select today from bounds)::timestamp - ($1::int - 1) * interval '1 day')
+        group by 1
+      )
+      select
+        to_char(d.day, 'YYYY-MM-DD') as date,
+        coalesce(a.auth, 0) as auth,
+        coalesce(u.uniq, 0) as "unique"
+      from days d
+      left join agg_auth a on a.day = d.day
+      left join agg_uniq u on u.day = d.day
+      order by d.day asc;
+    `;
+
+    const { rows } = await db.query(sql, [days, TZ]);
+    res.json({ ok: true, days: rows });
+  } catch (e) {
+    console.error('summary/daily error:', e);
+    res.status(500).json({ ok:false, error: String(e && e.message || e) });
+  }
+});
+
 // USERS with providers list
 router.get('/users', async (req, res) => {
   try {
