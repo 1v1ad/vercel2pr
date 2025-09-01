@@ -111,16 +111,17 @@ router.get('/users', async (req, res) => {
     }
 
     const sql = [
-      'select u.id, u.vk_id, u.first_name, u.last_name, u.avatar, u.balance,',
-      '       u.country_code, u.country_name, u.created_at, u.updated_at,',
-      \"       coalesce(array_agg(distinct aa.provider) filter (where aa.user_id is not null), '{}'::text[]) as providers\",
-      '  from users u',
-      '  left join auth_accounts aa on aa.user_id = u.id',
-      where,
-      ' group by u.id, u.vk_id, u.first_name, u.last_name, u.avatar, u.balance, u.country_code, u.country_name, u.created_at, u.updated_at',
-      ' order by u.id desc',
-      ' limit ' + add(limit) + ' offset ' + add(offset)
-    ].join('\\n');
+  'select u.id, u.vk_id, u.first_name, u.last_name, u.avatar, u.balance,',
+  '       u.country_code, u.country_name, u.created_at, u.updated_at,',
+  `       coalesce(array_agg(distinct aa.provider) filter (where aa.user_id is not null), '{}'::text[]) as providers`,
+  '  from users u',
+  '  left join auth_accounts aa on aa.user_id = u.id',
+  where,
+  ' group by u.id, u.vk_id, u.first_name, u.last_name, u.avatar, u.balance, u.country_code, u.country_name, u.created_at, u.updated_at',
+  ' order by u.id desc',
+  ' limit ' + add(limit) + ' offset ' + add(offset)
+].join('\n');
+
 
     const r = await db.query(sql, params);
     res.json({ ok:true, users:r.rows });
