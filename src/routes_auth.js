@@ -1,236 +1,312 @@
-import express from 'express';
-import axios from 'axios';
-import crypto from 'crypto';
-import { createCodeVerifier, createCodeChallenge } from './pkce.js';
-import { signSession } from './jwt.js';
-import { upsertUser, logEvent, db } from './db.js';
+// src/routes_auth.js
+// Авторизация TG + VK, выдача JWT в httpOnly-куке, безопасные редиректы.
+// Требует: cookie-parser в app, ENV: JWT_SECRET, TG_BOT_TOKEN,
+// VK_CLIENT_ID, VK_CLIENT_SECRET, (опц.) FRONT_ORIGIN, COOKIE_DOMAIN.
 
-const router = express.Router();
+import { Router } from 'express';
+import jwt from 'jsonwebtoken';
+import { verifyTelegramInitData } from './verifyTelegram.js';
+import { db } from './db.js'; // ожидается твой обёрточный модуль БД
 
-function getenv() {
-  const env = process.env;
-  const clientId     = env.VK_CLIENT_ID;
-  const clientSecret = env.VK_CLIENT_SECRET;
-  const redirectUri  = env.VK_REDIRECT_URI || env.REDIRECT_URI;
-  const frontendUrl  = env.FRONTEND_URL  || env.CLIENT_URL;
+const router = Router();
 
-  for (const [k, v] of Object.entries({
-    VK_CLIENT_ID: clientId,
-    VK_CLIENT_SECRET: clientSecret,
-    VK_REDIRECT_URI: redirectUri,
-    FRONTEND_URL: frontendUrl,
-  })) {
-    if (!v) throw new Error(`Missing env ${k}`);
-  }
-  return { clientId, clientSecret, redirectUri, frontendUrl };
+// ────────────────────────────────────────────────────────────
+// Конфиг
+// ────────────────────────────────────────────────────────────
+const JWT_SECRET = (process.env.JWT_SECRET || '').toString();
+const COOKIE_NAME = process.env.AUTH_COOKIE || 'gg_token';
+const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || undefined;
+const FRONT_DEFAULT =
+  process.env.FRONT_ORIGIN ||
+  process.env.FRONT_URL ||
+  'https://sweet-twilight-63a9b6.netlify.app'; // подставь свой фронт, если укажешь в ENV — возьмётся оттуда
+
+const VK_CLIENT_ID = (process.env.VK_CLIENT_ID || '').toString();
+const VK_CLIENT_SECRET = (process.env.VK_CLIENT_SECRET || '').toString();
+
+// ────────────────────────────────────────────────────────────
+// Утилиты
+// ────────────────────────────────────────────────────────────
+function backendBase(req) {
+  const proto = (req.get('x-forwarded-proto') || req.protocol || 'https').toString();
+  const host = req.get('host');
+  return `${proto}://${host}`;
 }
 
-function firstIp(req) {
-  const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
-  return ipHeader.split(',')[0].trim();
-}
-
-// ——— VK OAuth старт ——————————————————————————————————————————————
-router.get('/vk/start', async (req, res) => {
+function safeFront(next) {
   try {
-    const { clientId, redirectUri } = getenv();
-    const state         = crypto.randomBytes(16).toString('hex');
-    const codeVerifier  = createCodeVerifier();
-    const codeChallenge = createCodeChallenge(codeVerifier);
+    if (!next) return FRONT_DEFAULT;
+    const u = new URL(next, FRONT_DEFAULT);
+    // Не даём увести наружу: если origin другой — жёстко на наш FRONT.
+    if (u.origin !== new URL(FRONT_DEFAULT).origin) return FRONT_DEFAULT;
+    return u.toString();
+  } catch {
+    return FRONT_DEFAULT;
+  }
+}
 
-    res.cookie('vk_state', state,               { httpOnly:true, sameSite:'lax',  secure:true, path:'/', maxAge: 10*60*1000 });
-    res.cookie('vk_code_verifier', codeVerifier,{ httpOnly:true, sameSite:'lax',  secure:true, path:'/', maxAge: 10*60*1000 });
+function signJwt(claims) {
+  if (!JWT_SECRET) throw new Error('JWT_SECRET not set');
+  return jwt.sign(claims, JWT_SECRET, { expiresIn: '30d' });
+}
 
-    await logEvent({
-      user_id: null,
-      event_type: 'auth_start',
-      payload: { provider: 'vk' },
-      ip: firstIp(req),
-      ua: (req.headers['user-agent']||'').slice(0,256)
+function setAuthCookie(res, token) {
+  const opt = {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: true,
+    path: '/',
+  };
+  if (COOKIE_DOMAIN) opt.domain = COOKIE_DOMAIN;
+  res.cookie(COOKIE_NAME, token, opt);
+}
+
+function clearAuthCookie(res) {
+  const opt = { path: '/' };
+  if (COOKIE_DOMAIN) opt.domain = COOKIE_DOMAIN;
+  res.clearCookie(COOKIE_NAME, opt);
+}
+
+// На разных инсталлах БД-обёртка называется по-разному — делаем «мягкий» upsert.
+// Если у тебя свои методы — просто адаптируй один блок внутри.
+async function upsertUserFromProvider(provider, provider_id, profile = {}) {
+  if (!db) return null;
+
+  // 1) Если есть явный удобный метод — используем.
+  if (typeof db.upsertUserFromProvider === 'function') {
+    return db.upsertUserFromProvider(provider, provider_id, profile);
+  }
+
+  // 2) Частый вариант: найти по провайдеру → если нет — создать пользователя
+  try {
+    if (typeof db.userByProviderId === 'function') {
+      const found = await db.userByProviderId(provider, provider_id);
+      if (found) return found;
+    }
+  } catch (e) {
+    console.warn('[auth] userByProviderId failed:', e?.message || e);
+  }
+
+  try {
+    if (typeof db.createUserWithProvider === 'function') {
+      return await db.createUserWithProvider({ provider, provider_id, profile });
+    }
+  } catch (e) {
+    console.warn('[auth] createUserWithProvider failed:', e?.message || e);
+  }
+
+  // 3) Минимальный фоллбек — вообще без записи в БД (не рекомендуется, но даст жить фронту)
+  return {
+    id: null,
+    name: profile.firstName || profile.username || 'User',
+    avatar: profile.avatar || null,
+    providers: [provider],
+    provider_id,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// Диагностика
+// ────────────────────────────────────────────────────────────
+router.get('/auth/ping', (req, res) => res.json({ ok: true, service: 'auth' }));
+
+router.post('/auth/logout', (req, res) => {
+  clearAuthCookie(res);
+  res.json({ ok: true });
+});
+
+// ────────────────────────────────────────────────────────────
+// Telegram Login Widget callback
+// ────────────────────────────────────────────────────────────
+// Прилетает GET с query-параметрами. Подписаны ТОЛЬКО телеграм-поля.
+// Любые device_id и т.п. игнорируются в verify.
+router.get('/auth/tg/callback', async (req, res) => {
+  try {
+    const check = verifyTelegramInitData(req.query, process.env.TG_BOT_TOKEN);
+    if (!check.ok) {
+      console.warn('[auth][tg] verify fail:', check.reason);
+      return res.status(400).send('tg callback error');
+    }
+
+    const tg = check.data;
+    const provider = 'tg';
+    const provider_id = `tg:${tg.id}`;
+
+    const profile = {
+      firstName: tg.first_name || '',
+      lastName: tg.last_name || '',
+      username: tg.username || '',
+      avatar: tg.photo_url || '',
+    };
+
+    const user = await upsertUserFromProvider(provider, provider_id, profile);
+
+    // Собираем JWT. Минимальный набор — uid (может быть null, если БД не пишет).
+    const token = signJwt({
+      uid: user?.id ?? null,
+      p: provider,
+      pid: provider_id,
+      name: user?.name || `${profile.firstName} ${profile.lastName}`.trim(),
+      avatar: user?.avatar || profile.avatar || null,
+      iat: Math.floor(Date.now() / 1000),
     });
 
-    const u = new URL('https://id.vk.com/authorize');
-    u.searchParams.set('response_type', 'code');
-    u.searchParams.set('client_id', clientId);
-    u.searchParams.set('redirect_uri', redirectUri);
-    u.searchParams.set('state', state);
-    u.searchParams.set('code_challenge', codeChallenge);
-    u.searchParams.set('code_challenge_method', 'S256');
-    u.searchParams.set('scope', 'vkid.personal_info');
+    setAuthCookie(res, token);
 
-    return res.redirect(u.toString());
+    const next = safeFront(req.query.next || `${FRONT_DEFAULT}/lobby.html#tg`);
+    return res.redirect(302, next);
   } catch (e) {
-    console.error('vk/start error:', e.message);
-    return res.status(500).send('auth start failed');
+    console.error('[auth][tg] callback error:', e);
+    return res.status(500).send('tg callback error');
   }
 });
 
-// ——— VK OAuth callback + АВТОСКЛЕЙКА ——————————————————————————————
-router.get('/vk/callback', async (req, res) => {
-  const { code, state, device_id } = req.query;
+// ────────────────────────────────────────────────────────────
+// VK OAuth (поддержка VK ID и классического oauth.vk.com)
+// ────────────────────────────────────────────────────────────
+router.get('/auth/vk/start', (req, res) => {
+  const redirect_uri =
+    process.env.VK_REDIRECT_URI ||
+    `${backendBase(req)}/api/auth/vk/callback`;
+
+  const state = encodeURIComponent(
+    (req.query.next && safeFront(req.query.next)) || `${FRONT_DEFAULT}/lobby.html#vk`
+  );
+
+  // Стандартный VK ID
+  const url =
+    `https://id.vk.com/oauth2/auth?` +
+    `response_type=code&client_id=${encodeURIComponent(VK_CLIENT_ID)}` +
+    `&redirect_uri=${encodeURIComponent(redirect_uri)}` +
+    `&scope=${encodeURIComponent('email')}` +
+    `&state=${state}`;
+
+  return res.redirect(302, url);
+});
+
+async function exchangeVkToken(code, redirect_uri) {
+  // 1) Пробуем VK ID
   try {
-    const savedState   = req.cookies['vk_state'];
-    const codeVerifier = req.cookies['vk_code_verifier'];
-    if (!code || !state || !savedState || savedState !== state || !codeVerifier) {
-      return res.status(400).send('Invalid state');
-    }
-
-    res.clearCookie('vk_state', { path:'/' });
-    res.clearCookie('vk_code_verifier', { path:'/' });
-
-    const { clientId, clientSecret, redirectUri, frontendUrl } = getenv();
-
-    // 1) Обмен кода на токен
-    let tokenData = null;
-    try {
-      const resp = await axios.post(
-        'https://id.vk.com/oauth2/auth',
-        new URLSearchParams({
-          grant_type: 'authorization_code',
-          code,
-          client_id: clientId,
-          client_secret: clientSecret,
-          redirect_uri: redirectUri,
-          code_verifier: codeVerifier,
-          device_id: device_id || ''
-        }).toString(),
-        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
-      );
-      tokenData = resp.data;
-    } catch (err) {
-      // fallback на legacy endpoint
-      const resp = await axios.get('https://oauth.vk.com/access_token', {
-        params: {
-          client_id: clientId,
-          client_secret: clientSecret,
-          redirect_uri: redirectUri,
-          code,
-          code_verifier: codeVerifier,
-          device_id: device_id || ''
-        },
-        timeout: 10000
-      });
-      tokenData = resp.data;
-    }
-
-    const accessToken = tokenData?.access_token;
-    if (!accessToken) {
-      console.error('no access_token:', tokenData);
-      return res.status(400).send('Token exchange failed');
-    }
-
-    // 2) Профиль VK
-    let first_name = '', last_name = '', avatar = '';
-    try {
-      const u = await axios.get('https://api.vk.com/method/users.get', {
-        params: { access_token: accessToken, v: '5.199', fields: 'photo_200,first_name,last_name' },
-        timeout: 10000
-      });
-      const r = u.data?.response?.[0];
-      if (r) { first_name = r.first_name || ''; last_name = r.last_name || ''; avatar = r.photo_200 || ''; }
-    } catch {}
-
-    const vk_id = String(tokenData?.user_id || tokenData?.user?.id || 'unknown');
-
-    // 3) Апсертуем пользователя по VK
-    const user = await upsertUser({ vk_id, first_name, last_name, avatar });
-
-    // 4) Фиксируем учётку провайдера (для последующих склеек/аналитики)
-    try {
-      await db.query(`
-        insert into auth_accounts (user_id, provider, provider_user_id, device_id)
-        values ($1,$2,$3,$4)
-        on conflict (provider, provider_user_id)
-        do update set user_id = excluded.user_id,
-                     device_id = coalesce(excluded.device_id, auth_accounts.device_id)
-      `, [user.id, 'vk', vk_id, device_id || null]);
-    } catch (e) {
-      console.warn('auth_accounts upsert warn:', e.message);
-    }
-
-    // 5) АВТОСКЛЕЙКА: если есть другой пользователь на том же device_id → сливаем во VK
-    if (device_id) {
-      try {
-        const cand = await db.query(`
-          select aa.user_id
-          from auth_accounts aa
-          where aa.device_id = $1
-            and aa.user_id is not null
-            and aa.user_id <> $2
-          order by aa.created_at desc
-          limit 1
-        `, [device_id, user.id]);
-
-        const secondaryId = cand.rows?.[0]?.user_id ? Number(cand.rows[0].user_id) : 0;
-
-        if (secondaryId && secondaryId !== user.id) {
-          const client = await db.connect();
-          try {
-            await client.query('BEGIN');
-
-            // перенос всех привязок провайдеров
-            await client.query('update auth_accounts set user_id=$1 where user_id=$2', [user.id, secondaryId]);
-
-            // перенос ссылок в событиях / транзакциях (если есть)
-            try { await client.query('update events set user_id=$1 where user_id=$2', [user.id, secondaryId]); } catch {}
-            try { await client.query('update transactions set user_id=$1 where user_id=$2', [user.id, secondaryId]); } catch {}
-
-            // баланс: складываем, вторичному — 0 + отметка merged_into
-            await client.query(
-              'update users u set balance = coalesce(u.balance,0) + (select coalesce(balance,0) from users where id=$2) where id=$1',
-              [user.id, secondaryId]
-            );
-            await client.query(
-              "update users set balance=0, meta = jsonb_set(coalesce(meta,'{}'::jsonb), '{merged_into}', to_jsonb($1)::jsonb), updated_at=now() where id=$2",
-              [user.id, secondaryId]
-            );
-
-            await client.query('COMMIT');
-
-            await logEvent({
-              user_id: user.id,
-              event_type: 'merge_auto',
-              payload: { primary_id: user.id, secondary_id: secondaryId, by: 'device_id', provider: 'vk' },
-              ip: firstIp(req),
-              ua: (req.headers['user-agent']||'').slice(0,256)
-            });
-          } catch (e) {
-            await (async () => { try { await client.query('ROLLBACK'); } catch {} })();
-            console.error('auto-merge error:', e.message);
-          } finally {
-            client.release();
-          }
-        }
-      } catch (e) {
-        console.warn('auto-merge lookup warn:', e.message);
-      }
-    }
-
-    // 6) событие успешной авторизации
-    await logEvent({
-      user_id: user.id,
-      event_type: 'auth_success',
-      payload: { provider:'vk', vk_id, device_id: device_id || null },
-      ip: firstIp(req),
-      ua: (req.headers['user-agent']||'').slice(0,256)
+    const body = new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      client_id: VK_CLIENT_ID,
+      client_secret: VK_CLIENT_SECRET,
+      redirect_uri,
     });
 
-    // 7) Сессия + редирект на фронт
-    const sessionJwt = signSession({ uid: user.id, vk_id: user.vk_id });
-    res.cookie('sid', sessionJwt, {
-      httpOnly: true,
-      sameSite: 'none',
-      secure: true,
-      path: '/',
-      maxAge: 30 * 24 * 3600 * 1000
+    const r = await fetch('https://id.vk.com/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
     });
-
-    const url = new URL(frontendUrl);
-    url.searchParams.set('logged', '1');
-    return res.redirect(url.toString());
+    if (r.ok) return await r.json();
   } catch (e) {
-    console.error('vk/callback error:', e?.response?.data || e?.message);
-    return res.status(500).send('auth callback failed');
+    console.warn('[auth][vk] id.vk.com token fail:', e?.message || e);
+  }
+
+  // 2) Фоллбек на классический oauth.vk.com
+  const url =
+    `https://oauth.vk.com/access_token?client_id=${encodeURIComponent(VK_CLIENT_ID)}` +
+    `&client_secret=${encodeURIComponent(VK_CLIENT_SECRET)}` +
+    `&redirect_uri=${encodeURIComponent(redirect_uri)}` +
+    `&code=${encodeURIComponent(code)}`;
+
+  const r2 = await fetch(url);
+  if (!r2.ok) throw new Error(`oauth.vk.com token HTTP ${r2.status}`);
+  return await r2.json();
+}
+
+async function fetchVkProfile(access_token, user_id) {
+  // Универсальный способ — обычный VK API
+  const url =
+    `https://api.vk.com/method/users.get?user_ids=${encodeURIComponent(user_id)}` +
+    `&fields=photo_200,screen_name` +
+    `&v=5.131&access_token=${encodeURIComponent(access_token)}`;
+
+  const r = await fetch(url);
+  const j = await r.json();
+  if (!j || !j.response || !Array.isArray(j.response) || !j.response[0]) {
+    throw new Error('vk users.get bad response');
+  }
+  const u = j.response[0];
+  return {
+    id: u.id,
+    first_name: u.first_name,
+    last_name: u.last_name,
+    username: u.screen_name || '',
+    photo_url: u.photo_200 || '',
+  };
+}
+
+router.get('/auth/vk/callback', async (req, res) => {
+  const code = (req.query.code || '').toString();
+  if (!code) return res.status(400).send('vk code missing');
+
+  try {
+    const redirect_uri =
+      process.env.VK_REDIRECT_URI ||
+      `${backendBase(req)}/api/auth/vk/callback`;
+
+    const tok = await exchangeVkToken(code, redirect_uri);
+
+    // Форматы токена различаются; пытаемся аккуратно вытащить user_id + access_token
+    const access_token = tok.access_token || tok.token || tok.accessToken;
+    const user_id = tok.user_id || tok.uid || tok.userId || tok.user?.id;
+
+    if (!access_token || !user_id) {
+      console.warn('[auth][vk] no access_token or user_id in token:', tok);
+      return res.status(400).send('vk token error');
+    }
+
+    const profileRaw = await fetchVkProfile(access_token, user_id);
+
+    const provider = 'vk';
+    const provider_id = `vk:${profileRaw.id}`;
+    const profile = {
+      firstName: profileRaw.first_name || '',
+      lastName: profileRaw.last_name || '',
+      username: profileRaw.username || '',
+      avatar: profileRaw.photo_url || '',
+    };
+
+    const user = await upsertUserFromProvider(provider, provider_id, profile);
+
+    const token = signJwt({
+      uid: user?.id ?? null,
+      p: provider,
+      pid: provider_id,
+      name:
+        user?.name ||
+        `${profile.firstName} ${profile.lastName}`.trim() ||
+        profile.username ||
+        'VK User',
+      avatar: user?.avatar || profile.avatar || null,
+      iat: Math.floor(Date.now() / 1000),
+    });
+
+    setAuthCookie(res, token);
+
+    // state — это next в виде абсолютного URL нашей витрины
+    const next = safeFront(req.query.state || `${FRONT_DEFAULT}/lobby.html#vk`);
+    return res.redirect(302, next);
+  } catch (e) {
+    console.error('[auth][vk] callback error:', e);
+    return res.status(500).send('vk callback error');
+  }
+});
+
+// ────────────────────────────────────────────────────────────
+// Утилити-ручка для фронта/диагностики
+// ────────────────────────────────────────────────────────────
+router.get('/auth/whoami', (req, res) => {
+  try {
+    const raw = req.cookies?.[COOKIE_NAME];
+    if (!raw) return res.json({ ok: true, user: null });
+    const data = jwt.verify(raw, JWT_SECRET);
+    res.json({ ok: true, user: data });
+  } catch {
+    res.json({ ok: true, user: null });
   }
 });
 
