@@ -18,7 +18,7 @@ router.use(adminAuth);
 
 router.get('/health', (_req, res) => res.json({ ok:true }));
 
-// /api/admin/summary
+// api/admin/summary
 router.get('/summary', async (_req, res) => {
   try {
     const u = await db.query('select count(*)::int as c from users');
