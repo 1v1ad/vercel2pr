@@ -77,6 +77,49 @@ if (deviceId) {
       }catch(e){ console.warn('tg upsert failed', e?.message); }
     }
 
+// after upsert: try to resolve user by TG account itself
+if (tgId) {
+  try {
+    const link = await db.query(
+      `select user_id
+         from auth_accounts
+        where provider = 'tg' and provider_user_id = $1
+          and user_id is not null
+        order by updated_at desc
+        limit 1`,
+      [tgId]
+    );
+
+    if (link.rows.length) {
+      const user = await getUserById(link.rows[0].user_id);
+      if (user) {
+        // успех по связке TG-аккаунта → user_id
+        const jwt = signSession({ uid: user.id });
+        res.cookie('sid', jwt, {
+          httpOnly: true,
+          sameSite: 'none',
+          secure: true,
+          path: '/',
+          maxAge: 30 * 24 * 3600 * 1000
+        });
+
+        try {
+          await logEvent({
+            user_id: user.id,
+            event_type: 'auth_success',
+            payload: { provider: 'tg', via: 'account_link' },
+            ip: (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || null),
+            ua: req.get('user-agent') || null,
+            country_code: null
+          });
+        } catch {}
+      }
+    }
+  } catch (e) {
+    console.warn('tg account->user resolve failed:', e?.message || e);
+  }
+}
+    
     // fire-and-forget auto-merge
     try { if (deviceId) await autoMergeByDevice({ deviceId, tgId }); } catch {}
 
