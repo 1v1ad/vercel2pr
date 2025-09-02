@@ -85,7 +85,7 @@ router.get('/summary/daily', async (req, res) => {
     // Фильтр "события авторизации"
     const authFilters = [];
     // те же типы, что ты считаешь в summary
-    const AUTH_SET = `('auth','login','auth_start','auth_callback','auth_success')`;
+    const AUTH_SET = `('auth_success')`;
     if (hasEventType) authFilters.push(`event_type in ${AUTH_SET}`);
     if (hasType)      authFilters.push(`"type" in ${AUTH_SET}`);
     // если нет ни одной типовой колонки — просто считаем 0 авторизаций
