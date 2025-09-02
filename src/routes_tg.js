@@ -1,6 +1,6 @@
 // src/routes_tg.js — complete TG callback with device session + auto-merge
 import { Router } from 'express';
-import { db, getUserById } from './db.js';
+import { db, getUserById, logEvent } from './db.js';
 import { signSession } from './jwt.js';
 import { autoMergeByDevice } from './merge.js';
 
@@ -28,6 +28,16 @@ router.all('/callback', async (req, res) => {
             res.cookie('sid', jwt, {
               httpOnly:true, sameSite:'none', secure:true, path:'/', maxAge:30*24*3600*1000
             });
+            try {
+         await logEvent({
+            user_id: user.id,
+            event_type: 'auth_success',
+            payload: { provider: 'tg', via: 'device_id' },
+            ip: (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || null),
+            ua: req.get('user-agent') || null,
+            country_code: null
+          });
+        } catch {}
           }
         }
       } catch {}
