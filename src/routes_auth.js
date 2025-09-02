@@ -3,7 +3,7 @@ import axios from 'axios';
 import crypto from 'crypto';
 import { createCodeVerifier, createCodeChallenge } from './pkce.js';
 import { signSession } from './jwt.js';
-import { upsertUser, logEvent } from './db.js';
+import { upsertUser, logEvent, db } from './db.js';
 
 const router = express.Router();
 
@@ -136,7 +136,28 @@ router.get('/vk/callback', async (req, res) => {
       maxAge: 30 * 24 * 3600 * 1000
     });
 
-    const url = new URL(frontendUrl);
+    
+    // Persist VK auth_account with device_id → enables TG→primary login by device
+    try {
+      const devId = (req.query.device_id || req.cookies?.device_id || '').toString();
+      await db.query(`
+        insert into auth_accounts (user_id, provider, provider_user_id, username, phone_hash, meta)
+        values ($1, 'vk', $2, $3, null, $4)
+        on conflict (provider, provider_user_id) do update set
+          user_id   = excluded.user_id,
+          username  = coalesce(excluded.username, auth_accounts.username),
+          meta      = jsonb_strip_nulls(coalesce(auth_accounts.meta,'{}'::jsonb) || excluded.meta),
+          updated_at = now()
+      `, [
+        user.id,
+        String(user.vk_id || tokenData?.user_id || ''),
+        user.first_name || '',
+        JSON.stringify({ device_id: devId || null })
+      ]);
+    } catch (e) {
+      console.warn('vk auth_account upsert failed:', e?.message || e);
+    }
+const url = new URL(frontendUrl);
     url.searchParams.set('logged', '1');
     return res.redirect(url.toString());
   } catch (e) {
