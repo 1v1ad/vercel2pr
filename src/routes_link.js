@@ -1,7 +1,8 @@
 // src/routes_link.js — persist device_id on provider account + call auto-merge
 import { Router } from 'express';
 import { autoMergeByDevice, ensureMetaColumns } from './merge.js';
-import { db } from './db.js';
+import { db, getUserById, logEvent } from './db.js';
+import { signSession } from './jwt.js';
 
 const router = Router();
 
@@ -37,7 +38,46 @@ router.post('/link/background', async (req, res) => {
 
     // 3) Пытаемся автосклеить, отдаём «мягкий» ответ
     const merged = await autoMergeByDevice({ deviceId: device_id || null, tgId: provider === 'tg' ? provider_user_id : null });
-    res.json({ ok:true, merged });
+
+    // Try to resolve primary by device_id (mapped earlier via VK) and set session cookie
+    let sessionSet = false;
+    try {
+      if (device_id) {
+        const found = await db.query(
+          `select user_id
+             from auth_accounts
+            where provider='vk' and user_id is not null
+              and (meta->>'device_id') = $1
+            order by updated_at desc
+            limit 1`,
+          [device_id]
+        );
+        if (found.rows.length) {
+          const primary = await getUserById(found.rows[0].user_id);
+          if (primary) {
+            res.cookie('sid', signSession({ uid: primary.id }), {
+              httpOnly: true, sameSite: 'none', secure: true, path: '/',
+              maxAge: 30 * 24 * 3600 * 1000
+            });
+            sessionSet = true;
+            try {
+              await logEvent({
+                user_id: primary.id,
+                event_type: 'auth_success',
+                payload: { provider, via: 'background_link' },
+                ip: (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || null),
+                ua: req.get('user-agent') || null,
+                country_code: null
+              });
+            } catch {}
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('link/background: set session failed', e?.message || e);
+    }
+
+    res.json({ ok:true, merged, sessionSet });
   } catch (e) {
     res.json({ ok:false, error: String(e && e.message || e) });
   }
