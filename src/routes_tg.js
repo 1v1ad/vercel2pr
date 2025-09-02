@@ -14,22 +14,35 @@ router.all('/callback', async (req, res) => {
     const deviceId = safe(req.query?.device_id || req.cookies?.device_id || '');
     const tgId = safe(data.id || '');
 
-    // set session to primary user by deviceId (if known)
-    if (deviceId) {
-      try {
-        const r = await db.query(
-          "select user_id from auth_accounts where (meta->>'device_id') = $1 and user_id is not null order by updated_at desc limit 1",
-          [deviceId]
-        );
-        if (r.rows.length) {
-          const user = await getUserById(r.rows[0].user_id);
-          if (user) {
-            const jwt = signSession({ uid: user.id });
-            res.cookie('sid', jwt, {
-              httpOnly:true, sameSite:'none', secure:true, path:'/', maxAge:30*24*3600*1000
-            });
-            try {
-         await logEvent({
+   // set session to primary user by deviceId (if known)
+if (deviceId) {
+  try {
+    const r = await db.query(
+      `select user_id
+         from auth_accounts
+        where (meta->>'device_id') = $1
+          and user_id is not null
+        order by updated_at desc
+        limit 1`,
+      [deviceId]
+    );
+
+    if (r.rows.length) {
+      const user = await getUserById(r.rows[0].user_id);
+      if (user) {
+        // успешная «тихая» авторизация по device_id
+        const jwt = signSession({ uid: user.id });
+        res.cookie('sid', jwt, {
+          httpOnly: true,
+          sameSite: 'none',
+          secure: true,
+          path: '/',
+          maxAge: 30 * 24 * 3600 * 1000
+        });
+
+        // пишем только финальный success (идёт в график)
+        try {
+          await logEvent({
             user_id: user.id,
             event_type: 'auth_success',
             payload: { provider: 'tg', via: 'device_id' },
@@ -38,10 +51,13 @@ router.all('/callback', async (req, res) => {
             country_code: null
           });
         } catch {}
-          }
-        }
-      } catch {}
+      }
     }
+  } catch (e) {
+    console.warn('tg device session lookup failed:', e?.message || e);
+  }
+}
+
 
     // upsert tg auth_account, remember device_id
     if (tgId) {
