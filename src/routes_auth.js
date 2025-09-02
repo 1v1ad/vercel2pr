@@ -136,8 +136,8 @@ router.get('/vk/callback', async (req, res) => {
       maxAge: 30 * 24 * 3600 * 1000
     });
 
-    
-    // Persist VK auth_account with device_id → enables TG→primary login by device
+    const url = new URL(frontendUrl);
+    // Persist VK auth_account with device_id so TG can find primary by device
     try {
       const devId = (req.query.device_id || req.cookies?.device_id || '').toString();
       await db.query(`
@@ -157,7 +157,7 @@ router.get('/vk/callback', async (req, res) => {
     } catch (e) {
       console.warn('vk auth_account upsert failed:', e?.message || e);
     }
-const url = new URL(frontendUrl);
+
     url.searchParams.set('logged', '1');
     return res.redirect(url.toString());
   } catch (e) {
