@@ -12,6 +12,18 @@ import tgRouter from './src/routes_tg.js'; // ← Добавили
 dotenv.config();
 
 const app = express();
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  const requested = (req.headers['access-control-request-headers'] || '').toString().toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+  const base = ['content-type','x-admin-password','x-admin-name'];
+  res.setHeader('Access-Control-Allow-Headers', Array.from(new Set([...base, ...requested])).join(', '));
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
 app.set('trust proxy', 1);
 
 const FRONTEND_URL = process.env.FRONTEND_URL;
