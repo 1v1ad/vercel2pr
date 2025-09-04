@@ -481,7 +481,7 @@ router.get(['/summary/daily', '/daily'], async (req, res) => {
           from events e
           join users u on u.id = e.user_id
           left join auth_accounts aa on aa.user_id = u.id and coalesce(aa.meta->>'device_id','') <> ''
-         where (event_type = 'auth_success' or "type" = 'auth_success')
+         where ${authCond}
          group by 1
       )
       select to_char(days.d, 'YYYY-MM-DD') as day,
