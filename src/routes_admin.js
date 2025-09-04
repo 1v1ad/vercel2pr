@@ -66,24 +66,34 @@ router.get('/summary', async (req, res) => {
     let unique7 = 0;
     try {
       const r = await db.query(
-      `with clusters as (
-         select u.id as user_id, coalesce(nullif(u.meta->>'merged_into','')::int, u.id) as root_id
-           from users u
+        `with clusters as (
+           select u.id as user_id, coalesce(nullif(u.meta->>'merged_into','')::int, u.id) as root_id
+         from users u
        ),
-       devices_by_root as (
-         select c.root_id, max(nullif(aa.meta->>'device_id','')) as device_id
+       root_devices as (
+         select distinct c.root_id, nullif(aa.meta->>'device_id','') as device_id
            from clusters c
            left join auth_accounts aa on aa.user_id = c.user_id
+          where coalesce(aa.meta->>'device_id','') <> ''
+       ),
+       device_min_root as (
+         select device_id, min(root_id) as min_root from root_devices group by device_id
+       ),
+       root_component as (
+         select c.root_id, coalesce(min(dmr.min_root), c.root_id) as comp_root
+           from (select distinct root_id from clusters) c
+           left join root_devices rd on rd.root_id = c.root_id
+           left join device_min_root dmr on dmr.device_id = rd.device_id
           group by c.root_id
        )
-       select count(distinct coalesce(d.device_id, 'root:'||c.root_id::text))::int as c
+       select count(distinct rc.comp_root)::int as c
          from events e
-         join clusters c on c.user_id = e.user_id
-         left join devices_by_root d on d.root_id = c.root_id
+         join clusters cl on cl.user_id = e.user_id
+         join root_component rc on rc.root_id = cl.root_id
         where ${AUTH_WHERE}
           and (e.created_at at time zone $1) > (now() at time zone $1) - interval '7 days'`,
-      [TZ]
-    );
+        [TZ]
+      );
       unique7 = r.rows[0]?.c ?? 0;
     } catch {}
 
@@ -152,24 +162,32 @@ router.get('/summary/daily', async (req, res) => {
       ),
       agg_uniq as (
         with clusters as (
-          select u.id as user_id, coalesce(nullif(u.meta->>'merged_into','')::int, u.id) as root_id
-            from users u
+           select u.id as user_id, coalesce(nullif(u.meta->>'merged_into','')::int, u.id) as root_id
+             from users u
         ),
-        devices_by_root as (
-          select c.root_id, max(nullif(aa.meta->>'device_id','')) as device_id
+        root_devices as (
+          select distinct c.root_id, nullif(aa.meta->>'device_id','') as device_id
             from clusters c
             left join auth_accounts aa on aa.user_id = c.user_id
+           where coalesce(aa.meta->>'device_id','') <> ''
+        ),
+        device_min_root as (
+          select device_id, min(root_id) as min_root from root_devices group by device_id
+        ),
+        root_component as (
+          select c.root_id, coalesce(min(dmr.min_root), c.root_id) as comp_root
+            from (select distinct root_id from clusters) c
+            left join root_devices rd on rd.root_id = c.root_id
+            left join device_min_root dmr on dmr.device_id = rd.device_id
            group by c.root_id
         )
-        select
-          (e.created_at at time zone $2)::date as day,
-          count(distinct coalesce(d.device_id, 'root:'||c.root_id::text)) as uniq
-        from events e
-        join clusters c on c.user_id = e.user_id
-        left join devices_by_root d on d.root_id = c.root_id
-        where ${AUTH_WHERE}
-          and (e.created_at at time zone $2) >= ((select today from bounds)::timestamp - ($1::int - 1) * interval '1 day')
-        group by 1
+        select date_trunc('day', (e.created_at at time zone $2)) as d,
+               count(distinct rc.comp_root)::int as c
+          from events e
+          join clusters cl on cl.user_id = e.user_id
+          join root_component rc on rc.root_id = cl.root_id
+         where (event_type = 'auth_success' or "type" = 'auth_success')
+         group by 1
       )
       select
         to_char(d.day, 'YYYY-MM-DD') as date,
@@ -458,21 +476,11 @@ router.get(['/summary/daily', '/daily'], async (req, res) => {
          group by 1
       ),
       uniq as (
-        with clusters as (
-          select u.id as user_id, coalesce(nullif(u.meta->>'merged_into','')::int, u.id) as root_id
-            from users u
-        ),
-        devices_by_root as (
-          select c.root_id, max(nullif(aa.meta->>'device_id','')) as device_id
-            from clusters c
-            left join auth_accounts aa on aa.user_id = c.user_id
-           group by c.root_id
-        )
         select date_trunc('day', (e.created_at at time zone $2)) as d,
-               count(distinct coalesce(dbr.device_id, 'root:'||c.root_id::text))::int as c
+               count(distinct coalesce(aa.meta->>'device_id', 'root:'||coalesce(nullif(u.meta->>'merged_into','')::int, u.id)::text))::int as c
           from events e
-          join clusters c on c.user_id = e.user_id
-          left join devices_by_root dbr on dbr.root_id = c.root_id
+          join users u on u.id = e.user_id
+          left join auth_accounts aa on aa.user_id = u.id and coalesce(aa.meta->>'device_id','') <> ''
          where (event_type = 'auth_success' or "type" = 'auth_success')
          group by 1
       )
