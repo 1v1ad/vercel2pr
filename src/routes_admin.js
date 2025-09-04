@@ -222,8 +222,61 @@ router.post('/users/:id/topup', async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     const amount = parseInt((req.body && req.body.amount) || '0', 10) || 0;
-    const reason = (((req.body && req.body.reason) || '') + '').trim(); // станет обязательным на шаге 3
+    const reason = (((req.body && req.body.reason) || '') + '').trim();
     if (!id || !Number.isFinite(amount)) return res.status(400).json({ ok:false, error:'bad_args' });
+
+    // Кластер собираем только для логов/аналитики, но баланс меняем ТОЛЬКО у указанного id
+    let clusterIds = [id];
+    try {
+      await db.query("alter table users add column if not exists meta jsonb default '{}'::jsonb");
+      const rootQ = await db.query("select coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id=$1", [id]);
+      const rootId = rootQ.rows && rootQ.rows[0] && rootQ.rows[0].root_id ? rootQ.rows[0].root_id : id;
+      const baseQ = await db.query("select id from users where id=$1 or (meta->>'merged_into')::int = $1", [rootId]);
+      const set = new Set(baseQ.rows.map(r => r.id));
+      const didsQ = await db.query("select distinct meta->>'device_id' as did from auth_accounts where user_id = any($1::int[]) and coalesce(meta->>'device_id','') <> ''", [Array.from(set)]);
+      const dids = didsQ.rows.map(r => r.did).filter(Boolean);
+      if (dids.length) {
+        const moreQ = await db.query("select distinct user_id from auth_accounts where user_id is not null and coalesce(meta->>'device_id','') <> '' and meta->>'device_id' = any($1::text[])", [dids]);
+        for (const r of moreQ.rows) set.add(r.user_id);
+      }
+      clusterIds = Array.from(set);
+    } catch {}
+
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Транзакция на самом user_id
+      try {
+        await client.query(
+          "insert into transactions (user_id, type, amount, meta) values ($1,$2,$3,$4)",
+          [id, amount>=0 ? 'admin_topup' : 'admin_adjust', Math.abs(amount), JSON.stringify({ reason: reason || 'manual', cluster_ids: clusterIds })]
+        );
+      } catch {}
+
+      // Событие на root (чтобы аналитика видела «кластер» вокруг одной точки)
+      try {
+        // определим root ещё раз для события
+        const r = await db.query("select coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id=$1", [id]);
+        const rootId = r.rows && r.rows[0] && r.rows[0].root_id ? r.rows[0].root_id : id;
+        await client.query("insert into events (user_id, event_type, payload) values ($1,$2,$3)", [rootId, 'admin_topup', { amount, requested_user_id:id, cluster_ids: clusterIds }]);
+      } catch {}
+
+      // Меняем баланс ТОЛЬКО указанного пользователя
+      await client.query("update users set balance = coalesce(balance,0) + $2, updated_at = now() where id = $1", [id, amount]);
+
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK'); throw e;
+    } finally {
+      client.release();
+    }
+
+    res.json({ ok:true, user_id: id });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e && e.message || e) });
+  }
+});
 
     // 1) Root по merged_into (если есть)
     await db.query("alter table users add column if not exists meta jsonb default '{}'::jsonb");
