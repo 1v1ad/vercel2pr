@@ -37,372 +37,39 @@ router.get('/summary', async (_req, res) => {
 
     const e = await db.query('select count(*)::int as c from events');
     const events = e.rows[0]?.c ?? 0;
+    let auth7 = 0;
+    try {
+      const cols = await db.query("select column_name from information_schema.columns where table_schema='public' and table_name='events'");
+      const set = new Set(cols.rows.map(r => r.column_name));
+      const hasType = set.has('type');
+      const hasEventType = set.has('event_type');
+      const whereParts = [];
+      const AUTH_SET = "('auth_success')";
+      if (hasEventType) whereParts.push(`event_type in ${AUTH_SET}`);
+      if (hasType)      whereParts.push(`"type" in ${AUTH_SET}`);
+      const w = whereParts.length ? '(' + whereParts.join(' or ') + ')' : 'false';
+      const r2 = await db.query(`select count(*)::int as c from events where ${w} and created_at > now() - interval '7 days'`);
+      auth7 = r2.rows[0]?.c ?? 0;
+    } catch {}
+    let unique7 = 0;
+    try {
+      const r3 = await db.query(`
+        select count(distinct coalesce(nullif(u.meta->>'merged_into','')::int, u.id))::int as c
+          from events e
+          join users u on u.id = e.user_id
+         where (e.event_type = 'auth_success' or "type" = 'auth_success')
+           and e.created_at > now() - interval '7 days'
+      `);
+      unique7 = r3.rows[0]?.c ?? 0;
+    } catch {}
+    
 
     let auth7 = 0;
     if (hasType || hasEventType) {
       const parts = [];
-      if (hasEventType) parts.push("event_type in ('auth','login','auth_start','auth_callback')");
-      if (hasType)      parts.push('\"type\" in (\'auth\',\'login\',\'auth_start\',\'auth_callback\')');
-      const sql = 'select count(*)::int as c from events where (' + parts.join(' or ') + ") and created_at > now() - interval '7 days'";
-      const r = await db.query(sql);
-      auth7 = r.rows[0]?.c ?? 0;
-    }
-
-    const uq = await db.query("select count(distinct user_id)::int as c from events where created_at > now() - interval '7 days'");
-    const unique7 = uq.rows[0]?.c ?? 0;
-
-    res.json({ ok:true, users, events, auth7, unique7 });
-  } catch (e) {
-    res.status(500).json({ ok:false, error:String(e && e.message || e) });
-  }
-});
-
-// Ежедневная сводка для графика: /api/admin/summary/daily?days=7
-router.get('/summary/daily', async (req, res) => {
-  try {
-    const days = Math.max(1, Math.min(31, parseInt(req.query.days || '7', 10) || 7));
-    const TZ = process.env.ADMIN_TZ || 'Europe/Moscow';
-
-    // Узнаем, какие колонки есть в events
-    const cols = await db.query(
-      "select column_name from information_schema.columns where table_schema='public' and table_name='events'"
-    );
-    const have = new Set(cols.rows.map(r => r.column_name));
-    const hasType = have.has('type');
-    const hasEventType = have.has('event_type');
-    const hasCreatedAt = have.has('created_at');
-    const hasUserId = have.has('user_id');
-
-    if (!hasCreatedAt || !hasUserId) {
-      // Без ключевых полей сводку не посчитаем — вернём окно из нулей
-      const today = new Date();
-      today.setHours(0,0,0,0);
-      const out = [];
-      for (let i = days - 1; i >= 0; i--) {
-        const d = new Date(today); d.setDate(today.getDate() - i);
-        const y = d.getFullYear();
-        const m = String(d.getMonth() + 1).padStart(2,'0');
-        const dd = String(d.getDate()).padStart(2,'0');
-        out.push({ date: `${y}-${m}-${dd}`, auth: 0, unique: 0 });
-      }
-      return res.json({ ok: true, days: out });
-    }
-
-    // Фильтр "события авторизации"
-    const authFilters = [];
-    // те же типы, что ты считаешь в summary
-    const AUTH_SET = `('auth_success')`;
-    if (hasEventType) authFilters.push(`event_type in ${AUTH_SET}`);
-    if (hasType)      authFilters.push(`"type" in ${AUTH_SET}`);
-    // если нет ни одной типовой колонки — просто считаем 0 авторизаций
-    const AUTH_WHERE = authFilters.length ? '(' + authFilters.join(' or ') + ')' : 'false';
-
-    // Формируем SQL: окно дней, сегодня включительно, сегодня справа.
-    const sql = `
-      with bounds as (
-        select (date_trunc('day', (now() at time zone $2))::date) as today
-      ),
-      days as (
-        -- генерируем последовательность старейший..сегодня
-        select (select today from bounds) - s as day
-        from generate_series($1::int - 1, 0, -1) s
-        order by day asc
-      ),
-      agg_auth as (
-        select
-          (created_at at time zone $2)::date as day,
-          count(*) as auth
-        from events
-        where ${AUTH_WHERE}
-          and created_at >= ((select today from bounds)::timestamp - ($1::int - 1) * interval '1 day')
-        group by 1
-      ),
-      agg_uniq as (
-        select
-          (created_at at time zone $2)::date as day,
-          count(distinct user_id) as uniq
-        from events
-        where created_at >= ((select today from bounds)::timestamp - ($1::int - 1) * interval '1 day')
-        group by 1
-      )
-      select
-        to_char(d.day, 'YYYY-MM-DD') as date,
-        coalesce(a.auth, 0) as auth,
-        coalesce(u.uniq, 0) as "unique"
-      from days d
-      left join agg_auth a on a.day = d.day
-      left join agg_uniq u on u.day = d.day
-      order by d.day asc;
-    `;
-
-    const { rows } = await db.query(sql, [days, TZ]);
-    res.json({ ok: true, days: rows });
-  } catch (e) {
-    console.error('summary/daily error:', e);
-    res.status(500).json({ ok:false, error: String(e && e.message || e) });
-  }
-});
-
-// USERS with providers list
-router.get('/users', async (req, res) => {
-  try {
-    const search = (req.query.search || '').toString().trim();
-    const limit  = Math.min(100, parseInt(req.query.limit || '50', 10) || 50);
-    const offset = Math.max(0, parseInt(req.query.offset || '0', 10) || 0);
-
-    const params = [];
-    function add(v){ params.push(v); return '$' + params.length; }
-
-    let where = "where coalesce(u.meta->>'merged_into','') = ''";
-    if (search) {
-      const p = add('%' + search + '%');
-      where += ' and (cast(u.vk_id as text) ilike ' + p + ' or u.first_name ilike ' + p + ' or u.last_name ilike ' + p + ')';
-    }
-
-    const sql = [
-      'select u.id, u.vk_id, u.first_name, u.last_name, u.avatar, u.balance,',
-      '       u.country_code, u.country_name, u.created_at, u.updated_at,',
-      '       coalesce(array_agg(distinct aa.provider) filter (where aa.user_id is not null), \'{}\') as providers',
-      '  from users u',
-      '  left join auth_accounts aa on aa.user_id = u.id',
-      where,
-      ' group by u.id, u.vk_id, u.first_name, u.last_name, u.avatar, u.balance, u.country_code, u.country_name, u.created_at, u.updated_at',
-      ' order by u.id desc',
-      ' limit ' + add(limit) + ' offset ' + add(offset)
-    ].join('\n');
-
-    const r = await db.query(sql, params);
-    res.json({ ok:true, users:r.rows });
-  } catch (e) {
-    res.status(500).json({ ok:false, error:String(e && e.message || e) });
-  }
-});
-
-router.get('/events', async (req, res) => {
-  try {
-    const cols = await db.query("select column_name from information_schema.columns where table_schema='public' and table_name='events'");
-    const set = new Set(cols.rows.map(r => r.column_name));
-    const hasType = set.has('type');
-    const hasEventType = set.has('event_type');
-    const hasIp = set.has('ip');
-    const hasUa = set.has('ua');
-    const hasCreated = set.has('created_at');
-
-    const params = [];
-    function add(v){ params.push(v); return '$' + params.length; }
-
-    const selectCols = ['id', 'user_id'];
-    if (hasEventType) selectCols.push('event_type'); else selectCols.push("NULL::text as event_type");
-    if (hasType)      selectCols.push('\"type\"'); else selectCols.push("NULL::text as type");
-    if (hasIp) selectCols.push('ip'); else selectCols.push("NULL::text as ip");
-    if (hasUa) selectCols.push('ua'); else selectCols.push("NULL::text as ua");
-    if (hasCreated) selectCols.push('created_at'); else selectCols.push('now() as created_at');
-
-    const conds = [];
-    const type = (req.query.type || '').toString().trim();
-    const event_type = (req.query.event_type || '').toString().trim();
-    const user_id = parseInt((req.query.user_id || '').toString(), 10) || null;
-    const ip = (req.query.ip || '').toString().trim();
-    const ua = (req.query.ua || '').toString().trim();
-
-    if (type && hasType)            conds.push('\"type\" = ' + add(type));
-    if (event_type && hasEventType) conds.push('event_type = ' + add(event_type));
-    if (user_id) {
-      let rootId = parseInt(user_id, 10) || 0;
-      if (rootId) {
-        try {
-          const q = await db.query("select coalesce(nullif(u.meta->>'merged_into','')::int, u.id) as root_id from users u where u.id=$1", [rootId]);
-          if (q.rows && q.rows[0] && q.rows[0].root_id) rootId = q.rows[0].root_id;
-        } catch {}
-      }
-      conds.push('user_id = ' + add(rootId));
-    }
-    if (ip && hasIp)                conds.push('ip = ' + add(ip));
-    if (ua && hasUa)                conds.push('ua ilike ' + add('%' + ua + '%'));
-
-    const where = conds.length ? (' where ' + conds.join(' and ')) : '';
-
-    const limit  = Math.min(200, parseInt(req.query.limit || '50', 10) || 50);
-    const offset = Math.max(0, parseInt(req.query.offset || '0', 10) || 0);
-
-    const sql = 'select ' + selectCols.join(', ') + ' from events' + where + ' order by id desc limit ' + add(limit) + ' offset ' + add(offset);
-    const r = await db.query(sql, params);
-    res.json({ ok:true, events:r.rows });
-
-router.get('/topups', async (req, res) => {
-  try {
-    const limit  = Math.min(200, parseInt(req.query.limit || '50', 10) || 50);
-    const offset = Math.max(0, parseInt(req.query.offset || '0', 10) || 0);
-    const { rows } = await db.query(
-      "select id, admin_name, admin_ip, ua, user_id, amount, reason, created_at from admin_topups order by id desc limit $1 offset $2",
-      [limit, offset]
-    );
-    res.json({ ok:true, topups: rows });
-  } catch (e) {
-    res.status(500).json({ ok:false, error:String(e && e.message || e) });
-  }
-});
-
-  } catch (e) {
-    res.status(500).json({ ok:false, error:String(e && e.message || e) });
-  }
-});
-
-router.post('/users/:id/topup', async (req, res) => {
-  try {
-    const id = parseInt(req.params.id, 10);
-    const amount = parseInt((req.body && req.body.amount) || '0', 10) || 0;
-    const reason = (((req.body && req.body.reason) || '') + '').trim();
-    if (!id || !Number.isFinite(amount)) return res.status(400).json({ ok:false, error:'bad_args' });
-
-    // строгая валидация причины
-    const t = reason.trim();
-    const bad = (!t) || (t.length < 4) || (/^[\s._-]+$/.test(t)) || (/^\d{1,6}$/.test(t)) || (/^(\d)\1{2,}$/.test(t));
-    if (bad) return res.status(400).json({ ok:false, error:'bad_reason' });
-
-    // Собираем кластер для аналитики (но баланс меняем только у этого id)
-    let clusterIds = [id];
-    try {
-      await db.query("alter table users add column if not exists meta jsonb default '{}'::jsonb");
-      const rootQ = await db.query("select coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id=$1", [id]);
-      const rootId = rootQ.rows && rootQ.rows[0] && rootQ.rows[0].root_id ? rootQ.rows[0].root_id : id;
-      const baseQ = await db.query("select id from users where id=$1 or (meta->>'merged_into')::int = $1", [rootId]);
-      const set = new Set(baseQ.rows.map(r => r.id));
-      const didsQ = await db.query("select distinct meta->>'device_id' as did from auth_accounts where user_id = any($1::int[]) and coalesce(meta->>'device_id','') <> ''", [Array.from(set)]);
-      const dids = didsQ.rows.map(r => r.did).filter(Boolean);
-      if (dids.length) {
-        const moreQ = await db.query("select distinct user_id from auth_accounts where user_id is not null and coalesce(meta->>'device_id','') <> '' and meta->>'device_id' = any($1::text[])", [dids]);
-        for (const r of moreQ.rows) set.add(r.user_id);
-      }
-      clusterIds = Array.from(set);
-    } catch {}
-
-    const client = await db.connect();
-    try {
-      await client.query('BEGIN');
-
-      // Транзакция — на указанного пользователя
-      try {
-        await client.query(
-          "insert into transactions (user_id, type, amount, meta) values ($1,$2,$3,$4)",
-          [id, amount>=0 ? 'admin_topup' : 'admin_adjust', Math.abs(amount), JSON.stringify({ reason, cluster_ids: clusterIds })]
-        );
-      } catch {}
-
-      // Событие — на root (для группировки аналитики)
-      try {
-        const r = await db.query("select coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id=$1", [id]);
-        const rootId2 = r.rows && r.rows[0] && r.rows[0].root_id ? r.rows[0].root_id : id;
-        await client.query(
-          "insert into events (user_id, event_type, payload) values ($1,$2,$3)",
-          [rootId2, 'admin_topup', { amount, requested_user_id:id, reason, cluster_ids: clusterIds }]
-        );
-      } catch {}
-
-      // Меняем баланс ТОЛЬКО указанного пользователя
-      await client.query("update users set balance = coalesce(balance,0) + $2, updated_at = now() where id = $1", [id, amount]);
-
-      // Лог админ-операции
-      try {
-        const adminName = ((req.get('X-Admin-Name') || req.body?.admin_name || req.query?.admin_name || '') + '').trim().slice(0,64) || 'owner';
-        const ip = firstIp(req);
-        const ua = (req.headers['user-agent'] || '').slice(0,256);
-        const headers = { 'x-admin-name': adminName, 'x-admin-password': req.get('X-Admin-Password') ? '***' : undefined };
-        await client.query(
-          "insert into admin_topups (admin_name, admin_ip, ua, user_id, amount, reason, headers) values ($1,$2,$3,$4,$5,$6,$7)",
-          [adminName, ip, ua, id, amount, reason, headers]
-        );
-      } catch {}
-
-      await client.query('COMMIT');
-    } catch (e) {
-      await client.query('ROLLBACK'); throw e;
-    } finally {
-      client.release();
-    }
-
-    res.json({ ok:true, user_id: id });
-  } catch (e) {
-    res.status(500).json({ ok:false, error:String(e && e.message || e) });
-  }
-});
-
-router.post('/users/merge', async (req, res) => {
-  try {
-    const primaryId = parseInt((req.body && req.body.primary_id) || (req.query && req.query.primary_id) || '0', 10);
-    const secondaryId = parseInt((req.body && req.body.secondary_id) || (req.query && req.query.secondary_id) || '0', 10);
-    if (!primaryId || !secondaryId || primaryId === secondaryId) return res.status(400).json({ ok:false, error:'bad_args' });
-
-    await db.query("alter table users add column if not exists meta jsonb default '{}'::jsonb");
-
-    const client = await db.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query('update auth_accounts set user_id=$1 where user_id=$2', [primaryId, secondaryId]);
-      try { await client.query('update transactions set user_id=$1 where user_id=$2', [primaryId, secondaryId]); } catch {}
-      try { await client.query('update events set user_id=$1 where user_id=$2', [primaryId, secondaryId]); } catch {}
-      await client.query('update users u set balance = coalesce(u.balance,0) + (select coalesce(balance,0) from users where id=$2) where id=$1', [primaryId, secondaryId]);
-      await client.query(
-        "update users p set first_name = coalesce(nullif(p.first_name,''), s.first_name), last_name = coalesce(nullif(p.last_name,''), s.last_name), username = coalesce(nullif(p.username,''), s.username), avatar = coalesce(nullif(p.avatar,''), s.avatar), country_code = coalesce(nullif(p.country_code,''), s.country_code) from users s where p.id=$1 and s.id=$2",
-        [primaryId, secondaryId]
-      );
-      await client.query("update users set balance=0, meta = jsonb_set(coalesce(meta,'{}'::jsonb), '{merged_into}', to_jsonb($1)::jsonb), updated_at=now() where id=$2", [primaryId, secondaryId]);
-      await client.query('COMMIT');
-    } catch (e) {
-      await client.query('ROLLBACK'); throw e;
-    } finally {
-      client.release();
-    }
-    res.json({ ok:true });
-  } catch (e) {
-    res.status(500).json({ ok:false, error:String(e && e.message || e) });
-  }
-});
-
-router.get('/users/merge/suggestions', async (_req, res) => {
-  try {
-    const list = await mergeSuggestions(200);
-    res.json({ ok:true, list });
-  } catch (e) {
-    res.status(500).json({ ok:false, error:String(e && e.message || e) });
-  }
-});
-// --- DAILY STATS (alias: /summary/daily и /daily) ---
-router.get(['/summary/daily', '/daily'], async (req, res) => {
-  try {
-    const days = Math.max(1, Math.min(31, parseInt(req.query.days || '7', 10) || 7));
-
-    // Таблица events может не существовать – быстро выходим нулями
-    const hasT = await db.query("select to_regclass('public.events') as r");
-    if (!hasT.rows[0].r) {
-      const labels = Array.from({ length: days }, (_, i) => {
-        const d = new Date(); d.setDate(d.getDate() - (days - 1 - i));
-        return d.toISOString().slice(0,10); // YYYY-MM-DD
-      });
-      return res.json({ ok:true, labels, auth:Array(days).fill(0), unique:Array(days).fill(0) });
-    }
-
-    // Определяем, какие поля в events есть
-    const cols = await db.query(
-      "select column_name from information_schema.columns where table_schema='public' and table_name='events'"
-    );
-    const set = new Set(cols.rows.map(r => r.column_name));
-    const hasType      = set.has('type');
-    const hasEventType = set.has('event_type');
-    const hasCreated   = set.has('created_at');
-
-    if (!hasCreated) {
-      const labels = Array.from({ length: days }, (_, i) => {
-        const d = new Date(); d.setDate(d.getDate() - (days - 1 - i));
-        return d.toISOString().slice(0,10);
-      });
-      return res.json({ ok:true, labels, auth:Array(days).fill(0), unique:Array(days).fill(0) });
-    }
-
-    const parts = [];
-    if (hasEventType) parts.push("event_type in ('auth','login','auth_start','auth_callback')");
-    if (hasType)      parts.push(' "type" in (\'auth\',\'login\',\'auth_start\',\'auth_callback\') ');
-    const authCond = parts.length ? '(' + parts.join(' or ') + ')' : 'true';
+    parts.push("event_type = 'auth_success'");
+    parts.push("\"type\" = 'auth_success'");
+    const authCond = '(' + parts.join(' or ') + ')';
 
     // Собираем последнюю неделю с нулями через generate_series
     const sql = `
@@ -418,8 +85,11 @@ router.get(['/summary/daily', '/daily'], async (req, res) => {
          group by 1
       ),
       uniq as (
-        select date_trunc('day', created_at) as d, count(distinct user_id)::int as c
-          from events
+        select date_trunc('day', created_at) as d,
+               count(distinct coalesce(nullif(u.meta->>'merged_into','')::int, u.id))::int as c
+          from events e
+          join users u on u.id = e.user_id
+         where event_type = 'auth_success' or "type" = 'auth_success'
          group by 1
       )
       select to_char(days.d, 'YYYY-MM-DD') as day,
