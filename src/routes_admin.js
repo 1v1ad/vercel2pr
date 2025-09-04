@@ -59,12 +59,12 @@ router.get('/summary', async (req, res) => {
     let unique7 = 0;
     try {
       const r = await db.query(
-        \`select count(distinct coalesce(aa.meta->>'device_id', 'root:'||coalesce(nullif(u.meta->>'merged_into','')::int, u.id)::text))::int as c
+        `select count(distinct coalesce(aa.meta->>'device_id', 'root:'||coalesce(nullif(u.meta->>'merged_into','')::int, u.id)::text))::int as c
            from events e
            join users u on u.id = e.user_id
            left join auth_accounts aa on aa.user_id = u.id and coalesce(aa.meta->>'device_id','') <> ''
           where (e.event_type = 'auth_success' or "type" = 'auth_success')
-            and (e.created_at at time zone $1) > (now() at time zone $1) - interval '7 days'\`,
+            and (e.created_at at time zone $1) > (now() at time zone $1) - interval '7 days'`,
         [TZ]
       );
       unique7 = r.rows[0]?.c ?? 0;
@@ -102,7 +102,7 @@ router.get('/summary/daily', async (req, res) => {
         const y = d.getFullYear();
         const m = String(d.getMonth() + 1).padStart(2,'0');
         const dd = String(d.getDate()).padStart(2,'0');
-        out.push({ date: \`\${y}-\${m}-\${dd}\`, auth: 0, unique: 0 });
+        out.push({ date: `\${y}-\${m}-\${dd}`, auth: 0, unique: 0 });
       }
       return res.json({ ok: true, days: out });
     }
@@ -110,12 +110,12 @@ router.get('/summary/daily', async (req, res) => {
     // Фильтр "события авторизации"
     const authFilters = [];
     const AUTH_SET = "('auth_success')";
-    if (hasEventType) authFilters.push(\`event_type in \${AUTH_SET}\`);
-    if (hasType)      authFilters.push(\`"type" in \${AUTH_SET}\`);
+    if (hasEventType) authFilters.push(`event_type in \${AUTH_SET}`);
+    if (hasType)      authFilters.push(`"type" in \${AUTH_SET}`);
     const AUTH_WHERE = authFilters.length ? '(' + authFilters.join(' or ') + ')' : 'false';
 
     // Формируем SQL: окно дней, сегодня включительно, сегодня справа.
-    const sql = \`
+    const sql = `
       with bounds as (
         select (date_trunc('day', (now() at time zone $2))::date) as today
       ),
@@ -152,7 +152,7 @@ router.get('/summary/daily', async (req, res) => {
       left join agg_auth a on a.day = d.day
       left join agg_uniq u on u.day = d.day
       order by d.day asc;
-    \`;
+    `;
 
     const { rows } = await db.query(sql, [days, TZ]);
     res.json({ ok: true, days: rows });
@@ -418,7 +418,7 @@ router.get(['/summary/daily', '/daily'], async (req, res) => {
     if (hasType)      parts.push(' "type" in (\'auth_success\') ');
     const authCond = parts.length ? '(' + parts.join(' or ') + ')' : 'false';
 
-    const sql = \`
+    const sql = `
       with days as (
         select generate_series(date_trunc('day', (now() at time zone $2)) - ($1::int - 1) * interval '1 day',
                                date_trunc('day', (now() at time zone $2)),
@@ -446,7 +446,7 @@ router.get(['/summary/daily', '/daily'], async (req, res) => {
         left join auth on auth.d = days.d
         left join uniq on uniq.d = days.d
        order by days.d;
-    \`;
+    `;
 
     const r = await db.query(sql, [days, TZ]);
     const labels = r.rows.map(x => x.day);
