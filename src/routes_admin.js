@@ -201,7 +201,17 @@ router.get('/events', async (req, res) => {
 
     if (type && hasType)            conds.push('\"type\" = ' + add(type));
     if (event_type && hasEventType) conds.push('event_type = ' + add(event_type));
-    if (user_id)                    conds.push('user_id = ' + add(user_id));
+    if (user_id) {
+      // Map secondary user to its primary (merged_into) for event filtering
+      let rootId = parseInt(user_id, 10) || 0;
+      if (rootId) {
+        try {
+          const q = await db.query("select coalesce(nullif(u.meta->>'merged_into','')::int, u.id) as root_id from users u where u.id=$1", [rootId]);
+          if (q.rows && q.rows[0] && q.rows[0].root_id) rootId = q.rows[0].root_id;
+        } catch {}
+      }
+      conds.push('user_id = ' + add(rootId));
+    }
     if (ip && hasIp)                conds.push('ip = ' + add(ip));
     if (ua && hasUa)                conds.push('ua ilike ' + add('%' + ua + '%'));
 
