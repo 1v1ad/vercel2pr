@@ -74,6 +74,17 @@ await client.query(`create table if not exists link_codes (
   used_at timestamp,
   created_at timestamp default now()
 );`);
+await client.query(`create table if not exists admin_topups (
+  id serial primary key,
+  admin_name text,
+  admin_ip text,
+  ua text,
+  user_id integer references users(id) on delete set null,
+  amount integer not null,
+  reason text not null,
+  headers jsonb,
+  created_at timestamp default now()
+);`);
 await client.query(`create table if not exists link_audit (
   id serial primary key,
   primary_id integer,
