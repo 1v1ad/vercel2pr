@@ -278,72 +278,7 @@ router.post('/users/:id/topup', async (req, res) => {
   }
 });
 
-    // 1) Root по merged_into (если есть)
-    await db.query("alter table users add column if not exists meta jsonb default '{}'::jsonb");
-    const rootQ = await db.query("select id, coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id=$1", [id]);
-    if (!rootQ.rows.length) return res.status(404).json({ ok:false, error:'user_not_found' });
-    const rootId = rootQ.rows[0].root_id;
-
-    // 2) Базовый кластер: primary + все secondary, указывающие на него
-    let clusterIds = [];
-    {
-      const q = await db.query("select id from users where id=$1 or (meta->>'merged_into')::int = $1", [rootId]);
-      clusterIds = q.rows.map(r => r.id);
-    }
-
-    // 3) Расширение кластера через device_id в auth_accounts (двухголовая связка без merged_into)
-    try {
-      // device_id всех участников базового кластера
-      const didsQ = await db.query("select distinct meta->>'device_id' as did from auth_accounts where user_id = any($1::int[]) and coalesce(meta->>'device_id','') <> ''", [clusterIds.length? clusterIds : [id]]);
-      const dids = didsQ.rows.map(r => r.did).filter(Boolean);
-      if (dids.length) {
-        const moreQ = await db.query("select distinct user_id from auth_accounts where coalesce(meta->>'device_id','') <> '' and meta->>'device_id' = any($1::text[]) and user_id is not null", [dids]);
-        const moreIds = moreQ.rows.map(r => r.user_id).filter(x => Number.isInteger(x));
-        const set = new Set(clusterIds); moreIds.forEach(x => set.add(x)); if (!set.size) set.add(id);
-        clusterIds = Array.from(set);
-      }
-    } catch {}
-
-    // 4) Читаем текущие балансы всех участников кластера
-    const balQ = await db.query("select id, coalesce(balance,0)::int as balance from users where id = any($1::int[])", [clusterIds]);
-    const currentTotal = balQ.rows.reduce((s,r)=> s + (r.balance||0), 0);
-    const newTotal = currentTotal + amount;
-
-    const client = await db.connect();
-    try {
-      await client.query('BEGIN');
-
-      // Транзакция: лог на rootId
-      try {
-        await client.query(
-          "insert into transactions (user_id, type, amount, meta) values ($1,$2,$3,$4)",
-          [rootId, 'admin_topup', Math.abs(amount), JSON.stringify({ reason: reason || 'manual', requested_user_id:id, cluster_ids: clusterIds })]
-        );
-      } catch {}
-
-      // Событие
-      try {
-        await client.query(
-          "insert into events (user_id, event_type, payload) values ($1,$2,$3)",
-          [rootId, 'admin_topup', { amount, requested_user_id:id, cluster_ids: clusterIds, previous_total: currentTotal, new_total: newTotal }]
-        );
-      } catch {}
-
-      // Выравниваем баланс у всех участников кластера до общего значения
-      await client.query("update users set balance = $2, updated_at = now() where id = any($1::int[])", [clusterIds, newTotal]);
-
-      await client.query('COMMIT');
-    } catch (e) {
-      await client.query('ROLLBACK'); throw e;
-    } finally {
-      client.release();
-    }
-
-    res.json({ ok:true, root_id: rootId, cluster_ids: clusterIds, new_total: newTotal });
-  } catch (e) {
-    res.status(500).json({ ok:false, error:String(e && e.message || e) });
-  }
-});router.post('/users/merge', async (req, res) => {
+router.post('/users/merge', async (req, res) => {
   try {
     const primaryId = parseInt((req.body && req.body.primary_id) || (req.query && req.query.primary_id) || '0', 10);
     const secondaryId = parseInt((req.body && req.body.secondary_id) || (req.query && req.query.secondary_id) || '0', 10);
