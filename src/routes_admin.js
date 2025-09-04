@@ -186,7 +186,7 @@ router.get('/summary/daily', async (req, res) => {
           from events e
           join clusters cl on cl.user_id = e.user_id
           join root_component rc on rc.root_id = cl.root_id
-         where (event_type = 'auth_success' or "type" = 'auth_success')
+         where ${AUTH_WHERE}
          group by 1
       )
       select
