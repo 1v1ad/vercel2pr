@@ -102,7 +102,7 @@ router.get('/summary/daily', async (req, res) => {
         const y = d.getFullYear();
         const m = String(d.getMonth() + 1).padStart(2,'0');
         const dd = String(d.getDate()).padStart(2,'0');
-        out.push({ date: `\${y}-\${m}-\${dd}`, auth: 0, unique: 0 });
+        out.push({ date: `${y}-${m}-${dd}`, auth: 0, unique: 0 });
       }
       return res.json({ ok: true, days: out });
     }
@@ -110,8 +110,8 @@ router.get('/summary/daily', async (req, res) => {
     // Фильтр "события авторизации"
     const authFilters = [];
     const AUTH_SET = "('auth_success')";
-    if (hasEventType) authFilters.push(`event_type in \${AUTH_SET}`);
-    if (hasType)      authFilters.push(`"type" in \${AUTH_SET}`);
+    if (hasEventType) authFilters.push(`event_type in ${AUTH_SET}`);
+    if (hasType)      authFilters.push(`"type" in ${AUTH_SET}`);
     const AUTH_WHERE = authFilters.length ? '(' + authFilters.join(' or ') + ')' : 'false';
 
     // Формируем SQL: окно дней, сегодня включительно, сегодня справа.
@@ -129,7 +129,7 @@ router.get('/summary/daily', async (req, res) => {
           (created_at at time zone $2)::date as day,
           count(*) as auth
         from events
-        where \${AUTH_WHERE}
+        where ${AUTH_WHERE}
           and (created_at at time zone $2) >= ((select today from bounds)::timestamp - ($1::int - 1) * interval '1 day')
         group by 1
       ),
@@ -140,7 +140,7 @@ router.get('/summary/daily', async (req, res) => {
         from events e
         join users u on u.id = e.user_id
         left join auth_accounts aa on aa.user_id = u.id and coalesce(aa.meta->>'device_id','') <> ''
-        where \${AUTH_WHERE}
+        where ${AUTH_WHERE}
           and (e.created_at at time zone $2) >= ((select today from bounds)::timestamp - ($1::int - 1) * interval '1 day')
         group by 1
       )
@@ -427,7 +427,7 @@ router.get(['/summary/daily', '/daily'], async (req, res) => {
       auth as (
         select date_trunc('day', (created_at at time zone $2)) as d, count(*)::int as c
           from events
-         where \${authCond}
+         where ${authCond}
          group by 1
       ),
       uniq as (
