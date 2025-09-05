@@ -129,6 +129,11 @@ router.get('/summary/daily', async (req, res) => {
     if (hasType)      parts.push(`"type" in ${AUTH_SET}`);
     const AUTH_WHERE = parts.length ? '(' + parts.join(' or ') + ')' : 'false';
 
+    // Local-date helpers to avoid TZ drift: for timestamptz convert to TZ then ::date,
+    // for timestamp (no tz) take ::date as-is (treat stored local time as already TZ).
+    const LD  = "CASE WHEN pg_typeof(created_at) = 'timestamp with time zone'::regtype THEN (created_at at time zone $2)::date ELSE created_at::date END";
+    const ELD = "CASE WHEN pg_typeof(e.created_at) = 'timestamp with time zone'::regtype THEN (e.created_at at time zone $2)::date ELSE e.created_at::date END";
+
     const sql = `
       with bounds as (
         select (date_trunc('day', (now() at time zone $2))::date) as today
@@ -139,10 +144,10 @@ router.get('/summary/daily', async (req, res) => {
          order by day asc
       ),
       agg_auth as (
-        select (created_at at time zone $2)::date as day, count(*)::int as auth
+        select ${LD} as day, count(*)::int as auth
           from events
          where ${AUTH_WHERE}
-           and (created_at at time zone $2) >= ((select today from bounds)::timestamp - ($1::int - 1) * interval '1 day')
+           and ${LD} >= (select today from bounds) - ($1::int - 1)
          group by 1
       ),
       agg_uniq as (
@@ -166,13 +171,13 @@ router.get('/summary/daily', async (req, res) => {
             left join device_min_root dmr on dmr.device_id = rd.device_id
            group by c.root_id
         )
-        select (e.created_at at time zone $2)::date as day,
+        select ${ELD} as day,
                count(distinct rc.comp_root)::int as uniq
           from events e
           join clusters cl on cl.user_id = e.user_id
           join root_component rc on rc.root_id = cl.root_id
          where ${AUTH_WHERE}
-           and (e.created_at at time zone $2) >= ((select today from bounds)::timestamp - ($1::int - 1) * interval '1 day')
+           and ${ELD} >= (select today from bounds) - ($1::int - 1)
          group by 1
       )
       select to_char(d.day, 'YYYY-MM-DD') as date,
