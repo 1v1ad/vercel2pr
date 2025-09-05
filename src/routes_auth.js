@@ -1,10 +1,28 @@
-// src/routes_auth.js — robust TG verify + PKCE-only VK by default
+
+// src/routes_auth.js — v6 (build-info + TELEGRAM_BOT_TOKEN + robust TG verify + VK PKCE)
 import { Router } from 'express';
 import crypto from 'crypto';
 import { db, upsertVK, upsertTG } from './db.js';
 import { signSession, readSession, clearSession, COOKIE_NAME, cookieOpts } from './jwt.js';
 
 const router = Router();
+
+// --- Build info endpoint (маячок версии и подключение env, без секретов) ---
+router.get(['/auth/_build','/api/auth/_build'], (req, res) => {
+  res.json({
+    router: 'v6',
+    uses: {
+      TELEGRAM_BOT_TOKEN: !!(process.env.TELEGRAM_BOT_TOKEN),
+      TG_BOT_TOKEN: !!(process.env.TG_BOT_TOKEN),
+      FRONT_ORIGIN: !!(process.env.FRONT_ORIGIN),
+      FRONTEND_URL: !!(process.env.FRONTEND_URL),
+      FRONT_URL: !!(process.env.FRONT_URL),
+      VK_REDIRECT_URI: process.env.VK_REDIRECT_URI || null,
+      BACKEND_BASE: (process.env.BACKEND_BASE || process.env.PUBLIC_BACKEND_URL || null),
+      VK_USE_CLIENT_SECRET: (process.env.VK_USE_CLIENT_SECRET === '1' || process.env.VK_TOKEN_AUTH === 'secret')
+    }
+  });
+});
 
 // --- Env compatibility ---
 const FRONT = process.env.FRONT_ORIGIN || process.env.FRONTEND_URL || process.env.FRONT_URL || '';
@@ -115,12 +133,11 @@ function buildDataCheckString(obj){
   return entries.map(([k,v]) => `${k}=${v}`).join('\n');
 }
 function verifyTelegramAuth(req, botToken){
-  const data = parseRawQuery(req); // используем сырые значения из querystring
+  const data = parseRawQuery(req); // сырые значения из querystring
   const secret = crypto.createHash('sha256').update(botToken).digest();
   const checkHash = data.hash;
   const dataCheck = buildDataCheckString(data);
   const hmac = crypto.createHmac('sha256', secret).update(dataCheck).digest('hex');
-  // Доп. защита: проверим, что auth_date не слишком старый (24 часа)
   const authDate = Number(data.auth_date || '0');
   if (authDate && (Math.floor(Date.now()/1000) - authDate) > 24*3600) return false;
   return hmac === checkHash;
