@@ -1,5 +1,8 @@
 
-// src/routes_auth.js — v8 (dual-attempt VK token exchange + debug + TELEGRAM_BOT_TOKEN + TG verify strict)
+// src/routes_auth.js — v9
+// - Anti-cache headers for auth and /api/me
+// - VK token exchange: id.vk.com (PKCE, with/without secret) -> fallback oauth.vk.com/access_token (legacy)
+// - TELEGRAM_BOT_TOKEN + strict TG verify
 import { Router } from 'express';
 import crypto from 'crypto';
 import { db, upsertVK, upsertTG } from './db.js';
@@ -7,10 +10,18 @@ import { signSession, readSession, clearSession, COOKIE_NAME, cookieOpts } from 
 
 const router = Router();
 
+function noStore(res){
+  res.set('Cache-Control','no-store, no-cache, must-revalidate');
+  res.set('Pragma','no-cache');
+  res.set('Expires','0');
+  res.set('Vary','Cookie');
+}
+
 // --- Build info endpoint (маячок версии и подключение env, без секретов) ---
 router.get(['/auth/_build','/api/auth/_build'], (req, res) => {
+  noStore(res);
   res.json({
-    router: 'v8',
+    router: 'v9',
     uses: {
       TELEGRAM_BOT_TOKEN: !!(process.env.TELEGRAM_BOT_TOKEN),
       TG_BOT_TOKEN: !!(process.env.TG_BOT_TOKEN),
@@ -48,12 +59,17 @@ function pkceCookieOpts(){ return { httpOnly:true, sameSite:'lax', secure:true, 
 
 // --- session/me ---
 router.get(['/api/me','/me'], async (req, res) => {
+  noStore(res);
   const sess = readSession(req);
   if (!sess?.uid) return res.json({ ok:true, user: null });
   const u = await db.get('SELECT * FROM users WHERE id=?', [sess.uid]);
   res.json({ ok:true, user: u || null });
 });
-router.post(['/api/logout','/logout'], (req, res) => { clearSession(res); res.json({ ok:true }); });
+router.post(['/api/logout','/logout'], (req, res) => {
+  noStore(res);
+  clearSession(res);
+  res.json({ ok:true });
+});
 
 // --- VK OAuth (PKCE) ---
 router.get(['/auth/vk/start','/api/auth/vk/start'], (req, res) => {
@@ -75,7 +91,7 @@ router.get(['/auth/vk/start','/api/auth/vk/start'], (req, res) => {
   res.redirect(url.toString());
 });
 
-async function vkTokenExchange({ code, client_id, redirect_uri, code_verifier, withSecret }){
+async function vkTokenExchangeIdHost({ code, client_id, redirect_uri, code_verifier, withSecret }){
   const body = new URLSearchParams({
     grant_type: 'authorization_code', client_id, redirect_uri, code, code_verifier
   });
@@ -88,11 +104,29 @@ async function vkTokenExchange({ code, client_id, redirect_uri, code_verifier, w
   const text = await resp.text();
   let json = null;
   try { json = JSON.parse(text); } catch {}
-  return { ok: resp.ok, status: resp.status, text, json };
+  return { host:'id.vk.com', ok: resp.ok, status: resp.status, text, json };
+}
+
+async function vkTokenExchangeLegacyHost({ code, client_id, redirect_uri, withSecret }){
+  // Legacy OAuth host; PKCE не поддерживает, code_verifier не передаём
+  const body = new URLSearchParams({
+    client_id, redirect_uri, code
+  });
+  if (withSecret && process.env.VK_CLIENT_SECRET) body.set('client_secret', process.env.VK_CLIENT_SECRET);
+  const resp = await fetch('https://oauth.vk.com/access_token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+    body
+  });
+  const text = await resp.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+  return { host:'oauth.vk.com', ok: resp.ok, status: resp.status, text, json };
 }
 
 router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
   try {
+    noStore(res);
     const code = req.query.code?.toString();
     if (!code) return res.status(400).send('missing code');
     const client_id = process.env.VK_CLIENT_ID;
@@ -101,28 +135,25 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
     if (!client_id) return res.status(500).send('VK_CLIENT_ID not set');
     if (!code_verifier) return res.status(400).send('missing pkce verifier');
 
-    // Attempt 1
-    let attempt1 = await vkTokenExchange({ code, client_id, redirect_uri, code_verifier, withSecret: USE_VK_SECRET });
-    // Attempt 2 (toggle secret) if first failed and alternate mode is possible
-    let attempt2 = null;
-    if (!attempt1.ok) {
-      const canToggle = (!!process.env.VK_CLIENT_SECRET) || USE_VK_SECRET;
-      if (canToggle) {
-        attempt2 = await vkTokenExchange({ code, client_id, redirect_uri, code_verifier, withSecret: !USE_VK_SECRET });
-      }
-    }
-    const success = attempt1.ok ? attempt1 : (attempt2 && attempt2.ok ? attempt2 : null);
-    const last = success || attempt2 || attempt1;
+    // 1) New host, chosen mode
+    const a1 = await vkTokenExchangeIdHost({ code, client_id, redirect_uri, code_verifier, withSecret: USE_VK_SECRET });
+    // 2) New host, toggled mode
+    const a2 = a1.ok ? null :
+      await vkTokenExchangeIdHost({ code, client_id, redirect_uri, code_verifier, withSecret: !USE_VK_SECRET });
+    // 3) Legacy host, with secret if есть
+    const a3 = (a1.ok || (a2 && a2.ok)) ? null :
+      await vkTokenExchangeLegacyHost({ code, client_id, redirect_uri, withSecret: true });
+
+    const success = a1.ok ? a1 : (a2 && a2.ok ? a2 : (a3 && a3.ok ? a3 : null));
+    const last = success || a3 || a2 || a1;
 
     if (!success) {
       const info = {
-        mode1_used_secret: USE_VK_SECRET,
-        mode1_status: attempt1.status,
-        mode1_text: attempt1.text?.slice(0, 400),
-        mode2_tried: !!attempt2,
-        mode2_used_secret: attempt2 ? !USE_VK_SECRET : null,
-        mode2_status: attempt2 ? attempt2.status : null,
-        mode2_text: attempt2 ? attempt2.text?.slice(0, 400) : null
+        attempts: [
+          { host: a1.host, used_secret: USE_VK_SECRET, status: a1.status, body: a1.text?.slice(0,400) },
+          a2 ? { host: a2.host, used_secret: !USE_VK_SECRET, status: a2.status, body: a2.text?.slice(0,400) } : null,
+          a3 ? { host: a3.host, used_secret: true, status: a3.status, body: a3.text?.slice(0,400) } : null,
+        ].filter(Boolean)
       };
       return res.status(502).send('vk token error: ' + JSON.stringify(info));
     }
@@ -153,6 +184,7 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
 
 // --- Debug endpoint for VK config ---
 router.get(['/auth/vk/debug','/api/auth/vk/debug'], (req, res) => {
+  noStore(res);
   res.json({
     client_id_present: !!process.env.VK_CLIENT_ID,
     has_secret: !!process.env.VK_CLIENT_SECRET,
@@ -191,6 +223,7 @@ function verifyTelegramAuth(req, botToken){
 
 router.get(['/auth/tg/callback','/api/auth/tg/callback'], async (req, res) => {
   try {
+    noStore(res);
     const botToken = TG_TOKEN;
     if (!botToken) return res.status(500).send('TELEGRAM_BOT_TOKEN not set');
     if (!verifyTelegramAuth(req, botToken)) return res.status(401).send('tg verify fail');
