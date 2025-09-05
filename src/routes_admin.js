@@ -5,6 +5,22 @@ import { mergeSuggestions } from './merge.js';
 
 const router = Router();
 
+// --- Cluster ID migration (idempotent) ---
+async function ensureClusterId() {
+  try {
+    await db.query("alter table users add column if not exists cluster_id int");
+    await db.query("update users set cluster_id = id where cluster_id is null");
+    try {
+      await db.query("update users u set cluster_id = (u.meta->>'merged_into')::int where (u.meta->>'merged_into') ~ '^[0-9]+' and u.cluster_id = u.id");
+    } catch {}
+    try {
+      await db.query("update users u set cluster_id = p.cluster_id from users p where u.cluster_id = p.id and p.cluster_id is not null and u.cluster_id is distinct from p.cluster_id");
+    } catch {}
+    await db.query("create index if not exists users_cluster_id_idx on users(cluster_id)");
+  } catch (e) { /* noop */ }
+}
+
+
 function firstIp(req){
   const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
   return ipHeader.split(',')[0].trim();
@@ -20,82 +36,40 @@ function adminAuth(req, res, next) {
 }
 router.use(adminAuth);
 
-router.get('/health', (_req, res) => res.json({ ok:true }));
+router.get('/health', (_req, res) => res.json({
+    await ensureClusterId();
+ ok:true }));
 
-router.get('/summary', async (req, res) => {
+router.get('/summary', async (_req, res) => {
+    await ensureClusterId();
+
   try {
-    const TZ = process.env.ADMIN_TZ || 'Europe/Moscow';
-
     const u = await db.query('select count(*)::int as c from users');
     let users = u.rows[0]?.c ?? 0;
 
     const hasT = await db.query("select to_regclass('public.events') as r");
     if (!hasT.rows[0].r) return res.json({ ok:true, users, events:0, auth7:0, unique7:0 });
 
-    
-    // Определяем доступные колонки и строим фильтр для auth_success
     const cols = await db.query("select column_name from information_schema.columns where table_schema='public' and table_name='events'");
     const set = new Set(cols.rows.map(r => r.column_name));
     const hasType = set.has('type');
     const hasEventType = set.has('event_type');
-    const parts = [];
-    const AUTH_SET = "('auth_success')";
-    if (hasEventType) parts.push(`event_type in ${AUTH_SET}`);
-    if (hasType)      parts.push(`"type" in ${AUTH_SET}`);
-    const AUTH_WHERE = parts.length ? '(' + parts.join(' or ') + ')' : 'false';
 
     const e = await db.query('select count(*)::int as c from events');
     const events = e.rows[0]?.c ?? 0;
 
-    // auth7: только auth_success за 7*24 часа
     let auth7 = 0;
-    try {
+    if (hasType || hasEventType) {
       const parts = [];
-      const AUTH_SET = "('auth_success')";
-      if (hasEventType) parts.push(`event_type in ${AUTH_SET}`);
-      if (hasType)      parts.push(`\"type\" in ${AUTH_SET}`);
-      const where = parts.length ? '(' + parts.join(' or ') + ')' : 'false';
-      const r = await db.query(
-        `select count(*)::int as c from events where ${AUTH_WHERE} and (created_at at time zone $1) > (now() at time zone $1) - interval '7 days'`,
-        [TZ]
-      );
+      if (hasEventType) parts.push("event_type in ('auth','login','auth_start','auth_callback')");
+      if (hasType)      parts.push('\"type\" in (\'auth\',\'login\',\'auth_start\',\'auth_callback\')');
+      const sql = 'select count(*)::int as c from events where (' + parts.join(' or ') + ") and created_at > now() - interval '7 days'";
+      const r = await db.query(sql);
       auth7 = r.rows[0]?.c ?? 0;
-    } catch {}
+    }
 
-    // unique7: кластерная уникальность (device_id, иначе root_id) среди auth_success за 7*24 часа
-    let unique7 = 0;
-    try {
-      const r = await db.query(
-        `with clusters as (
-           select u.id as user_id, coalesce(nullif(u.meta->>'merged_into','')::int, u.id) as root_id
-         from users u
-       ),
-       root_devices as (
-         select distinct c.root_id, nullif(aa.meta->>'device_id','') as device_id
-           from clusters c
-           left join auth_accounts aa on aa.user_id = c.user_id
-          where coalesce(aa.meta->>'device_id','') <> ''
-       ),
-       device_min_root as (
-         select device_id, min(root_id) as min_root from root_devices group by device_id
-       ),
-       root_component as (
-         select c.root_id, coalesce(min(dmr.min_root), c.root_id) as comp_root
-           from (select distinct root_id from clusters) c
-           left join root_devices rd on rd.root_id = c.root_id
-           left join device_min_root dmr on dmr.device_id = rd.device_id
-          group by c.root_id
-       )
-       select count(distinct rc.comp_root)::int as c
-         from events e
-         join clusters cl on cl.user_id = e.user_id
-         join root_component rc on rc.root_id = cl.root_id
-        where ${AUTH_WHERE}
-          and (e.created_at at time zone $1) > (now() at time zone $1) - interval '7 days'`,
-        [TZ]
-      );
-      unique7 = r.rows[0]?.c ?? 0;
-    } catch {}
+    const uq = await db.query("select count(distinct user_id)::int as c from events where created_at > now() - interval '7 days'");
+    const unique7 = uq.rows[0]?.c ?? 0;
 
     res.json({ ok:true, users, events, auth7, unique7 });
   } catch (e) {
@@ -105,94 +79,89 @@ router.get('/summary', async (req, res) => {
 
 // Ежедневная сводка для графика: /api/admin/summary/daily?days=7
 router.get('/summary/daily', async (req, res) => {
+    await ensureClusterId();
+
   try {
     const days = Math.max(1, Math.min(31, parseInt(req.query.days || '7', 10) || 7));
     const TZ = process.env.ADMIN_TZ || 'Europe/Moscow';
 
-    // Определяем наличие колонок, чтобы корректно построить фильтр авторизаций
+    // Узнаем, какие колонки есть в events
     const cols = await db.query(
       "select column_name from information_schema.columns where table_schema='public' and table_name='events'"
     );
-    const set = new Set(cols.rows.map(r => r.column_name));
-    const hasType = set.has('type');
-    const hasEventType = set.has('event_type');
-    const hasCreatedAt = set.has('created_at');
-    const hasUserId = set.has('user_id');
+    const have = new Set(cols.rows.map(r => r.column_name));
+    const hasType = have.has('type');
+    const hasEventType = have.has('event_type');
+    const hasCreatedAt = have.has('created_at');
+    const hasUserId = have.has('user_id');
 
     if (!hasCreatedAt || !hasUserId) {
-      return res.json({ ok:true, days: [] });
+      // Без ключевых полей сводку не посчитаем — вернём окно из нулей
+      const today = new Date();
+      today.setHours(0,0,0,0);
+      const out = [];
+      for (let i = days - 1; i >= 0; i--) {
+        const d = new Date(today); d.setDate(today.getDate() - i);
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2,'0');
+        const dd = String(d.getDate()).padStart(2,'0');
+        out.push({ date: `${y}-${m}-${dd}`, auth: 0, unique: 0 });
+      }
+      return res.json({ ok: true, days: out });
     }
 
-    const AUTH_SET = "('auth_success')";
-    const parts = [];
-    if (hasEventType) parts.push(`event_type in ${AUTH_SET}`);
-    if (hasType)      parts.push(`"type" in ${AUTH_SET}`);
-    const AUTH_WHERE = parts.length ? '(' + parts.join(' or ') + ')' : 'false';
+    // Фильтр "события авторизации"
+    const authFilters = [];
+    // те же типы, что ты считаешь в summary
+    const AUTH_SET = `('auth_success')`;
+    if (hasEventType) authFilters.push(`event_type in ${AUTH_SET}`);
+    if (hasType)      authFilters.push(`"type" in ${AUTH_SET}`);
+    // если нет ни одной типовой колонки — просто считаем 0 авторизаций
+    const AUTH_WHERE = authFilters.length ? '(' + authFilters.join(' or ') + ')' : 'false';
 
-    // Local-date helpers to avoid TZ drift: for timestamptz convert to TZ then ::date,
-    // for timestamp (no tz) take ::date as-is (treat stored local time as already TZ).
-    const LD  = "CASE WHEN pg_typeof(created_at) = 'timestamp with time zone'::regtype THEN (created_at at time zone $2)::date ELSE created_at::date END";
-    const ELD = "CASE WHEN pg_typeof(e.created_at) = 'timestamp with time zone'::regtype THEN (e.created_at at time zone $2)::date ELSE e.created_at::date END";
-
+    // Формируем SQL: окно дней, сегодня включительно, сегодня справа.
     const sql = `
       with bounds as (
         select (date_trunc('day', (now() at time zone $2))::date) as today
       ),
       days as (
+        -- генерируем последовательность старейший..сегодня
         select (select today from bounds) - s as day
-          from generate_series($1::int - 1, 0, -1) s
-         order by day asc
+        from generate_series($1::int - 1, 0, -1) s
+        order by day asc
       ),
       agg_auth as (
-        select ${LD} as day, count(*)::int as auth
-          from events
-         where ${AUTH_WHERE}
-           and ${LD} >= (select today from bounds) - ($1::int - 1)
-         group by 1
+        select
+          (created_at at time zone $2)::date as day,
+          count(*) as auth
+        from events
+        where ${AUTH_WHERE}
+          and created_at >= ((select today from bounds)::timestamp - ($1::int - 1) * interval '1 day')
+        group by 1
       ),
       agg_uniq as (
-        with clusters as (
-          select u.id as user_id, coalesce(nullif(u.meta->>'merged_into','')::int, u.id) as root_id
-            from users u
-        ),
-        root_devices as (
-          select distinct c.root_id, nullif(aa.meta->>'device_id','') as device_id
-            from clusters c
-            left join auth_accounts aa on aa.user_id = c.user_id
-           where coalesce(aa.meta->>'device_id','') <> ''
-        ),
-        device_min_root as (
-          select device_id, min(root_id) as min_root from root_devices group by device_id
-        ),
-        root_component as (
-          select c.root_id, coalesce(min(dmr.min_root), c.root_id) as comp_root
-            from (select distinct root_id from clusters) c
-            left join root_devices rd on rd.root_id = c.root_id
-            left join device_min_root dmr on dmr.device_id = rd.device_id
-           group by c.root_id
-        )
-        select ${ELD} as day,
-               count(distinct rc.comp_root)::int as uniq
-          from events e
-          join clusters cl on cl.user_id = e.user_id
-          join root_component rc on rc.root_id = cl.root_id
-         where ${AUTH_WHERE}
-           and ${ELD} >= (select today from bounds) - ($1::int - 1)
-         group by 1
+        select
+          (created_at at time zone $2)::date as day,
+          count(distinct user_id) as uniq
+        from events
+        where created_at >= ((select today from bounds)::timestamp - ($1::int - 1) * interval '1 day')
+        group by 1
       )
-      select to_char(d.day, 'YYYY-MM-DD') as date,
-             coalesce(a.auth, 0) as auth,
-             coalesce(u.uniq, 0)  as "unique"
-        from days d
-        left join agg_auth a on a.day = d.day
-        left join agg_uniq u on u.day = d.day
-       order by d.day asc;
+      select
+        to_char(d.day, 'YYYY-MM-DD') as date,
+        coalesce(a.auth, 0) as auth,
+        coalesce(u.uniq, 0) as "unique"
+      from days d
+      left join agg_auth a on a.day = d.day
+      left join agg_uniq u on u.day = d.day
+      order by d.day asc;
     `;
 
     const { rows } = await db.query(sql, [days, TZ]);
-    res.json({ ok:true, days: rows });
+    res.json({ ok: true, days: rows });
   } catch (e) {
-    res.status(500).json({ ok:false, error:String(e && e.message || e) });
+    console.error('summary/daily error:', e);
+    res.status(500).json({ ok:false, error: String(e && e.message || e) });
   }
 });
 
@@ -387,6 +356,11 @@ router.post('/users/merge', async (req, res) => {
     const client = await db.connect();
     try {
       await client.query('BEGIN');
+// --- cluster_id alignment for merged users ---
+const rootIdRow = await client.query("select coalesce(cluster_id, id) as r from users where id=$1", [primaryId]);
+const rootId = (rootIdRow.rows[0] && rootIdRow.rows[0].r) || primaryId;
+await client.query("update users set cluster_id=$1 where cluster_id = any($2::int[])", [rootId, [primaryId, secondaryId]]);
+
       await client.query('update auth_accounts set user_id=$1 where user_id=$2', [primaryId, secondaryId]);
       try { await client.query('update transactions set user_id=$1 where user_id=$2', [primaryId, secondaryId]); } catch {}
       try { await client.query('update events set user_id=$1 where user_id=$2', [primaryId, secondaryId]); } catch {}
@@ -420,17 +394,18 @@ router.get('/users/merge/suggestions', async (_req, res) => {
 router.get(['/summary/daily', '/daily'], async (req, res) => {
   try {
     const days = Math.max(1, Math.min(31, parseInt(req.query.days || '7', 10) || 7));
-    const TZ = process.env.ADMIN_TZ || 'Europe/Moscow';
 
+    // Таблица events может не существовать – быстро выходим нулями
     const hasT = await db.query("select to_regclass('public.events') as r");
     if (!hasT.rows[0].r) {
       const labels = Array.from({ length: days }, (_, i) => {
         const d = new Date(); d.setDate(d.getDate() - (days - 1 - i));
-        return d.toISOString().slice(0,10);
+        return d.toISOString().slice(0,10); // YYYY-MM-DD
       });
       return res.json({ ok:true, labels, auth:Array(days).fill(0), unique:Array(days).fill(0) });
     }
 
+    // Определяем, какие поля в events есть
     const cols = await db.query(
       "select column_name from information_schema.columns where table_schema='public' and table_name='events'"
     );
@@ -448,29 +423,26 @@ router.get(['/summary/daily', '/daily'], async (req, res) => {
     }
 
     const parts = [];
-    if (hasEventType) parts.push("event_type in ('auth_success')");
-    if (hasType)      parts.push(' "type" in (\'auth_success\') ');
-    const authCond = parts.length ? '(' + parts.join(' or ') + ')' : 'false';
+    if (hasEventType) parts.push("event_type in ('auth','login','auth_start','auth_callback')");
+    if (hasType)      parts.push(' "type" in (\'auth\',\'login\',\'auth_start\',\'auth_callback\') ');
+    const authCond = parts.length ? '(' + parts.join(' or ') + ')' : 'true';
 
+    // Собираем последнюю неделю с нулями через generate_series
     const sql = `
       with days as (
-        select generate_series(date_trunc('day', (now() at time zone $2)) - ($1::int - 1) * interval '1 day',
-                               date_trunc('day', (now() at time zone $2)),
+        select generate_series(date_trunc('day', now()) - ($1::int - 1) * interval '1 day',
+                               date_trunc('day', now()),
                                interval '1 day') as d
       ),
       auth as (
-        select date_trunc('day', (created_at at time zone $2)) as d, count(*)::int as c
+        select date_trunc('day', created_at) as d, count(*)::int as c
           from events
          where ${authCond}
          group by 1
       ),
       uniq as (
-        select date_trunc('day', (e.created_at at time zone $2)) as d,
-               count(distinct coalesce(aa.meta->>'device_id', 'root:'||coalesce(nullif(u.meta->>'merged_into','')::int, u.id)::text))::int as c
-          from events e
-          join users u on u.id = e.user_id
-          left join auth_accounts aa on aa.user_id = u.id and coalesce(aa.meta->>'device_id','') <> ''
-         where ${authCond}
+        select date_trunc('day', created_at) as d, count(distinct user_id)::int as c
+          from events
          group by 1
       )
       select to_char(days.d, 'YYYY-MM-DD') as day,
@@ -482,7 +454,7 @@ router.get(['/summary/daily', '/daily'], async (req, res) => {
        order by days.d;
     `;
 
-    const r = await db.query(sql, [days, TZ]);
+    const r = await db.query(sql, [days]);
     const labels = r.rows.map(x => x.day);
     const auth   = r.rows.map(x => x.auth);
     const unique = r.rows.map(x => x.uniq);
