@@ -1,5 +1,5 @@
 
-// src/routes_auth.js — v6 (build-info + TELEGRAM_BOT_TOKEN + robust TG verify + VK PKCE)
+// src/routes_auth.js — v7 (TG data_check_string filtered + TELEGRAM_BOT_TOKEN + VK PKCE)
 import { Router } from 'express';
 import crypto from 'crypto';
 import { db, upsertVK, upsertTG } from './db.js';
@@ -10,7 +10,7 @@ const router = Router();
 // --- Build info endpoint (маячок версии и подключение env, без секретов) ---
 router.get(['/auth/_build','/api/auth/_build'], (req, res) => {
   res.json({
-    router: 'v6',
+    router: 'v7',
     uses: {
       TELEGRAM_BOT_TOKEN: !!(process.env.TELEGRAM_BOT_TOKEN),
       TG_BOT_TOKEN: !!(process.env.TG_BOT_TOKEN),
@@ -128,15 +128,18 @@ function parseRawQuery(req){
   for (const [k,v] of usp.entries()){ obj[k] = v; }
   return obj;
 }
-function buildDataCheckString(obj){
-  const entries = Object.entries(obj).filter(([k]) => k !== 'hash').sort(([a],[b]) => a.localeCompare(b));
+const TG_ALLOWED_KEYS = new Set(['id','first_name','last_name','username','photo_url','auth_date','hash']);
+function buildDataCheckStringFiltered(obj){
+  const entries = Object.entries(obj)
+    .filter(([k]) => k !== 'hash' && TG_ALLOWED_KEYS.has(k))
+    .sort(([a],[b]) => a.localeCompare(b));
   return entries.map(([k,v]) => `${k}=${v}`).join('\n');
 }
 function verifyTelegramAuth(req, botToken){
   const data = parseRawQuery(req); // сырые значения из querystring
   const secret = crypto.createHash('sha256').update(botToken).digest();
   const checkHash = data.hash;
-  const dataCheck = buildDataCheckString(data);
+  const dataCheck = buildDataCheckStringFiltered(data);
   const hmac = crypto.createHmac('sha256', secret).update(dataCheck).digest('hex');
   const authDate = Number(data.auth_date || '0');
   if (authDate && (Math.floor(Date.now()/1000) - authDate) > 24*3600) return false;
