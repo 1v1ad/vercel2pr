@@ -1,8 +1,6 @@
 
-// src/routes_auth.js — v11
-// VK: handle id_token (JWT) to extract user id/profile + users.get via access_token query
-// TG: TELEGRAM_BOT_TOKEN + strict verify
-// Anti-cache headers on auth + /api/me
+// src/routes_auth.js — v12
+// Fixes: CORS on /api/me & auth routes, /health endpoint, verbose VK id resolution
 import { Router } from 'express';
 import crypto from 'crypto';
 import { db, upsertVK, upsertTG } from './db.js';
@@ -10,18 +8,53 @@ import { signSession, readSession, clearSession, COOKIE_NAME, cookieOpts } from 
 
 const router = Router();
 
+// --- Env compatibility ---
+const FRONT = process.env.FRONT_ORIGIN || process.env.FRONTEND_URL || process.env.FRONT_URL || '';
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN || '';
+const BACKEND_BASE =
+  process.env.BACKEND_BASE ||
+  process.env.PUBLIC_BACKEND_URL ||
+  (process.env.VK_REDIRECT_URI ? new URL(process.env.VK_REDIRECT_URI).origin : '');
+
+// --- Helpers ---
 function noStore(res){
   res.set('Cache-Control','no-store, no-cache, must-revalidate');
   res.set('Pragma','no-cache');
   res.set('Expires','0');
-  res.set('Vary','Cookie');
+  res.set('Vary','Cookie, Origin');
 }
+function allowCORS(req, res){
+  const origin = req.headers.origin || '';
+  const allowed = FRONT || origin || '*';
+  res.set('Access-Control-Allow-Origin', allowed);
+  res.set('Access-Control-Allow-Credentials', 'true');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+}
+function redirectAfterLogin(res){
+  const to = process.env.AFTER_LOGIN_URL || (FRONT ? FRONT + '/lobby.html' : '/health');
+  res.redirect(to);
+}
+function base64url(buf){
+  return Buffer.from(buf).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function genCodeVerifier(){ return base64url(crypto.randomBytes(64)); }
+function codeChallengeFrom(verifier){ return base64url(crypto.createHash('sha256').update(verifier).digest()); }
+function cookieOptsPkce(){ return { httpOnly:true, sameSite:'lax', secure:true, path:'/', maxAge: 10 * 60 * 1000 }; }
 
-// --- Build info endpoint (маячок версии и подключение env, без секретов) ---
+// --- Health (both /health and /api/health) ---
+function healthHandler(req,res){
+  allowCORS(req,res); noStore(res);
+  res.json({ ok:true, ts: Date.now() });
+}
+router.all('/health', healthHandler);
+router.all('/api/health', healthHandler);
+
+// --- Build info endpoint ---
 router.get(['/auth/_build','/api/auth/_build'], (req, res) => {
-  noStore(res);
+  allowCORS(req,res); noStore(res);
   res.json({
-    router: 'v11',
+    router: 'v12',
     uses: {
       TELEGRAM_BOT_TOKEN: !!(process.env.TELEGRAM_BOT_TOKEN),
       TG_BOT_TOKEN: !!(process.env.TG_BOT_TOKEN),
@@ -36,45 +69,16 @@ router.get(['/auth/_build','/api/auth/_build'], (req, res) => {
   });
 });
 
-// --- Env compatibility ---
-const FRONT = process.env.FRONT_ORIGIN || process.env.FRONTEND_URL || process.env.FRONT_URL || '';
-const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN || '';
-
-const BACKEND_BASE =
-  process.env.BACKEND_BASE ||
-  process.env.PUBLIC_BACKEND_URL ||
-  (process.env.VK_REDIRECT_URI ? new URL(process.env.VK_REDIRECT_URI).origin : '');
-
-// --- helpers ---
-function redirectAfterLogin(res){
-  const to = process.env.AFTER_LOGIN_URL || (FRONT ? FRONT + '/lobby.html' : '/health');
-  res.redirect(to);
-}
-function base64url(buf){
-  return Buffer.from(buf).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-}
-function genCodeVerifier(){ return base64url(crypto.randomBytes(64)); }
-function codeChallengeFrom(verifier){ return base64url(crypto.createHash('sha256').update(verifier).digest()); }
-function cookieOptsPkce(){ return { httpOnly:true, sameSite:'lax', secure:true, path:'/', maxAge: 10 * 60 * 1000 }; }
-
-function b64urlDecodeToJSON(b64url){
-  try {
-    const b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
-    const pad = b64.length % 4 === 2 ? '==' : (b64.length % 4 === 3 ? '=' : '');
-    const json = Buffer.from(b64 + pad, 'base64').toString('utf8');
-    return JSON.parse(json);
-  } catch { return null; }
-}
-
 // --- session/me ---
+router.options(['/api/me','/me'], (req,res)=>{ allowCORS(req,res); res.sendStatus(204); });
 router.get(['/api/me','/me'], async (req, res) => {
-  noStore(res);
+  allowCORS(req,res); noStore(res);
   const sess = readSession(req);
   if (!sess?.uid) return res.json({ ok:true, user: null });
   const u = await db.get('SELECT * FROM users WHERE id=?', [sess.uid]);
   res.json({ ok:true, user: u || null });
 });
-router.post(['/api/logout','/logout'], (req, res) => { noStore(res); clearSession(res); res.json({ ok:true }); });
+router.post(['/api/logout','/logout'], (req, res) => { allowCORS(req,res); noStore(res); clearSession(res); res.json({ ok:true }); });
 
 // --- VK OAuth (state + PKCE) ---
 router.get(['/auth/vk/start','/api/auth/vk/start'], (req, res) => {
@@ -97,14 +101,15 @@ router.get(['/auth/vk/start','/api/auth/vk/start'], (req, res) => {
   res.redirect(url.toString());
 });
 
-async function vkAuthTokenViaIdHost({ code, client_id, client_secret, redirect_uri, code_verifier }){
+async function vkAuthTokenViaIdHost({ code, client_id, client_secret, redirect_uri, code_verifier, device_id }){
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
     code,
     client_id,
     client_secret: client_secret || '',
     redirect_uri,
-    code_verifier
+    code_verifier,
+    device_id: device_id || ''
   });
   const resp = await fetch('https://id.vk.com/oauth2/auth', {
     method: 'POST',
@@ -115,14 +120,14 @@ async function vkAuthTokenViaIdHost({ code, client_id, client_secret, redirect_u
   let json = null; try { json = JSON.parse(text); } catch {}
   return { host:'id.vk.com', ok: resp.ok, status: resp.status, text, json };
 }
-
-async function vkAuthTokenViaLegacy({ code, client_id, client_secret, redirect_uri, code_verifier }){
+async function vkAuthTokenViaLegacy({ code, client_id, client_secret, redirect_uri, code_verifier, device_id }){
   const params = new URLSearchParams({
     client_id,
     client_secret: client_secret || '',
     redirect_uri,
     code,
-    code_verifier
+    code_verifier,
+    device_id: device_id || ''
   });
   const resp = await fetch('https://oauth.vk.com/access_token?' + params.toString(), {
     method: 'GET',
@@ -135,8 +140,8 @@ async function vkAuthTokenViaLegacy({ code, client_id, client_secret, redirect_u
 
 router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
   try {
-    noStore(res);
-    const { code, state } = req.query;
+    allowCORS(req,res); noStore(res);
+    const { code, state, device_id } = req.query;
     const savedState = req.cookies?.vk_state;
     const code_verifier = req.cookies?.vk_code_verifier;
     if (!code || !state || !savedState || savedState !== state || !code_verifier) {
@@ -149,11 +154,8 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
     const client_secret = process.env.VK_CLIENT_SECRET || '';
     const redirect_uri = process.env.VK_REDIRECT_URI || (BACKEND_BASE + '/api/auth/vk/callback');
 
-    // 1) id.vk.com/oauth2/auth
-    const a1 = await vkAuthTokenViaIdHost({ code, client_id, client_secret, redirect_uri, code_verifier });
-    // 2) legacy fallback
-    const a2 = a1.ok ? null : await vkAuthTokenViaLegacy({ code, client_id, client_secret, redirect_uri, code_verifier });
-
+    const a1 = await vkAuthTokenViaIdHost({ code, client_id, client_secret, redirect_uri, code_verifier, device_id });
+    const a2 = a1.ok ? null : await vkAuthTokenViaLegacy({ code, client_id, client_secret, redirect_uri, code_verifier, device_id });
     const success = a1.ok ? a1 : (a2 && a2.ok ? a2 : null);
     if (!success) {
       return res.status(502).send('vk token error: ' + JSON.stringify({
@@ -165,51 +167,45 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
     }
     const token = success.json || {};
 
-    // --- Try to resolve profile
+    // Resolve VK ID from several places
     let avatar = '', firstName = '', lastName = '';
     let vk_id = token.user_id?.toString() || (token.user && (token.user.id || token.user.user_id) ? String(token.user.id || token.user.user_id) : '');
 
-    // New VK ID flow often returns id_token (JWT) with sub/claims
+    // Try id_token (JWT)
     if (!vk_id && token.id_token && typeof token.id_token === 'string') {
       const parts = token.id_token.split('.');
       if (parts.length >= 2) {
-        const payload = parts[1];
-        const claims = (() => {
-          try {
-            const b64 = payload.replace(/-/g,'+').replace(/_/g,'/');
-            const pad = b64.length % 4 === 2 ? '==' : (b64.length % 4 === 3 ? '=' : '');
-            const json = Buffer.from(b64 + pad, 'base64').toString('utf8');
-            return JSON.parse(json);
-          } catch { return null; }
-        })();
-        if (claims) {
-          vk_id = String(claims.sub || claims.user_id || claims.uid || '');
-          firstName = firstName || claims.given_name || claims.first_name || '';
-          lastName  = lastName  || claims.family_name || claims.last_name || '';
-          avatar    = avatar    || claims.picture || claims.photo || '';
-        }
+        try {
+          const payload = parts[1].replace(/-/g,'+').replace(/_/g,'/');
+          const pad = payload.length % 4 === 2 ? '==' : (payload.length % 4 === 3 ? '=' : '');
+          const json = JSON.parse(Buffer.from(payload + pad, 'base64').toString('utf8'));
+          vk_id = String(json.sub || json.user_id || json.uid || '');
+          firstName = firstName || json.given_name || json.first_name || '';
+          lastName  = lastName  || json.family_name || json.last_name || '';
+          avatar    = avatar    || json.picture || json.photo || '';
+        } catch {}
       }
     }
 
-    // Best-effort users.get to refine names/avatar if access_token works for API
+    // Try users.get via access_token
     try {
-      if (token.access_token) {
+      if (!vk_id && token.access_token) {
         const apiV = process.env.VK_API_VERSION || '5.199';
         const infoResp = await fetch(`https://api.vk.com/method/users.get?v=${apiV}&fields=photo_200&access_token=${encodeURIComponent(token.access_token)}`);
         const info = await infoResp.json();
         if (info?.response?.[0]) {
           const p = info.response[0];
+          if (p.id) vk_id = String(p.id);
           firstName = p.first_name || firstName || '';
           lastName = p.last_name || lastName || '';
           avatar = p.photo_200 || avatar || '';
-          if (!vk_id && p.id) vk_id = String(p.id);
         }
       }
     } catch {}
 
     if (!vk_id) {
-      // help debug without leaking secrets: show token keys only
       const keys = Object.keys(token || {});
+      const flags = { has_access_token: !!token.access_token, has_id_token: !!token.id_token };
       return res.status(502).send('vk: cannot resolve user id');
     }
 
@@ -225,7 +221,7 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
 
 // --- Debug endpoint for VK config ---
 router.get(['/auth/vk/debug','/api/auth/vk/debug'], (req, res) => {
-  noStore(res);
+  allowCORS(req,res); noStore(res);
   res.json({
     client_id_present: !!process.env.VK_CLIENT_ID,
     has_secret: !!process.env.VK_CLIENT_SECRET,
@@ -252,7 +248,7 @@ function buildDataCheckStringFiltered(obj){
   return entries.map(([k,v]) => `${k}=${v}`).join('\n');
 }
 function verifyTelegramAuth(req, botToken){
-  const data = parseRawQuery(req); // сырые значения из querystring
+  const data = parseRawQuery(req);
   const secret = crypto.createHash('sha256').update(botToken).digest();
   const checkHash = data.hash;
   const dataCheck = buildDataCheckStringFiltered(data);
@@ -264,7 +260,7 @@ function verifyTelegramAuth(req, botToken){
 
 router.get(['/auth/tg/callback','/api/auth/tg/callback'], async (req, res) => {
   try {
-    noStore(res);
+    allowCORS(req,res); noStore(res);
     const botToken = TG_TOKEN;
     if (!botToken) return res.status(500).send('TELEGRAM_BOT_TOKEN not set');
     if (!verifyTelegramAuth(req, botToken)) return res.status(401).send('tg verify fail');
