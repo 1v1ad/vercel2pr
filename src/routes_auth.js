@@ -9,13 +9,13 @@ const router = Router();
 const FRONT_ORIGIN = process.env.FRONT_ORIGIN || '';
 const BACKEND_BASE = process.env.BACKEND_BASE || process.env.PUBLIC_BACKEND_URL || '';
 
-// ---------- Helpers ----------
+// --- helpers ---
 function redirectAfterLogin(res){
   const to = process.env.AFTER_LOGIN_URL || (FRONT_ORIGIN ? FRONT_ORIGIN + '/lobby.html' : '/health');
   res.redirect(to);
 }
 
-// ---------- Session ----------
+// --- session/me ---
 router.get(['/api/me','/me'], async (req, res) => {
   const sess = readSession(req);
   if (!sess?.uid) return res.json({ ok:true, user: null });
@@ -28,8 +28,7 @@ router.post(['/api/logout','/logout'], (req, res) => {
   res.json({ ok:true });
 });
 
-// ---------- VK OAuth (code flow) ----------
-// Старт: редиректим на id.vk.com/authorize
+// --- VK OAuth ---
 router.get(['/auth/vk/start','/api/auth/vk/start'], (req, res) => {
   const client_id = process.env.VK_CLIENT_ID;
   if (!client_id) return res.status(500).send('VK_CLIENT_ID is not set');
@@ -44,7 +43,6 @@ router.get(['/auth/vk/start','/api/auth/vk/start'], (req, res) => {
   res.redirect(url.toString());
 });
 
-// Callback: меняем code на токен и достаём профиль
 router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
   try {
     const code = req.query.code?.toString();
@@ -54,7 +52,6 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
     const redirect_uri = process.env.VK_REDIRECT_URI || (BACKEND_BASE + '/api/auth/vk/callback');
     if (!client_id || !client_secret) return res.status(500).send('VK creds not set');
 
-    // VK ID token exchange
     const tokenResp = await fetch('https://id.vk.com/oauth2/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -72,7 +69,6 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
     }
     const token = await tokenResp.json();
 
-    // Профиль через старый VK API (при наличии access_token)
     let avatar = '', firstName = '', lastName = '';
     try {
       const apiV = process.env.VK_API_VERSION || '5.199';
@@ -100,7 +96,7 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
   }
 });
 
-// ---------- Telegram Login Widget ----------
+// --- Telegram widget ---
 function verifyTelegramAuth(data, botToken){
   const secret = crypto.createHash('sha256').update(botToken).digest();
   const checkHash = data.hash;
