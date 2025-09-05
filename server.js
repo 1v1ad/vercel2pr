@@ -7,20 +7,19 @@ import authRouter from './src/routes_auth.js';
 import { ensureClusterId } from './src/merge.js';
 
 const app = express();
+app.set('trust proxy', 1);
 
-// CORS: доверяем фронту (динамически), куки/заголовки пропускаем
+// CORS
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
 
-// --- Health endpoints, чтобы фронт не ругался ---
-app.get(['/health','/healthz','/health1'], (req,res)=> res.json({ ok:true, ts:Date.now() }));
+// Health
+app.get(['/','/health','/healthz','/health1'], (req, res) => res.json({ ok:true, ts: Date.now() }));
 
-// --- Роуты ---
-// Совместимость: некоторые сборки объявляют пути как '/auth/*', другие — как '/api/auth/*'.
-// Чтобы не ловить 404, монтируем и так, и так.
-app.use('/api', authRouter); // если внутри роутера пути '/auth/*' → тут получится '/api/auth/*'
-app.use(authRouter);         // если внутри роутера пути уже '/api/auth/*' → совпадёт тут
+// Routers (compat mount)
+app.use('/api', authRouter);
+app.use(authRouter);
 
 app.use('/admin', adminRouter);
 
@@ -30,8 +29,4 @@ async function bootstrap(){
   await ensureClusterId();
   app.listen(PORT, () => console.log('[BOOT] listening on', PORT));
 }
-
-bootstrap().catch(err => {
-  console.error('[BOOT] fatal:', err);
-  process.exit(1);
-});
+bootstrap().catch(e => { console.error('[BOOT] fatal', e); process.exit(1); });

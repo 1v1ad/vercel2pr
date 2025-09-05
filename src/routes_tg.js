@@ -1,21 +1,14 @@
 // src/routes_tg.js — complete TG callback with device session + auto-merge
 import { Router } from 'express';
-import { db, getUserById, logEvent } from './db.js';
+import { db, getUserById } from './db.js';
 import { signSession } from './jwt.js';
 import { autoMergeByDevice } from './merge.js';
 
 const router = Router();
 
-function firstIp(req) {
-  const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
-  return ipHeader.split(',')[0].trim();
-}
-
-
 function safe(s){ return (s==null ? null : String(s)); }
 
 router.all('/callback', async (req, res) => {
-  try { await logEvent({ user_id:null, event_type:'auth_start', payload:{ provider:'tg' }, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) }); } catch {}
   try {
     const data = { ...(req.query || {}), ...(req.body || {}) };
     const deviceId = safe(req.query?.device_id || req.cookies?.device_id || '');
@@ -70,19 +63,6 @@ router.all('/callback', async (req, res) => {
     if (data.last_name) url.searchParams.set('last_name', safe(data.last_name));
     if (data.username) url.searchParams.set('username', safe(data.username));
     if (data.photo_url) url.searchParams.set('photo_url', safe(data.photo_url));
-    
-    try {
-      let uidToLog = null;
-      if (tgId) {
-        const rLog = await db.query(
-          "select user_id from auth_accounts where provider='tg' and provider_user_id=$1 order by updated_at desc limit 1",
-          [tgId]
-        );
-        uidToLog = (rLog.rows && rLog.rows[0] && rLog.rows[0].user_id) ? rLog.rows[0].user_id : null;
-      }
-      await logEvent({ user_id: uidToLog, event_type:'auth_success', payload:{ provider:'tg', tg_id: tgId || null }, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
-    } catch {}
-
     res.redirect(302, url.toString());
   } catch (e) {
     console.error('tg/callback error', e);

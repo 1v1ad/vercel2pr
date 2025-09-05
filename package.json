@@ -1,6 +1,6 @@
 {
   "name": "ggroom-backend",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "type": "module",
   "engines": {
     "node": ">=18.17"
@@ -8,5 +8,13 @@
   "scripts": {
     "start": "node server.js",
     "render-build": "npm ci --omit=dev || npm install --omit=dev"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "sqlite": "^4.2.1",
+    "sqlite3": "^5.1.7"
   }
 }

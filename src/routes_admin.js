@@ -5,7 +5,6 @@ import { resolvePrimaryUserId } from './merge.js';
 
 const router = Router();
 
-// --- простая админ-авторизация через заголовок ---
 function adminAuth(req, res, next) {
   const serverPass = (process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD || '').toString();
   const given = (req.get('X-Admin-Password') || (req.body && req.body.pwd) || req.query.pwd || '').toString();
@@ -14,10 +13,8 @@ function adminAuth(req, res, next) {
   next();
 }
 
-// простой ping
 router.get('/ping', adminAuth, (req, res) => res.json({ ok: true }));
 
-// Топап по первичному (primary) userId
 router.post('/topup', adminAuth, async (req, res) => {
   try {
     const { userId, amount = 0, meta = null } = req.body || {};
