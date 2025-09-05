@@ -1,5 +1,6 @@
 
-// src/routes_admin.js — v1 (re-expose admin endpoints with CORS & safe fallbacks)
+// src/routes_admin.js — v2
+// Mount this router in your server:  app.use(adminRouter);
 import { Router } from 'express';
 import { db } from './db.js';
 
@@ -19,58 +20,82 @@ function noStore(res){
 
 router.options(/\/api\/admin\/.*/, (req,res)=>{ allowCORS(req,res); res.sendStatus(204); });
 
+// Users list
 router.get('/api/admin/users', async (req,res)=>{
   try {
     allowCORS(req,res); noStore(res);
     const take = Math.min(parseInt(req.query.take||'50',10), 200);
     const skip = Math.max(parseInt(req.query.skip||'0',10), 0);
     const search = (req.query.search||'').trim();
-    let rows, totalRow;
+    let rows=[], total=0;
     if (search) {
       const like = `%${search}%`;
       rows = await db.all(
-        'SELECT * FROM users WHERE id LIKE ? OR vk_id LIKE ? OR tg_id LIKE ? OR first_name LIKE ? OR last_name LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?',
+        `SELECT * FROM users
+         WHERE CAST(id AS TEXT) LIKE ? OR CAST(vk_id AS TEXT) LIKE ? OR CAST(tg_id AS TEXT) LIKE ?
+           OR first_name LIKE ? OR last_name LIKE ?
+         ORDER BY id DESC LIMIT ? OFFSET ?`,
         [like, like, like, like, like, take, skip]
       );
-      totalRow = await db.get('SELECT COUNT(*) as c FROM users WHERE id LIKE ? OR vk_id LIKE ? OR tg_id LIKE ? OR first_name LIKE ? OR last_name LIKE ?', [like, like, like, like, like]);
+      const r = await db.get(
+        `SELECT COUNT(*) as c FROM users
+         WHERE CAST(id AS TEXT) LIKE ? OR CAST(vk_id AS TEXT) LIKE ? OR CAST(tg_id AS TEXT) LIKE ?
+           OR first_name LIKE ? OR last_name LIKE ?`,
+        [like, like, like, like, like]
+      );
+      total = r?.c || 0;
     } else {
       rows = await db.all('SELECT * FROM users ORDER BY id DESC LIMIT ? OFFSET ?', [take, skip]);
-      totalRow = await db.get('SELECT COUNT(*) as c FROM users');
+      const r = await db.get('SELECT COUNT(*) as c FROM users');
+      total = r?.c || 0;
     }
-    res.json({ ok:true, items: rows || [], total: totalRow?.c || 0 });
+    res.json({ ok:true, items: rows, total });
   } catch (e) {
-    res.json({ ok:false, error:'users_list_failed' });
+    res.status(200).json({ ok:false, error:'users_list_failed' });
   }
 });
 
+// Summary daily (return multiple shapes so old UI won't choke)
 router.get('/api/admin/summary/daily', async (req,res)=>{
   try {
     allowCORS(req,res); noStore(res);
     const days = Math.min(parseInt(req.query.days||'7',10), 30);
-    // Заглушка: вернём нули, чтобы UI не падал (под твой формат подтянем позже)
     const today = Date.now();
     const points = Array.from({length: days}, (_,i)=>{
       const d = new Date(today - (days-1-i)*24*3600*1000);
       return { date: d.toISOString().slice(0,10), users: 0, deposits: 0, revenue: 0 };
     });
-    res.json({ ok:true, points });
+    res.json({ ok:true, points, daily: points, data: points });
   } catch (e) {
     res.json({ ok:false, error:'summary_failed' });
   }
 });
 
-router.get('/api/admin/daily', async (req,res)=>{
-  try { allowCORS(req,res); noStore(res); res.json({ ok:true, points: [] }); }
+// Backward: /api/admin/summary
+router.get('/api/admin/summary', async (req,res)=>{
+  try {
+    allowCORS(req,res); noStore(res);
+    res.json({ ok:true, totals: { users: 0, deposits: 0, revenue: 0 } });
+  } catch (e) {
+    res.json({ ok:false });
+  }
+});
+
+// Events feed (stub)
+router.get('/api/admin/events', async (req,res)=>{
+  try { allowCORS(req,res); noStore(res); res.json({ ok:true, events: [] }); }
   catch { res.json({ ok:false }); }
 });
 
+// Manual topups (accept but no-op)
 router.post('/api/admin/topups', async (req,res)=>{
   try { allowCORS(req,res); noStore(res); res.json({ ok:true }); }
   catch { res.json({ ok:false }); }
 });
 
-router.get('/api/admin/events', async (req,res)=>{
-  try { allowCORS(req,res); noStore(res); res.json({ ok:true, events: [] }); }
+// Another old path guarded by UI
+router.get('/api/admin/daily', async (req,res)=>{
+  try { allowCORS(req,res); noStore(res); res.json({ ok:true, points: [] }); }
   catch { res.json({ ok:false }); }
 });
 

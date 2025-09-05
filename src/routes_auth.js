@@ -1,9 +1,9 @@
 
-// src/routes_auth.js — v13
-// Changes vs v12:
-//  - "Последний логин побеждает": при входе через VK/TG обновляем имя/аватар и ставим src_provider ('vk'|'tg')
-//  - /api/me добавляет поле provider (из БД, иначе из cookie 'src')
-//  - Сохраняем CORS/anti-cache, VK id_token декод, users.get fallback
+// src/routes_auth.js — v14
+// Diff vs v13:
+//  - session cookies set with SameSite=None (so Netlify -> Render third‑party fetches carry cookie)
+//  - keep "last login wins" for avatar/name + provider label
+//  - CORS + anti-cache intact
 import { Router } from 'express';
 import crypto from 'crypto';
 import { db, upsertVK, upsertTG } from './db.js';
@@ -52,7 +52,7 @@ router.all('/api/health', healthHandler);
 router.get(['/auth/_build','/api/auth/_build'], (req, res) => {
   allowCORS(req,res); noStore(res);
   res.json({
-    router: 'v13',
+    router: 'v14',
     uses: {
       TELEGRAM_BOT_TOKEN: !!(process.env.TELEGRAM_BOT_TOKEN),
       TG_BOT_TOKEN: !!(process.env.TG_BOT_TOKEN),
@@ -213,15 +213,16 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
 
     const user = await upsertVK(vk_id, { firstName, lastName, avatar });
 
-    // LAST-LOGIN-WINS: обновляем базовые поля и маркер провайдера
+    // last-login-wins
     try {
       await db.run('UPDATE users SET first_name=?, last_name=?, avatar=?, src_provider=? WHERE id=?',
         [firstName || user.first_name || '', lastName || user.last_name || '', avatar || user.avatar || '', 'vk', user.id]);
     } catch {}
 
     const jwt = signSession({ uid: user.id });
-    res.cookie(COOKIE_NAME, jwt, cookieOpts());
-    res.cookie('src', 'vk', { ...cookieOpts(), httpOnly:false });
+    const opts = { ...cookieOpts(), sameSite:'none' };
+    res.cookie(COOKIE_NAME, jwt, opts);
+    res.cookie('src', 'vk', { ...opts, httpOnly:false });
     redirectAfterLogin(res);
   } catch (e) {
     console.error('[VK callback] error', e);
@@ -289,8 +290,9 @@ router.get(['/auth/tg/callback','/api/auth/tg/callback'], async (req, res) => {
     } catch {}
 
     const jwt = signSession({ uid: user.id });
-    res.cookie(COOKIE_NAME, jwt, cookieOpts());
-    res.cookie('src', 'tg', { ...cookieOpts(), httpOnly:false });
+    const opts = { ...cookieOpts(), sameSite:'none' };
+    res.cookie(COOKIE_NAME, jwt, opts);
+    res.cookie('src', 'tg', { ...opts, httpOnly:false });
     redirectAfterLogin(res);
   } catch (e) {
     console.error('[TG callback] error', e);
