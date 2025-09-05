@@ -9,22 +9,18 @@ import { ensureClusterId } from './src/merge.js';
 const app = express();
 app.set('trust proxy', 1);
 
-// CORS
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
 
-// Health
 app.get(['/', '/health', '/healthz', '/health1'], (req, res) =>
   res.json({ ok: true, ts: Date.now() })
 );
 
-// Routers
-// authRouter уже содержит и абсолютные /api/маршруты, и короткие — оставим оба монтирования для совместимости
+// auth и admin вешаем на корень И продублируем под /api — чтобы покрыть все старые ссылки
 app.use(authRouter);
 app.use('/api', authRouter);
 
-// ВАЖНО: админ-роутер должен висеть на корне (и можно продублировать на /api)
 app.use(adminRouter);
 app.use('/api', adminRouter);
 
