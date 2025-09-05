@@ -1,6 +1,9 @@
 
-// src/routes_auth.js — v12
-// Fixes: CORS on /api/me & auth routes, /health endpoint, verbose VK id resolution
+// src/routes_auth.js — v13
+// Changes vs v12:
+//  - "Последний логин побеждает": при входе через VK/TG обновляем имя/аватар и ставим src_provider ('vk'|'tg')
+//  - /api/me добавляет поле provider (из БД, иначе из cookie 'src')
+//  - Сохраняем CORS/anti-cache, VK id_token декод, users.get fallback
 import { Router } from 'express';
 import crypto from 'crypto';
 import { db, upsertVK, upsertTG } from './db.js';
@@ -8,7 +11,6 @@ import { signSession, readSession, clearSession, COOKIE_NAME, cookieOpts } from 
 
 const router = Router();
 
-// --- Env compatibility ---
 const FRONT = process.env.FRONT_ORIGIN || process.env.FRONTEND_URL || process.env.FRONT_URL || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN || '';
 const BACKEND_BASE =
@@ -16,13 +18,6 @@ const BACKEND_BASE =
   process.env.PUBLIC_BACKEND_URL ||
   (process.env.VK_REDIRECT_URI ? new URL(process.env.VK_REDIRECT_URI).origin : '');
 
-// --- Helpers ---
-function noStore(res){
-  res.set('Cache-Control','no-store, no-cache, must-revalidate');
-  res.set('Pragma','no-cache');
-  res.set('Expires','0');
-  res.set('Vary','Cookie, Origin');
-}
 function allowCORS(req, res){
   const origin = req.headers.origin || '';
   const allowed = FRONT || origin || '*';
@@ -30,6 +25,12 @@ function allowCORS(req, res){
   res.set('Access-Control-Allow-Credentials', 'true');
   res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+}
+function noStore(res){
+  res.set('Cache-Control','no-store, no-cache, must-revalidate');
+  res.set('Pragma','no-cache');
+  res.set('Expires','0');
+  res.set('Vary','Cookie, Origin');
 }
 function redirectAfterLogin(res){
   const to = process.env.AFTER_LOGIN_URL || (FRONT ? FRONT + '/lobby.html' : '/health');
@@ -42,19 +43,16 @@ function genCodeVerifier(){ return base64url(crypto.randomBytes(64)); }
 function codeChallengeFrom(verifier){ return base64url(crypto.createHash('sha256').update(verifier).digest()); }
 function cookieOptsPkce(){ return { httpOnly:true, sameSite:'lax', secure:true, path:'/', maxAge: 10 * 60 * 1000 }; }
 
-// --- Health (both /health and /api/health) ---
-function healthHandler(req,res){
-  allowCORS(req,res); noStore(res);
-  res.json({ ok:true, ts: Date.now() });
-}
+// Health
+function healthHandler(req,res){ allowCORS(req,res); noStore(res); res.json({ ok:true, ts: Date.now() }); }
 router.all('/health', healthHandler);
 router.all('/api/health', healthHandler);
 
-// --- Build info endpoint ---
+// Build marker
 router.get(['/auth/_build','/api/auth/_build'], (req, res) => {
   allowCORS(req,res); noStore(res);
   res.json({
-    router: 'v12',
+    router: 'v13',
     uses: {
       TELEGRAM_BOT_TOKEN: !!(process.env.TELEGRAM_BOT_TOKEN),
       TG_BOT_TOKEN: !!(process.env.TG_BOT_TOKEN),
@@ -69,18 +67,25 @@ router.get(['/auth/_build','/api/auth/_build'], (req, res) => {
   });
 });
 
-// --- session/me ---
+// /api/me
 router.options(['/api/me','/me'], (req,res)=>{ allowCORS(req,res); res.sendStatus(204); });
 router.get(['/api/me','/me'], async (req, res) => {
   allowCORS(req,res); noStore(res);
   const sess = readSession(req);
-  if (!sess?.uid) return res.json({ ok:true, user: null });
+  if (!sess?.uid) return res.json({ ok:true, user: null, provider: null });
   const u = await db.get('SELECT * FROM users WHERE id=?', [sess.uid]);
-  res.json({ ok:true, user: u || null });
+  let provider = null;
+  try {
+    const row = await db.get('SELECT src_provider FROM users WHERE id=?', [sess.uid]);
+    provider = row?.src_provider || null;
+  } catch {}
+  if (!provider) provider = req.cookies?.src || null;
+  res.json({ ok:true, user: u || null, provider });
 });
+
 router.post(['/api/logout','/logout'], (req, res) => { allowCORS(req,res); noStore(res); clearSession(res); res.json({ ok:true }); });
 
-// --- VK OAuth (state + PKCE) ---
+// --- VK OAuth ---
 router.get(['/auth/vk/start','/api/auth/vk/start'], (req, res) => {
   const client_id = process.env.VK_CLIENT_ID;
   if (!client_id) return res.status(500).send('VK_CLIENT_ID is not set');
@@ -167,11 +172,10 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
     }
     const token = success.json || {};
 
-    // Resolve VK ID from several places
+    // Resolve VK id
     let avatar = '', firstName = '', lastName = '';
     let vk_id = token.user_id?.toString() || (token.user && (token.user.id || token.user.user_id) ? String(token.user.id || token.user.user_id) : '');
 
-    // Try id_token (JWT)
     if (!vk_id && token.id_token && typeof token.id_token === 'string') {
       const parts = token.id_token.split('.');
       if (parts.length >= 2) {
@@ -187,9 +191,9 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
       }
     }
 
-    // Try users.get via access_token
+    // users.get try
     try {
-      if (!vk_id && token.access_token) {
+      if (token.access_token) {
         const apiV = process.env.VK_API_VERSION || '5.199';
         const infoResp = await fetch(`https://api.vk.com/method/users.get?v=${apiV}&fields=photo_200&access_token=${encodeURIComponent(token.access_token)}`);
         const info = await infoResp.json();
@@ -204,14 +208,20 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
     } catch {}
 
     if (!vk_id) {
-      const keys = Object.keys(token || {});
-      const flags = { has_access_token: !!token.access_token, has_id_token: !!token.id_token };
       return res.status(502).send('vk: cannot resolve user id');
     }
 
     const user = await upsertVK(vk_id, { firstName, lastName, avatar });
+
+    // LAST-LOGIN-WINS: обновляем базовые поля и маркер провайдера
+    try {
+      await db.run('UPDATE users SET first_name=?, last_name=?, avatar=?, src_provider=? WHERE id=?',
+        [firstName || user.first_name || '', lastName || user.last_name || '', avatar || user.avatar || '', 'vk', user.id]);
+    } catch {}
+
     const jwt = signSession({ uid: user.id });
     res.cookie(COOKIE_NAME, jwt, cookieOpts());
+    res.cookie('src', 'vk', { ...cookieOpts(), httpOnly:false });
     redirectAfterLogin(res);
   } catch (e) {
     console.error('[VK callback] error', e);
@@ -219,7 +229,7 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
   }
 });
 
-// --- Debug endpoint for VK config ---
+// VK debug
 router.get(['/auth/vk/debug','/api/auth/vk/debug'], (req, res) => {
   allowCORS(req,res); noStore(res);
   res.json({
@@ -231,7 +241,7 @@ router.get(['/auth/vk/debug','/api/auth/vk/debug'], (req, res) => {
   });
 });
 
-// --- Telegram Login Widget ---
+// --- Telegram ---
 function parseRawQuery(req){
   const idx = req.originalUrl.indexOf('?');
   const raw = idx >= 0 ? req.originalUrl.slice(idx+1) : '';
@@ -272,8 +282,15 @@ router.get(['/auth/tg/callback','/api/auth/tg/callback'], async (req, res) => {
     const avatar = q.photo_url || '';
     const user = await upsertTG(tg_id, { firstName, lastName, avatar });
 
+    // last-login-wins
+    try {
+      await db.run('UPDATE users SET first_name=?, last_name=?, avatar=?, src_provider=? WHERE id=?',
+        [firstName || user.first_name || '', lastName || user.last_name || '', avatar || user.avatar || '', 'tg', user.id]);
+    } catch {}
+
     const jwt = signSession({ uid: user.id });
     res.cookie(COOKIE_NAME, jwt, cookieOpts());
+    res.cookie('src', 'tg', { ...cookieOpts(), httpOnly:false });
     redirectAfterLogin(res);
   } catch (e) {
     console.error('[TG callback] error', e);
