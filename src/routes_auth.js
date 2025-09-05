@@ -1,5 +1,5 @@
 
-// src/routes_auth.js — v7 (TG data_check_string filtered + TELEGRAM_BOT_TOKEN + VK PKCE)
+// src/routes_auth.js — v8 (dual-attempt VK token exchange + debug + TELEGRAM_BOT_TOKEN + TG verify strict)
 import { Router } from 'express';
 import crypto from 'crypto';
 import { db, upsertVK, upsertTG } from './db.js';
@@ -10,7 +10,7 @@ const router = Router();
 // --- Build info endpoint (маячок версии и подключение env, без секретов) ---
 router.get(['/auth/_build','/api/auth/_build'], (req, res) => {
   res.json({
-    router: 'v7',
+    router: 'v8',
     uses: {
       TELEGRAM_BOT_TOKEN: !!(process.env.TELEGRAM_BOT_TOKEN),
       TG_BOT_TOKEN: !!(process.env.TG_BOT_TOKEN),
@@ -75,6 +75,22 @@ router.get(['/auth/vk/start','/api/auth/vk/start'], (req, res) => {
   res.redirect(url.toString());
 });
 
+async function vkTokenExchange({ code, client_id, redirect_uri, code_verifier, withSecret }){
+  const body = new URLSearchParams({
+    grant_type: 'authorization_code', client_id, redirect_uri, code, code_verifier
+  });
+  if (withSecret && process.env.VK_CLIENT_SECRET) body.set('client_secret', process.env.VK_CLIENT_SECRET);
+  const resp = await fetch('https://id.vk.com/oauth2/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+    body
+  });
+  const text = await resp.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+  return { ok: resp.ok, status: resp.status, text, json };
+}
+
 router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
   try {
     const code = req.query.code?.toString();
@@ -85,17 +101,33 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
     if (!client_id) return res.status(500).send('VK_CLIENT_ID not set');
     if (!code_verifier) return res.status(400).send('missing pkce verifier');
 
-    const tokenBody = new URLSearchParams({
-      grant_type: 'authorization_code', client_id, redirect_uri, code, code_verifier
-    });
-    if (USE_VK_SECRET && process.env.VK_CLIENT_SECRET) tokenBody.set('client_secret', process.env.VK_CLIENT_SECRET);
+    // Attempt 1
+    let attempt1 = await vkTokenExchange({ code, client_id, redirect_uri, code_verifier, withSecret: USE_VK_SECRET });
+    // Attempt 2 (toggle secret) if first failed and alternate mode is possible
+    let attempt2 = null;
+    if (!attempt1.ok) {
+      const canToggle = (!!process.env.VK_CLIENT_SECRET) || USE_VK_SECRET;
+      if (canToggle) {
+        attempt2 = await vkTokenExchange({ code, client_id, redirect_uri, code_verifier, withSecret: !USE_VK_SECRET });
+      }
+    }
+    const success = attempt1.ok ? attempt1 : (attempt2 && attempt2.ok ? attempt2 : null);
+    const last = success || attempt2 || attempt1;
 
-    const tokenResp = await fetch('https://id.vk.com/oauth2/token', {
-      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' }, body: tokenBody
-    });
-    if (!tokenResp.ok) { const txt = await tokenResp.text(); return res.status(502).send('vk token error: ' + txt); }
-    const token = await tokenResp.json();
+    if (!success) {
+      const info = {
+        mode1_used_secret: USE_VK_SECRET,
+        mode1_status: attempt1.status,
+        mode1_text: attempt1.text?.slice(0, 400),
+        mode2_tried: !!attempt2,
+        mode2_used_secret: attempt2 ? !USE_VK_SECRET : null,
+        mode2_status: attempt2 ? attempt2.status : null,
+        mode2_text: attempt2 ? attempt2.text?.slice(0, 400) : null
+      };
+      return res.status(502).send('vk token error: ' + JSON.stringify(info));
+    }
 
+    const token = success.json || {};
     let avatar = '', firstName = '', lastName = '';
     try {
       const apiV = process.env.VK_API_VERSION || '5.199';
@@ -117,6 +149,17 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
     console.error('[VK callback] error', e);
     res.status(500).send('vk callback error');
   }
+});
+
+// --- Debug endpoint for VK config ---
+router.get(['/auth/vk/debug','/api/auth/vk/debug'], (req, res) => {
+  res.json({
+    client_id_present: !!process.env.VK_CLIENT_ID,
+    has_secret: !!process.env.VK_CLIENT_SECRET,
+    use_secret_mode: USE_VK_SECRET,
+    redirect_uri: (process.env.VK_REDIRECT_URI || (BACKEND_BASE + '/api/auth/vk/callback')),
+    pkce_cookie_present: !!req.cookies?.pkce_v
+  });
 });
 
 // --- Telegram Login Widget ---
