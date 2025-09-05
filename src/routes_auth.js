@@ -1,4 +1,4 @@
-// src/routes_auth.js — TELEGRAM_BOT_TOKEN + FRONTEND_URL support + PKCE
+// src/routes_auth.js — robust TG verify + PKCE-only VK by default
 import { Router } from 'express';
 import crypto from 'crypto';
 import { db, upsertVK, upsertTG } from './db.js';
@@ -9,6 +9,8 @@ const router = Router();
 // --- Env compatibility ---
 const FRONT = process.env.FRONT_ORIGIN || process.env.FRONTEND_URL || process.env.FRONT_URL || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN || '';
+const USE_VK_SECRET = (process.env.VK_USE_CLIENT_SECRET === '1' || process.env.VK_TOKEN_AUTH === 'secret');
+
 const BACKEND_BASE =
   process.env.BACKEND_BASE ||
   process.env.PUBLIC_BACKEND_URL ||
@@ -24,9 +26,7 @@ function base64url(buf){
 }
 function genCodeVerifier(){ return base64url(crypto.randomBytes(64)); }
 function codeChallengeFrom(verifier){ return base64url(crypto.createHash('sha256').update(verifier).digest()); }
-function pkceCookieOpts(){
-  return { httpOnly:true, sameSite:'lax', secure:true, path:'/', maxAge: 10 * 60 * 1000 };
-}
+function pkceCookieOpts(){ return { httpOnly:true, sameSite:'lax', secure:true, path:'/', maxAge: 10 * 60 * 1000 }; }
 
 // --- session/me ---
 router.get(['/api/me','/me'], async (req, res) => {
@@ -62,7 +62,6 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
     const code = req.query.code?.toString();
     if (!code) return res.status(400).send('missing code');
     const client_id = process.env.VK_CLIENT_ID;
-    const client_secret = process.env.VK_CLIENT_SECRET;
     const redirect_uri = process.env.VK_REDIRECT_URI || (BACKEND_BASE + '/api/auth/vk/callback');
     const code_verifier = req.cookies?.pkce_v;
     if (!client_id) return res.status(500).send('VK_CLIENT_ID not set');
@@ -71,10 +70,10 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
     const tokenBody = new URLSearchParams({
       grant_type: 'authorization_code', client_id, redirect_uri, code, code_verifier
     });
-    if (client_secret) tokenBody.set('client_secret', client_secret);
+    if (USE_VK_SECRET && process.env.VK_CLIENT_SECRET) tokenBody.set('client_secret', process.env.VK_CLIENT_SECRET);
 
     const tokenResp = await fetch('https://id.vk.com/oauth2/token', {
-      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: tokenBody
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' }, body: tokenBody
     });
     if (!tokenResp.ok) { const txt = await tokenResp.text(); return res.status(502).send('vk token error: ' + txt); }
     const token = await tokenResp.json();
@@ -86,10 +85,7 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
         headers: { 'Authorization': `Bearer ${token.access_token}` }
       });
       const info = await infoResp.json();
-      if (info?.response?.[0]) {
-        const p = info.response[0];
-        firstName = p.first_name || ''; lastName = p.last_name || ''; avatar = p.photo_200 || '';
-      }
+      if (info?.response?.[0]) { const p = info.response[0]; firstName = p.first_name || ''; lastName = p.last_name || ''; avatar = p.photo_200 || ''; }
     } catch {}
 
     const vk_id = token.user_id?.toString() || token.user?.id?.toString();
@@ -106,15 +102,27 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
 });
 
 // --- Telegram Login Widget ---
-function verifyTelegramAuth(data, botToken){
+function parseRawQuery(req){
+  const idx = req.originalUrl.indexOf('?');
+  const raw = idx >= 0 ? req.originalUrl.slice(idx+1) : '';
+  const usp = new URLSearchParams(raw);
+  const obj = {};
+  for (const [k,v] of usp.entries()){ obj[k] = v; }
+  return obj;
+}
+function buildDataCheckString(obj){
+  const entries = Object.entries(obj).filter(([k]) => k !== 'hash').sort(([a],[b]) => a.localeCompare(b));
+  return entries.map(([k,v]) => `${k}=${v}`).join('\n');
+}
+function verifyTelegramAuth(req, botToken){
+  const data = parseRawQuery(req); // используем сырые значения из querystring
   const secret = crypto.createHash('sha256').update(botToken).digest();
   const checkHash = data.hash;
-  const params = Object.entries(data)
-    .filter(([k]) => k !== 'hash')
-    .sort(([a],[b]) => a.localeCompare(b))
-    .map(([k,v]) => `${k}=${v}`)
-    .join('\n');
-  const hmac = crypto.createHmac('sha256', secret).update(params).digest('hex');
+  const dataCheck = buildDataCheckString(data);
+  const hmac = crypto.createHmac('sha256', secret).update(dataCheck).digest('hex');
+  // Доп. защита: проверим, что auth_date не слишком старый (24 часа)
+  const authDate = Number(data.auth_date || '0');
+  if (authDate && (Math.floor(Date.now()/1000) - authDate) > 24*3600) return false;
   return hmac === checkHash;
 }
 
@@ -122,13 +130,13 @@ router.get(['/auth/tg/callback','/api/auth/tg/callback'], async (req, res) => {
   try {
     const botToken = TG_TOKEN;
     if (!botToken) return res.status(500).send('TELEGRAM_BOT_TOKEN not set');
-    const data = Object.fromEntries(Object.entries(req.query).map(([k,v]) => [k, Array.isArray(v)?v[0]:v]));
-    if (!verifyTelegramAuth(data, botToken)) return res.status(401).send('tg verify fail');
+    if (!verifyTelegramAuth(req, botToken)) return res.status(401).send('tg verify fail');
 
-    const tg_id = data.id?.toString();
-    const firstName = data.first_name || '';
-    const lastName = data.last_name || '';
-    const avatar = data.photo_url || '';
+    const q = parseRawQuery(req);
+    const tg_id = q.id?.toString();
+    const firstName = q.first_name || '';
+    const lastName = q.last_name || '';
+    const avatar = q.photo_url || '';
     const user = await upsertTG(tg_id, { firstName, lastName, avatar });
 
     const jwt = signSession({ uid: user.id });
