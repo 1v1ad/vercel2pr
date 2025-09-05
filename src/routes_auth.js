@@ -1,7 +1,7 @@
 
-// src/routes_auth.js — v10
-// VK flow: id.vk.com/oauth2/auth (with secret + PKCE) -> oauth.vk.com/access_token fallback (legacy)
-// TG: TELEGRAM_BOT_TOKEN, strict verify
+// src/routes_auth.js — v11
+// VK: handle id_token (JWT) to extract user id/profile + users.get via access_token query
+// TG: TELEGRAM_BOT_TOKEN + strict verify
 // Anti-cache headers on auth + /api/me
 import { Router } from 'express';
 import crypto from 'crypto';
@@ -21,7 +21,7 @@ function noStore(res){
 router.get(['/auth/_build','/api/auth/_build'], (req, res) => {
   noStore(res);
   res.json({
-    router: 'v10',
+    router: 'v11',
     uses: {
       TELEGRAM_BOT_TOKEN: !!(process.env.TELEGRAM_BOT_TOKEN),
       TG_BOT_TOKEN: !!(process.env.TG_BOT_TOKEN),
@@ -56,6 +56,15 @@ function base64url(buf){
 function genCodeVerifier(){ return base64url(crypto.randomBytes(64)); }
 function codeChallengeFrom(verifier){ return base64url(crypto.createHash('sha256').update(verifier).digest()); }
 function cookieOptsPkce(){ return { httpOnly:true, sameSite:'lax', secure:true, path:'/', maxAge: 10 * 60 * 1000 }; }
+
+function b64urlDecodeToJSON(b64url){
+  try {
+    const b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
+    const pad = b64.length % 4 === 2 ? '==' : (b64.length % 4 === 3 ? '=' : '');
+    const json = Buffer.from(b64 + pad, 'base64').toString('utf8');
+    return JSON.parse(json);
+  } catch { return null; }
+}
 
 // --- session/me ---
 router.get(['/api/me','/me'], async (req, res) => {
@@ -155,18 +164,54 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
       }));
     }
     const token = success.json || {};
+
+    // --- Try to resolve profile
     let avatar = '', firstName = '', lastName = '';
+    let vk_id = token.user_id?.toString() || (token.user && (token.user.id || token.user.user_id) ? String(token.user.id || token.user.user_id) : '');
+
+    // New VK ID flow often returns id_token (JWT) with sub/claims
+    if (!vk_id && token.id_token && typeof token.id_token === 'string') {
+      const parts = token.id_token.split('.');
+      if (parts.length >= 2) {
+        const payload = parts[1];
+        const claims = (() => {
+          try {
+            const b64 = payload.replace(/-/g,'+').replace(/_/g,'/');
+            const pad = b64.length % 4 === 2 ? '==' : (b64.length % 4 === 3 ? '=' : '');
+            const json = Buffer.from(b64 + pad, 'base64').toString('utf8');
+            return JSON.parse(json);
+          } catch { return null; }
+        })();
+        if (claims) {
+          vk_id = String(claims.sub || claims.user_id || claims.uid || '');
+          firstName = firstName || claims.given_name || claims.first_name || '';
+          lastName  = lastName  || claims.family_name || claims.last_name || '';
+          avatar    = avatar    || claims.picture || claims.photo || '';
+        }
+      }
+    }
+
+    // Best-effort users.get to refine names/avatar if access_token works for API
     try {
-      const apiV = process.env.VK_API_VERSION || '5.199';
-      const infoResp = await fetch(`https://api.vk.com/method/users.get?v=${apiV}&fields=photo_200`, {
-        headers: { 'Authorization': `Bearer ${token.access_token}` }
-      });
-      const info = await infoResp.json();
-      if (info?.response?.[0]) { const p = info.response[0]; firstName = p.first_name || ''; lastName = p.last_name || ''; avatar = p.photo_200 || ''; }
+      if (token.access_token) {
+        const apiV = process.env.VK_API_VERSION || '5.199';
+        const infoResp = await fetch(`https://api.vk.com/method/users.get?v=${apiV}&fields=photo_200&access_token=${encodeURIComponent(token.access_token)}`);
+        const info = await infoResp.json();
+        if (info?.response?.[0]) {
+          const p = info.response[0];
+          firstName = p.first_name || firstName || '';
+          lastName = p.last_name || lastName || '';
+          avatar = p.photo_200 || avatar || '';
+          if (!vk_id && p.id) vk_id = String(p.id);
+        }
+      }
     } catch {}
 
-    const vk_id = token.user_id?.toString() || token.user?.id?.toString() || '';
-    if (!vk_id) return res.status(502).send('vk: cannot resolve user id');
+    if (!vk_id) {
+      // help debug without leaking secrets: show token keys only
+      const keys = Object.keys(token || {});
+      return res.status(502).send('vk: cannot resolve user id');
+    }
 
     const user = await upsertVK(vk_id, { firstName, lastName, avatar });
     const jwt = signSession({ uid: user.id });
