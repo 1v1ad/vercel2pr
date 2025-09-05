@@ -1,8 +1,8 @@
 
-// src/routes_auth.js — v9
-// - Anti-cache headers for auth and /api/me
-// - VK token exchange: id.vk.com (PKCE, with/without secret) -> fallback oauth.vk.com/access_token (legacy)
-// - TELEGRAM_BOT_TOKEN + strict TG verify
+// src/routes_auth.js — v10
+// VK flow: id.vk.com/oauth2/auth (with secret + PKCE) -> oauth.vk.com/access_token fallback (legacy)
+// TG: TELEGRAM_BOT_TOKEN, strict verify
+// Anti-cache headers on auth + /api/me
 import { Router } from 'express';
 import crypto from 'crypto';
 import { db, upsertVK, upsertTG } from './db.js';
@@ -21,7 +21,7 @@ function noStore(res){
 router.get(['/auth/_build','/api/auth/_build'], (req, res) => {
   noStore(res);
   res.json({
-    router: 'v9',
+    router: 'v10',
     uses: {
       TELEGRAM_BOT_TOKEN: !!(process.env.TELEGRAM_BOT_TOKEN),
       TG_BOT_TOKEN: !!(process.env.TG_BOT_TOKEN),
@@ -30,7 +30,8 @@ router.get(['/auth/_build','/api/auth/_build'], (req, res) => {
       FRONT_URL: !!(process.env.FRONT_URL),
       VK_REDIRECT_URI: process.env.VK_REDIRECT_URI || null,
       BACKEND_BASE: (process.env.BACKEND_BASE || process.env.PUBLIC_BACKEND_URL || null),
-      VK_USE_CLIENT_SECRET: (process.env.VK_USE_CLIENT_SECRET === '1' || process.env.VK_TOKEN_AUTH === 'secret')
+      VK_CLIENT_ID: !!process.env.VK_CLIENT_ID,
+      VK_CLIENT_SECRET: !!process.env.VK_CLIENT_SECRET
     }
   });
 });
@@ -38,7 +39,6 @@ router.get(['/auth/_build','/api/auth/_build'], (req, res) => {
 // --- Env compatibility ---
 const FRONT = process.env.FRONT_ORIGIN || process.env.FRONTEND_URL || process.env.FRONT_URL || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN || '';
-const USE_VK_SECRET = (process.env.VK_USE_CLIENT_SECRET === '1' || process.env.VK_TOKEN_AUTH === 'secret');
 
 const BACKEND_BASE =
   process.env.BACKEND_BASE ||
@@ -55,7 +55,7 @@ function base64url(buf){
 }
 function genCodeVerifier(){ return base64url(crypto.randomBytes(64)); }
 function codeChallengeFrom(verifier){ return base64url(crypto.createHash('sha256').update(verifier).digest()); }
-function pkceCookieOpts(){ return { httpOnly:true, sameSite:'lax', secure:true, path:'/', maxAge: 10 * 60 * 1000 }; }
+function cookieOptsPkce(){ return { httpOnly:true, sameSite:'lax', secure:true, path:'/', maxAge: 10 * 60 * 1000 }; }
 
 // --- session/me ---
 router.get(['/api/me','/me'], async (req, res) => {
@@ -65,99 +65,95 @@ router.get(['/api/me','/me'], async (req, res) => {
   const u = await db.get('SELECT * FROM users WHERE id=?', [sess.uid]);
   res.json({ ok:true, user: u || null });
 });
-router.post(['/api/logout','/logout'], (req, res) => {
-  noStore(res);
-  clearSession(res);
-  res.json({ ok:true });
-});
+router.post(['/api/logout','/logout'], (req, res) => { noStore(res); clearSession(res); res.json({ ok:true }); });
 
-// --- VK OAuth (PKCE) ---
+// --- VK OAuth (state + PKCE) ---
 router.get(['/auth/vk/start','/api/auth/vk/start'], (req, res) => {
   const client_id = process.env.VK_CLIENT_ID;
   if (!client_id) return res.status(500).send('VK_CLIENT_ID is not set');
   const redirect_uri = process.env.VK_REDIRECT_URI || (BACKEND_BASE + '/api/auth/vk/callback');
-  const state = encodeURIComponent(req.query.returnTo || '');
+  const state = crypto.randomBytes(16).toString('hex');
   const code_verifier = genCodeVerifier();
   const code_challenge = codeChallengeFrom(code_verifier);
-  res.cookie('pkce_v', code_verifier, pkceCookieOpts());
+  res.cookie('vk_state', state, cookieOptsPkce());
+  res.cookie('vk_code_verifier', code_verifier, cookieOptsPkce());
   const url = new URL('https://id.vk.com/authorize');
   url.searchParams.set('client_id', client_id);
   url.searchParams.set('redirect_uri', redirect_uri);
   url.searchParams.set('response_type', 'code');
-  url.searchParams.set('scope', 'email');
+  url.searchParams.set('scope', 'vkid.personal_info');
+  url.searchParams.set('state', state);
   url.searchParams.set('code_challenge', code_challenge);
   url.searchParams.set('code_challenge_method', 'S256');
-  if (state) url.searchParams.set('state', state);
   res.redirect(url.toString());
 });
 
-async function vkTokenExchangeIdHost({ code, client_id, redirect_uri, code_verifier, withSecret }){
+async function vkAuthTokenViaIdHost({ code, client_id, client_secret, redirect_uri, code_verifier }){
   const body = new URLSearchParams({
-    grant_type: 'authorization_code', client_id, redirect_uri, code, code_verifier
+    grant_type: 'authorization_code',
+    code,
+    client_id,
+    client_secret: client_secret || '',
+    redirect_uri,
+    code_verifier
   });
-  if (withSecret && process.env.VK_CLIENT_SECRET) body.set('client_secret', process.env.VK_CLIENT_SECRET);
-  const resp = await fetch('https://id.vk.com/oauth2/token', {
+  const resp = await fetch('https://id.vk.com/oauth2/auth', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
     body
   });
   const text = await resp.text();
-  let json = null;
-  try { json = JSON.parse(text); } catch {}
+  let json = null; try { json = JSON.parse(text); } catch {}
   return { host:'id.vk.com', ok: resp.ok, status: resp.status, text, json };
 }
 
-async function vkTokenExchangeLegacyHost({ code, client_id, redirect_uri, withSecret }){
-  // Legacy OAuth host; PKCE не поддерживает, code_verifier не передаём
-  const body = new URLSearchParams({
-    client_id, redirect_uri, code
+async function vkAuthTokenViaLegacy({ code, client_id, client_secret, redirect_uri, code_verifier }){
+  const params = new URLSearchParams({
+    client_id,
+    client_secret: client_secret || '',
+    redirect_uri,
+    code,
+    code_verifier
   });
-  if (withSecret && process.env.VK_CLIENT_SECRET) body.set('client_secret', process.env.VK_CLIENT_SECRET);
-  const resp = await fetch('https://oauth.vk.com/access_token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-    body
+  const resp = await fetch('https://oauth.vk.com/access_token?' + params.toString(), {
+    method: 'GET',
+    headers: { 'Accept': 'application/json' }
   });
   const text = await resp.text();
-  let json = null;
-  try { json = JSON.parse(text); } catch {}
+  let json = null; try { json = JSON.parse(text); } catch {}
   return { host:'oauth.vk.com', ok: resp.ok, status: resp.status, text, json };
 }
 
 router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
   try {
     noStore(res);
-    const code = req.query.code?.toString();
-    if (!code) return res.status(400).send('missing code');
-    const client_id = process.env.VK_CLIENT_ID;
-    const redirect_uri = process.env.VK_REDIRECT_URI || (BACKEND_BASE + '/api/auth/vk/callback');
-    const code_verifier = req.cookies?.pkce_v;
-    if (!client_id) return res.status(500).send('VK_CLIENT_ID not set');
-    if (!code_verifier) return res.status(400).send('missing pkce verifier');
-
-    // 1) New host, chosen mode
-    const a1 = await vkTokenExchangeIdHost({ code, client_id, redirect_uri, code_verifier, withSecret: USE_VK_SECRET });
-    // 2) New host, toggled mode
-    const a2 = a1.ok ? null :
-      await vkTokenExchangeIdHost({ code, client_id, redirect_uri, code_verifier, withSecret: !USE_VK_SECRET });
-    // 3) Legacy host, with secret if есть
-    const a3 = (a1.ok || (a2 && a2.ok)) ? null :
-      await vkTokenExchangeLegacyHost({ code, client_id, redirect_uri, withSecret: true });
-
-    const success = a1.ok ? a1 : (a2 && a2.ok ? a2 : (a3 && a3.ok ? a3 : null));
-    const last = success || a3 || a2 || a1;
-
-    if (!success) {
-      const info = {
-        attempts: [
-          { host: a1.host, used_secret: USE_VK_SECRET, status: a1.status, body: a1.text?.slice(0,400) },
-          a2 ? { host: a2.host, used_secret: !USE_VK_SECRET, status: a2.status, body: a2.text?.slice(0,400) } : null,
-          a3 ? { host: a3.host, used_secret: true, status: a3.status, body: a3.text?.slice(0,400) } : null,
-        ].filter(Boolean)
-      };
-      return res.status(502).send('vk token error: ' + JSON.stringify(info));
+    const { code, state } = req.query;
+    const savedState = req.cookies?.vk_state;
+    const code_verifier = req.cookies?.vk_code_verifier;
+    if (!code || !state || !savedState || savedState !== state || !code_verifier) {
+      return res.status(400).send('invalid state');
     }
+    res.clearCookie('vk_state', { path:'/' });
+    res.clearCookie('vk_code_verifier', { path:'/' });
 
+    const client_id = process.env.VK_CLIENT_ID;
+    const client_secret = process.env.VK_CLIENT_SECRET || '';
+    const redirect_uri = process.env.VK_REDIRECT_URI || (BACKEND_BASE + '/api/auth/vk/callback');
+
+    // 1) id.vk.com/oauth2/auth
+    const a1 = await vkAuthTokenViaIdHost({ code, client_id, client_secret, redirect_uri, code_verifier });
+    // 2) legacy fallback
+    const a2 = a1.ok ? null : await vkAuthTokenViaLegacy({ code, client_id, client_secret, redirect_uri, code_verifier });
+
+    const success = a1.ok ? a1 : (a2 && a2.ok ? a2 : null);
+    if (!success) {
+      return res.status(502).send('vk token error: ' + JSON.stringify({
+        attempts: [
+          { host: a1.host, status: a1.status, body: a1.text?.slice(0,400) },
+          a2 ? { host: a2.host, status: a2.status, body: a2.text?.slice(0,400) } : null
+        ].filter(Boolean)
+      }));
+    }
     const token = success.json || {};
     let avatar = '', firstName = '', lastName = '';
     try {
@@ -169,12 +165,12 @@ router.get(['/auth/vk/callback','/api/auth/vk/callback'], async (req, res) => {
       if (info?.response?.[0]) { const p = info.response[0]; firstName = p.first_name || ''; lastName = p.last_name || ''; avatar = p.photo_200 || ''; }
     } catch {}
 
-    const vk_id = token.user_id?.toString() || token.user?.id?.toString();
+    const vk_id = token.user_id?.toString() || token.user?.id?.toString() || '';
     if (!vk_id) return res.status(502).send('vk: cannot resolve user id');
+
     const user = await upsertVK(vk_id, { firstName, lastName, avatar });
     const jwt = signSession({ uid: user.id });
     res.cookie(COOKIE_NAME, jwt, cookieOpts());
-    res.clearCookie('pkce_v', pkceCookieOpts());
     redirectAfterLogin(res);
   } catch (e) {
     console.error('[VK callback] error', e);
@@ -188,9 +184,9 @@ router.get(['/auth/vk/debug','/api/auth/vk/debug'], (req, res) => {
   res.json({
     client_id_present: !!process.env.VK_CLIENT_ID,
     has_secret: !!process.env.VK_CLIENT_SECRET,
-    use_secret_mode: USE_VK_SECRET,
     redirect_uri: (process.env.VK_REDIRECT_URI || (BACKEND_BASE + '/api/auth/vk/callback')),
-    pkce_cookie_present: !!req.cookies?.pkce_v
+    state_cookie: !!req.cookies?.vk_state,
+    verifier_cookie: !!req.cookies?.vk_code_verifier
   });
 });
 
