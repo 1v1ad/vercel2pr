@@ -15,18 +15,26 @@ app.use(express.json());
 app.use(cookieParser());
 
 // Health
-app.get(['/','/health','/healthz','/health1'], (req, res) => res.json({ ok:true, ts: Date.now() }));
+app.get(['/', '/health', '/healthz', '/health1'], (req, res) =>
+  res.json({ ok: true, ts: Date.now() })
+);
 
-// Routers (compat mount)
-app.use('/api', authRouter);
+// Routers
+// authRouter уже содержит и абсолютные /api/маршруты, и короткие — оставим оба монтирования для совместимости
 app.use(authRouter);
+app.use('/api', authRouter);
 
-app.use('/admin', adminRouter);
+// ВАЖНО: админ-роутер должен висеть на корне (и можно продублировать на /api)
+app.use(adminRouter);
+app.use('/api', adminRouter);
 
 const PORT = process.env.PORT || 10000;
 
-async function bootstrap(){
+async function bootstrap() {
   await ensureClusterId();
   app.listen(PORT, () => console.log('[BOOT] listening on', PORT));
 }
-bootstrap().catch(e => { console.error('[BOOT] fatal', e); process.exit(1); });
+bootstrap().catch((e) => {
+  console.error('[BOOT] fatal', e);
+  process.exit(1);
+});
