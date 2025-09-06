@@ -10,6 +10,7 @@
     "render-build": "npm ci --omit=dev || npm install --omit=dev"
   },
   "dependencies": {
+    "cookie": "^0.6.0",
     "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
     "express": "^4.19.2",
