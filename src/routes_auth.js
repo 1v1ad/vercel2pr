@@ -1,200 +1,159 @@
-// src/routes_auth.js  (ESM)
+// src/routes_auth.js
 import express from 'express';
-import axios from 'axios';
 import crypto from 'crypto';
+import cookie from 'cookie';
+import { makePkcePair } from './pkce.js';
+import { signSession } from './jwt.js';
+import { upsertUser, logEvent } from './db.js';
+
+/* axios removed; using global fetch */
 
 const router = express.Router();
 
-// ===== helpers =====
-function b64url(buf) {
-  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-}
-function genState() {
-  return b64url(crypto.randomBytes(24));
-}
-function genPkce() {
-  const verifier = b64url(crypto.randomBytes(32));
-  const challenge = b64url(crypto.createHash('sha256').update(verifier).digest());
-  return { verifier, challenge };
-}
-function frontUrl() {
-  return process.env.FRONT_URL || 'https://sweet-twilight-63a9b6.netlify.app';
-}
-function backendBase(req) {
-  const proto = (req.headers['x-forwarded-proto'] || 'https');
-  const host = req.headers['x-forwarded-host'] || req.headers.host;
+/** Helpers */
+const publicBase = (req) => {
+  // Render/Netlify friendly
+  const proto = (req.headers['x-forwarded-proto'] || '').split(',')[0] || 'https';
+  const host = (req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0];
   return `${proto}://${host}`;
-}
-function vkRedirectUri(req) {
-  return `${backendBase(req)}/api/auth/vk/callback`;
-}
+};
 
-// ===== cookie-based session (host cookies) =====
-const SESSION_COOKIE = 'gg_session';
-const COOKIE_OPTS = { httpOnly: true, sameSite: 'none', secure: true, path: '/' }; // SameSite=None для cross-site XHR с Netlify
-
-function readSession(req) {
-  try { return JSON.parse(req.cookies[SESSION_COOKIE] || '{}'); } catch { return {}; }
-}
-function writeSession(res, obj) {
-  res.cookie(SESSION_COOKIE, JSON.stringify(obj), COOKIE_OPTS);
-}
-
-// ======/api/auth/vk/debug =====
-router.get('/auth/vk/debug', (req, res) => {
-  const useSecret = String(process.env.VK_USE_CLIENT_SECRET || '1') === '1';
-  const hasId = !!process.env.VK_CLIENT_ID;
-  const hasSecret = !!process.env.VK_CLIENT_SECRET;
-  res.type('application/json').send({
-    client_id_present: hasId,
-    has_secret: hasSecret,
-    use_secret_mode: useSecret,
-    redirect_uri: vkRedirectUri(req),
-    pkce_cookie_present: !!req.cookies.vk_pkce_verifier,
-    state_cookie_present: !!req.cookies.vk_state
-  });
+const getenv = () => ({
+  clientId: process.env.VK_CLIENT_ID || process.env.VK_ID || '',
+  clientSecret: process.env.VK_CLIENT_SECRET || process.env.VK_SECRET || '',
+  redirectUri: process.env.VK_REDIRECT_URI || process.env.REDIRECT_URI || '',
+  frontendUrl: process.env.FRONT_URL || process.env.FRONTEND_URL || '',
 });
 
-// ===== старт =====
-router.get('/auth/vk/start', async (req, res) => {
-  const state = genState();
-  res.cookie('vk_state', state, COOKIE_OPTS);
+const COOKIE_SID = 'sid';
+const COOKIE_PKCE = 'vk_pkce';
+const COOKIE_STATE = 'vk_state';
 
-  const useSecret = String(process.env.VK_USE_CLIENT_SECRET || '1') === '1';
-  const clientId = process.env.VK_CLIENT_ID;
-  if (!clientId) return res.status(500).send('VK_CLIENT_ID not set');
+/** VK: start (дублируем пути под старый/новый фронт) */
+router.get(['/vk/start','/api/auth/vk/start'], async (req, res) => {
+  const { clientId, redirectUri, frontendUrl } = getenv();
+  if (!clientId) return res.status(500).send('vk: clientId not set');
 
-  const redirect_uri = vkRedirectUri(req);
-  const scope = 'email';
-  const v = '5.199';
+  const { verifier, challenge } = makePkcePair();
+  const state = crypto.randomBytes(16).toString('hex');
 
-  if (useSecret) {
-    const url = new URL('https://oauth.vk.com/authorize');
-    url.searchParams.set('client_id', clientId);
-    url.searchParams.set('redirect_uri', redirect_uri);
-    url.searchParams.set('response_type', 'code');
-    url.searchParams.set('scope', scope);
-    url.searchParams.set('state', state);
-    url.searchParams.set('v', v);
-    return res.redirect(url.toString());
-  } else {
-    const { verifier, challenge } = genPkce();
-    res.cookie('vk_pkce_verifier', verifier, COOKIE_OPTS);
+  // сохраняем PKCE и state в httpOnly cookie
+  res.setHeader('Set-Cookie', [
+    cookie.serialize(COOKIE_PKCE, verifier, { httpOnly: true, secure: true, sameSite: 'none', path: '/', maxAge: 600 }),
+    cookie.serialize(COOKIE_STATE, state,   { httpOnly: true, secure: true, sameSite: 'none', path: '/', maxAge: 600 }),
+  ]);
 
-    const url = new URL('https://id.vk.com/authorize');
-    url.searchParams.set('client_id', clientId);
-    url.searchParams.set('redirect_uri', redirect_uri);
-    url.searchParams.set('response_type', 'code');
-    url.searchParams.set('scope', scope);
-    url.searchParams.set('state', state);
-    url.searchParams.set('code_challenge', challenge);
-    url.searchParams.set('code_challenge_method', 'S256');
-    return res.redirect(url.toString());
-  }
+  const cb = redirectUri || `${publicBase(req)}/api/auth/vk/callback`;
+  const authUrl = new URL('https://id.vk.com/authorize');
+  authUrl.search = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: cb,
+    response_type: 'code',
+    scope: 'email',
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    state,
+  }).toString();
+
+  return res.redirect(authUrl.toString());
 });
 
-// ===== коллбэк =====
-router.get('/auth/vk/callback', async (req, res) => {
-  const { code, state } = req.query || {};
-  const savedState = req.cookies.vk_state;
-
-  if (!code) return res.status(400).send('vk: code missing');
-  if (!state || !savedState || state !== savedState) return res.status(400).send('vk: state mismatch');
-
-  res.clearCookie('vk_state', { path: '/' });
-
-  const useSecret = String(process.env.VK_USE_CLIENT_SECRET || '1') === '1';
-  const clientId = process.env.VK_CLIENT_ID;
-  const clientSecret = process.env.VK_CLIENT_SECRET;
-  const redirect_uri = vkRedirectUri(req);
-
+/** VK: callback (дублируем пути под старый/новый фронт) */
+router.get(['/vk/callback','/api/auth/vk/callback'], async (req, res) => {
   try {
-    let access_token;
+    const { clientId, clientSecret, redirectUri, frontendUrl } = getenv();
+    const code = String(req.query.code || '');
+    const state = String(req.query.state || '');
+    if (!code) return res.status(400).send('vk: code is empty');
 
-    if (useSecret) {
-      // classic flow
-      const r = await axios.get('https://oauth.vk.com/access_token', {
-        params: { client_id: clientId, client_secret: clientSecret, redirect_uri, code, v: '5.199' },
-        timeout: 8000,
-      });
-      access_token = r.data.access_token;
-      if (!access_token) throw new Error('no access_token from oauth.vk.com');
-    } else {
-      // PKCE flow
-      const verifier = req.cookies.vk_pkce_verifier;
-      if (!verifier) return res.status(400).send('vk: verifier missing');
-      res.clearCookie('vk_pkce_verifier', { path: '/' });
+    // достаём pkce/state
+    const parsed = cookie.parse(req.headers.cookie || '');
+    const codeVerifier = parsed[COOKIE_PKCE] || '';
+    const savedState  = parsed[COOKIE_STATE] || '';
+    if (state && savedState && state !== savedState) {
+      return res.status(400).send('vk: bad state');
+    }
 
-      const r = await axios.post('https://id.vk.com/oauth2/token', {
+    // Token exchange (VK ID → fallback oauth)
+    const redirect_uri = (redirectUri || `${publicBase(req)}/api/auth/vk/callback`);
+    const code_verifier = codeVerifier;
+    let tokenData = null;
+    try {
+      const baseParams = {
         grant_type: 'authorization_code',
         code,
-        redirect_uri,
         client_id: clientId,
-        code_verifier: verifier,
-      }, { timeout: 8000 });
-
-      access_token = r.data.access_token;
-      if (!access_token) throw new Error('no access_token from id.vk.com');
+        redirect_uri,
+        code_verifier,
+      };
+      if (clientSecret) baseParams.client_secret = clientSecret;
+      const body = new URLSearchParams(baseParams).toString();
+      const resp = await fetch('https://id.vk.com/oauth2/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+        signal: AbortSignal.timeout(10000),
+      });
+      tokenData = await resp.json();
+    } catch (err) {
+      tokenData = null;
     }
 
-    // pull user
-    const u = await axios.get('https://api.vk.com/method/users.get', {
-      params: { access_token, v: '5.199', fields: 'photo_100,photo_200,screen_name' },
-      timeout: 8000,
-    });
-    if (!u.data || !u.data.response || !u.data.response[0]) {
-      return res.status(502).send('vk: cannot resolve user id');
-    }
-    const vkUser = u.data.response[0];
-
-    const session = readSession(req);
-    session.user = {
-      id: String(vkUser.id),
-      name: `${vkUser.first_name || ''} ${vkUser.last_name || ''}`.trim(),
-      avatar: vkUser.photo_200 || vkUser.photo_100 || null,
-    };
-    session.provider = 'vk';
-    writeSession(res, session);
-
-    return res.redirect(`${frontUrl()}/lobby.html`);
-  } catch (e) {
-    // авто-фолбэк на classic, если вдруг стукнулись не туда
-    if (!useSecret) {
+    if (!tokenData?.access_token) {
+      const q = new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri,
+        code,
+        v: '5.199',
+        grant_type: 'authorization_code',
+      }).toString();
       try {
-        const r2 = await axios.get('https://oauth.vk.com/access_token', {
-          params: { client_id: clientId, client_secret: clientSecret, redirect_uri, code, v: '5.199' },
-          timeout: 8000,
+        const resp2 = await fetch('https://oauth.vk.com/access_token?' + q, {
+          method: 'GET',
+          signal: AbortSignal.timeout(10000),
         });
-        const access_token = r2.data.access_token;
-        if (access_token) {
-          const u2 = await axios.get('https://api.vk.com/method/users.get', {
-            params: { access_token, v: '5.199', fields: 'photo_100,photo_200,screen_name' },
-            timeout: 8000,
-          });
-          const vkUser = u2.data.response && u2.data.response[0];
-          if (vkUser) {
-            const session = readSession(req);
-            session.user = {
-              id: String(vkUser.id),
-              name: `${vkUser.first_name || ''} ${vkUser.last_name || ''}`.trim(),
-              avatar: vkUser.photo_200 || vkUser.photo_100 || null,
-            };
-            session.provider = 'vk';
-            writeSession(res, session);
-            return res.redirect(`${frontUrl()}/lobby.html`);
-          }
-        }
-      } catch { /* fall through */ }
+        tokenData = await resp2.json();
+      } catch {}
     }
-    const attempts = (e.response && { status: e.response.status, host: e.config && new URL(e.config.url).host }) || null;
-    return res.status(502).type('text/plain').send(`vk token error: ${JSON.stringify({ attempts })}`);
-  }
-});
 
-// ===== current session for front =====
-router.get('/me', (req, res) => {
-  const s = readSession(req);
-  res.json({ ok: true, user: s.user || null, provider: s.provider || null });
+    const accessToken = tokenData?.access_token || tokenData?.token || tokenData?.accessToken;
+    const vkUserId = tokenData?.user_id || tokenData?.userId;
+    if (!accessToken || !vkUserId) {
+      return res.status(502).send('vk token error: ' + JSON.stringify({ attempts: [{ host: 'id.vk.com', used_secret: !!clientSecret, status: tokenData?.status || 404, body: tokenData?.body || '---' }] }));
+    }
+
+    // профиль
+    let first_name = '', last_name = '', avatar = '';
+    try {
+      const profUrl = new URL('https://api.vk.com/method/users.get');
+      profUrl.search = new URLSearchParams({ access_token: accessToken, v: '5.199', fields: 'photo_200,first_name,last_name' }).toString();
+      const u = await fetch(profUrl.toString(), { signal: AbortSignal.timeout(10000) });
+      const data = await u.json();
+      const r = data?.response?.[0];
+      if (r) { first_name = r.first_name || ''; last_name = r.last_name || ''; avatar = r.photo_200 || ''; }
+    } catch {}
+
+    // upsert пользователя
+    const user = await upsertUser({
+      provider: 'vk',
+      provider_user_id: String(vkUserId),
+      name: [first_name, last_name].filter(Boolean).join(' ') || `id${vkUserId}`,
+      avatar,
+    });
+
+    // выдаём cookie сессии
+    const payload = { id: user.id, provider: 'vk', vk_id: vkUserId };
+    const sid = signSession(payload);
+    res.cookie(COOKIE_SID, sid, { httpOnly: true, secure: true, sameSite: 'none', path: '/', maxAge: 60 * 60 * 24 * 30 });
+
+    // лог и редирект
+    logEvent(user.id, 'login', { provider: 'vk' }).catch(() => {});
+    const to = (getenv().frontendUrl || '/lobby.html');
+    return res.redirect(to);
+  } catch (e) {
+    return res.status(500).send('vk: ' + (e?.message || 'unknown'));
+  }
 });
 
 export default router;
