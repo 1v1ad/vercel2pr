@@ -1,9 +1,23 @@
-import crypto from 'crypto';
-function base64url(input){
-  return Buffer.from(input).toString('base64').replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+// src/pkce.js  — ESM-версия генератора PKCE (S256)
+import { randomBytes, createHash } from 'crypto';
+
+function base64url(buf) {
+  return Buffer.from(buf)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
 }
-export function createCodeVerifier(){ return base64url(crypto.randomBytes(64)); }
-export function createCodeChallenge(verifier){
-  const hash = crypto.createHash('sha256').update(verifier).digest();
-  return base64url(hash);
+
+/**
+ * Генерирует пару {verifier, challenge} для PKCE S256.
+ * @param {number} bytesLength длина случайных байт для верифаера (по умолчанию 64)
+ */
+export function makePkcePair(bytesLength = 64) {
+  const verifier = base64url(randomBytes(bytesLength));
+  const challenge = base64url(createHash('sha256').update(verifier).digest());
+  return { verifier, challenge, method: 'S256' };
 }
+
+// На всякий случай — дефолт-экспорт тем же именем:
+export default makePkcePair;
