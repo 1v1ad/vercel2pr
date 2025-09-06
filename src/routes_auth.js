@@ -1,18 +1,17 @@
 // src/routes_auth.js
 import express from 'express';
 import crypto from 'crypto';
-import cookie from 'cookie';
+import * as cookie from 'cookie';        // надежнее для CJS-пакета
 import { makePkcePair } from './pkce.js';
 import { signSession } from './jwt.js';
 import { upsertUser, logEvent } from './db.js';
 
-/* axios removed; using global fetch */
+/* axios не нужен — используем встроенный fetch */
 
 const router = express.Router();
 
 /** Helpers */
 const publicBase = (req) => {
-  // Render/Netlify friendly
   const proto = (req.headers['x-forwarded-proto'] || '').split(',')[0] || 'https';
   const host = (req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0];
   return `${proto}://${host}`;
@@ -31,13 +30,12 @@ const COOKIE_STATE = 'vk_state';
 
 /** VK: start (дублируем пути под старый/новый фронт) */
 router.get(['/vk/start','/api/auth/vk/start'], async (req, res) => {
-  const { clientId, redirectUri, frontendUrl } = getenv();
+  const { clientId, redirectUri } = getenv();
   if (!clientId) return res.status(500).send('vk: clientId not set');
 
   const { verifier, challenge } = makePkcePair();
   const state = crypto.randomBytes(16).toString('hex');
 
-  // сохраняем PKCE и state в httpOnly cookie
   res.setHeader('Set-Cookie', [
     cookie.serialize(COOKIE_PKCE, verifier, { httpOnly: true, secure: true, sameSite: 'none', path: '/', maxAge: 600 }),
     cookie.serialize(COOKIE_STATE, state,   { httpOnly: true, secure: true, sameSite: 'none', path: '/', maxAge: 600 }),
@@ -66,7 +64,6 @@ router.get(['/vk/callback','/api/auth/vk/callback'], async (req, res) => {
     const state = String(req.query.state || '');
     if (!code) return res.status(400).send('vk: code is empty');
 
-    // достаём pkce/state
     const parsed = cookie.parse(req.headers.cookie || '');
     const codeVerifier = parsed[COOKIE_PKCE] || '';
     const savedState  = parsed[COOKIE_STATE] || '';
@@ -74,10 +71,11 @@ router.get(['/vk/callback','/api/auth/vk/callback'], async (req, res) => {
       return res.status(400).send('vk: bad state');
     }
 
-    // Token exchange (VK ID → fallback oauth)
     const redirect_uri = (redirectUri || `${publicBase(req)}/api/auth/vk/callback`);
     const code_verifier = codeVerifier;
     let tokenData = null;
+
+    // Основной путь — VK ID OAuth2 с PKCE
     try {
       const baseParams = {
         grant_type: 'authorization_code',
@@ -87,6 +85,7 @@ router.get(['/vk/callback','/api/auth/vk/callback'], async (req, res) => {
         code_verifier,
       };
       if (clientSecret) baseParams.client_secret = clientSecret;
+
       const body = new URLSearchParams(baseParams).toString();
       const resp = await fetch('https://id.vk.com/oauth2/token', {
         method: 'POST',
@@ -95,10 +94,11 @@ router.get(['/vk/callback','/api/auth/vk/callback'], async (req, res) => {
         signal: AbortSignal.timeout(10000),
       });
       tokenData = await resp.json();
-    } catch (err) {
+    } catch {
       tokenData = null;
     }
 
+    // Фолбэк — старый endpoint
     if (!tokenData?.access_token) {
       const q = new URLSearchParams({
         client_id: clientId,
@@ -120,10 +120,14 @@ router.get(['/vk/callback','/api/auth/vk/callback'], async (req, res) => {
     const accessToken = tokenData?.access_token || tokenData?.token || tokenData?.accessToken;
     const vkUserId = tokenData?.user_id || tokenData?.userId;
     if (!accessToken || !vkUserId) {
-      return res.status(502).send('vk token error: ' + JSON.stringify({ attempts: [{ host: 'id.vk.com', used_secret: !!clientSecret, status: tokenData?.status || 404, body: tokenData?.body || '---' }] }));
+      return res
+        .status(502)
+        .send('vk token error: ' + JSON.stringify({
+          attempts: [{ host: 'id.vk.com', used_secret: !!clientSecret, status: tokenData?.status || 404, body: tokenData?.body || '---' }]
+        }));
     }
 
-    // профиль
+    // Профиль
     let first_name = '', last_name = '', avatar = '';
     try {
       const profUrl = new URL('https://api.vk.com/method/users.get');
@@ -134,7 +138,7 @@ router.get(['/vk/callback','/api/auth/vk/callback'], async (req, res) => {
       if (r) { first_name = r.first_name || ''; last_name = r.last_name || ''; avatar = r.photo_200 || ''; }
     } catch {}
 
-    // upsert пользователя
+    // upsert
     const user = await upsertUser({
       provider: 'vk',
       provider_user_id: String(vkUserId),
@@ -142,15 +146,14 @@ router.get(['/vk/callback','/api/auth/vk/callback'], async (req, res) => {
       avatar,
     });
 
-    // выдаём cookie сессии
+    // cookie-сессия
     const payload = { id: user.id, provider: 'vk', vk_id: vkUserId };
     const sid = signSession(payload);
-    res.cookie(COOKIE_SID, sid, { httpOnly: true, secure: true, sameSite: 'none', path: '/', maxAge: 60 * 60 * 24 * 30 });
+    res.cookie('sid', sid, { httpOnly: true, secure: true, sameSite: 'none', path: '/', maxAge: 60 * 60 * 24 * 30 });
 
     // лог и редирект
     logEvent(user.id, 'login', { provider: 'vk' }).catch(() => {});
-    const to = (getenv().frontendUrl || '/lobby.html');
-    return res.redirect(to);
+    return res.redirect(frontendUrl || '/lobby.html');
   } catch (e) {
     return res.status(500).send('vk: ' + (e?.message || 'unknown'));
   }
