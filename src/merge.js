@@ -1,27 +1,52 @@
 // src/merge.js
-import { db } from './db.js';
+import crypto from 'crypto';
+import { getDb } from './db.js';
 
-export async function ensureClusterId(){
-  await db.run('UPDATE users SET cluster_id = id WHERE cluster_id IS NULL');
-}
+/**
+ * Гарантируем, что в БД есть cluster_id.
+ * - создаём таблицу settings(key TEXT PRIMARY KEY, value TEXT)
+ * - пытаемся прочитать cluster_id
+ * - если нет — мигрируем из возможных старых мест
+ * - если и там нет — генерируем новый и сохраняем
+ */
+export async function ensureClusterId() {
+  const db = await getDb();
 
-export async function resolvePrimaryUserId(userId){
-  const row = await db.get('SELECT COALESCE(cluster_id, id) AS cid FROM users WHERE id = ?', [userId]);
-  const cid = row ? row.cid : userId;
-  const pri = await db.get('SELECT MIN(id) AS id FROM users WHERE COALESCE(cluster_id, id) = ?', [cid]);
-  return pri?.id ?? userId;
-}
+  // 1) Базовая таблица настроек
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key   TEXT PRIMARY KEY,
+      value TEXT
+    );
+  `);
 
-export async function mergeUsers(primaryId, secondaryId){
-  const cid = await resolvePrimaryUserId(primaryId);
-  await db.run('UPDATE users SET cluster_id = ? WHERE id = ?', [cid, secondaryId]);
-  return { ok: true, clusterId: cid };
-}
+  // 2) Пробуем найти уже сохранённый cluster_id
+  let row = await db.get(`SELECT value FROM settings WHERE key = 'cluster_id'`);
+  if (row?.value) {
+    console.log('[BOOT] cluster_id =', row.value);
+    return row.value;
+  }
 
-export async function mergeSuggestions(){
-  return [];
-}
+  // 3) Легаси-поиск (если раньше где-то хранили)
+  let legacy = null;
+  try {
+    legacy = (await db.get(`SELECT cluster_id AS value FROM meta LIMIT 1`))?.value || null;
+  } catch {}
+  if (!legacy) {
+    try {
+      legacy = (await db.get(`SELECT value FROM kv WHERE key = 'cluster_id'`))?.value || null;
+    } catch {}
+  }
 
-export async function autoMergeByDevice(){
-  return false;
+  // 4) Берём легаси или генерим новый
+  const cid = legacy || ('c_' + crypto.randomUUID());
+
+  // 5) Сохраняем в settings (idempotent)
+  await db.run(
+    `INSERT OR REPLACE INTO settings(key, value) VALUES ('cluster_id', ?)`,
+    [cid]
+  );
+
+  console.log('[BOOT] cluster_id set to', cid, legacy ? '(migrated)' : '(new)');
+  return cid;
 }
