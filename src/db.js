@@ -144,3 +144,7 @@ export async function linkAccounts({ left, right }) {
 export async function getUserById(id) {
   return db.get(`SELECT * FROM users WHERE id = ?`, [id]);
 }
+export function getDb() {
+  if (!db) throw new Error('db not initialized');
+  return db;
+}
