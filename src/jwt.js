@@ -1,30 +1,17 @@
 // src/jwt.js
 import jwt from 'jsonwebtoken';
-const SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
-export const COOKIE_NAME = process.env.SESSION_COOKIE || 'sid';
 
-export function signSession(payload){
-  return jwt.sign(payload, SECRET, { expiresIn: '30d' });
+const JWT_SECRET = process.env.JWT_SECRET || process.env.SESSION_SECRET || 'dev-secret';
+const MAX_AGE_SEC = 60 * 60 * 24 * 30; // 30 дней
+
+export function signSession(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: MAX_AGE_SEC });
 }
-export function readSession(req){
-  const token = (req.cookies && req.cookies[COOKIE_NAME]) || null;
-  if (!token) return null;
+
+export function verifySession(token) {
   try {
-    return jwt.verify(token, SECRET);
-  } catch(e){
+    return jwt.verify(token, JWT_SECRET);
+  } catch {
     return null;
   }
-}
-export function clearSession(res){
-  res.clearCookie(COOKIE_NAME, cookieOpts());
-}
-export function cookieOpts(){
-  return {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: true,
-    path: '/',
-    domain: process.env.COOKIE_DOMAIN || undefined,
-    maxAge: 30*24*3600*1000
-  };
 }
