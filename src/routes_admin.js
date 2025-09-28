@@ -1,5 +1,6 @@
 // src/routes_admin.js
 import express from 'express';
+import { resolvePrimaryUserId, tx } from './db.js';
 
 const router = express.Router();
 
@@ -46,6 +47,63 @@ router.get(['/admin/users', '/api/admin/users'], ensureAdmin, (req, res) => {
 });
 router.get(['/admin/topups', '/api/admin/topups'], ensureAdmin, (req, res) => {
   res.json({ ok: true, items: [] });
+});
+
+function toRublesInt(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n) || n === 0) throw new Error('invalid_amount');
+  return n > 0 ? Math.floor(n) : Math.ceil(n);
+}
+
+router.post(['/admin/topup', '/api/admin/topup'], ensureAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const rawId = body.user_id ?? body.id;
+    const requestedId = Number(rawId);
+    if (!Number.isInteger(requestedId) || requestedId <= 0) {
+      return res.status(404).json({ ok: false, error: 'user_not_found' });
+    }
+
+    const amountRaw = body.amount ?? body.delta ?? body.value ?? body.sum;
+    const delta = toRublesInt(amountRaw);
+
+    const result = await tx(async ({ query, isPg }) => {
+      const primaryId = await resolvePrimaryUserId(requestedId, query);
+      const selectSql = isPg
+        ? 'SELECT id, balance FROM users WHERE id = $1 FOR UPDATE'
+        : 'SELECT id, balance FROM users WHERE id = $1';
+      const { rows } = await query(selectSql, [primaryId]);
+      if (!rows.length) throw new Error('user_not_found');
+
+      const currentBalance = Number(rows[0].balance || 0);
+      const newBalance = currentBalance + delta;
+
+      await query('UPDATE users SET balance = $1 WHERE id = $2', [newBalance, primaryId]);
+      await query('INSERT INTO events (user_id, type, meta) VALUES ($1, $2, $3)', [
+        primaryId,
+        'balance_update',
+        JSON.stringify({
+          requested_user_id: requestedId,
+          resolved_user_id: primaryId,
+          delta,
+        }),
+      ]);
+
+      return { balance: newBalance, primaryId };
+    });
+
+    res.json({ ok: true, balance: result.balance, user_id: result.primaryId });
+  } catch (err) {
+    const code = err?.message;
+    if (code === 'invalid_amount') {
+      return res.status(400).json({ ok: false, error: 'invalid_amount' });
+    }
+    if (code === 'user_not_found') {
+      return res.status(404).json({ ok: false, error: 'user_not_found' });
+    }
+    console.error('/admin/topup error', err);
+    res.status(500).json({ ok: false, error: 'topup_failed' });
+  }
 });
 
 // no-op чтобы убрать 404 в лобби
