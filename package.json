@@ -7,7 +7,9 @@
   },
   "scripts": {
     "start": "node server.js",
-    "render-build": "npm ci --omit=dev || npm install --omit=dev"
+    "render-build": "npm ci --omit=dev || npm install --omit=dev",
+    "test": "node --test",
+    "backfill:cluster": "node scripts/backfill-cluster.js"
   },
   "dependencies": {
     "cookie": "^0.6.0",
@@ -17,5 +19,8 @@
     "jsonwebtoken": "^9.0.2",
     "sqlite": "^4.2.1",
     "sqlite3": "^5.1.7"
+  },
+  "devDependencies": {
+    "supertest": "^6.3.4"
   }
 }

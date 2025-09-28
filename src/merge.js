@@ -50,3 +50,61 @@ export async function ensureClusterId() {
   console.log('[BOOT] cluster_id set to', cid, legacy ? '(migrated)' : '(new)');
   return cid;
 }
+
+export async function resolvePrimaryUserId(userId) {
+  if (!userId) return null;
+
+  const db = await getDb();
+  const user = await db.get(
+    `SELECT id, provider, provider_user_id FROM users WHERE id = ?`,
+    [userId]
+  );
+  if (!user) return null;
+
+  const link = await db.get(
+    `SELECT person_id FROM person_links WHERE provider = ? AND provider_user_id = ?`,
+    [user.provider, String(user.provider_user_id)]
+  );
+  if (!link) return user.id;
+
+  const personId = link.person_id;
+  const person = await db.get(
+    `SELECT primary_user_id FROM persons WHERE id = ?`,
+    [personId]
+  );
+
+  if (person?.primary_user_id) {
+    const exists = await db.get(`SELECT id FROM users WHERE id = ?`, [person.primary_user_id]);
+    if (exists) return person.primary_user_id;
+  }
+
+  const vkAccount = await db.get(
+    `
+      SELECT u.id
+      FROM users u
+      JOIN person_links pl
+        ON pl.provider = u.provider AND pl.provider_user_id = u.provider_user_id
+      WHERE pl.person_id = ? AND u.provider = 'vk'
+      ORDER BY datetime(u.created_at) ASC, u.id ASC
+      LIMIT 1
+    `,
+    [personId]
+  );
+  if (vkAccount?.id) return vkAccount.id;
+
+  const earliestAccount = await db.get(
+    `
+      SELECT u.id
+      FROM users u
+      JOIN person_links pl
+        ON pl.provider = u.provider AND pl.provider_user_id = u.provider_user_id
+      WHERE pl.person_id = ?
+      ORDER BY datetime(u.created_at) ASC, u.id ASC
+      LIMIT 1
+    `,
+    [personId]
+  );
+  if (earliestAccount?.id) return earliestAccount.id;
+
+  return user.id;
+}

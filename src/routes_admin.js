@@ -1,5 +1,7 @@
 // src/routes_admin.js
 import express from 'express';
+import { getDb, logEvent } from './db.js';
+import { resolvePrimaryUserId } from './merge.js';
 
 const router = express.Router();
 
@@ -46,6 +48,66 @@ router.get(['/admin/users', '/api/admin/users'], ensureAdmin, (req, res) => {
 });
 router.get(['/admin/topups', '/api/admin/topups'], ensureAdmin, (req, res) => {
   res.json({ ok: true, items: [] });
+});
+
+router.post(['/admin/topup', '/api/admin/topup'], ensureAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const rawId = body.user_id ?? body.userId ?? body.id;
+    const rawAmount = body.amount ?? body.delta ?? body.value;
+    const reason = (body.reason ?? '').toString().trim();
+
+    const userId = Number(rawId);
+    const amount = Number(rawAmount);
+
+    if (!Number.isFinite(userId) || userId <= 0) {
+      return res.status(400).json({ ok: false, error: 'bad_user_id' });
+    }
+    if (!Number.isFinite(amount) || !Number.isInteger(amount) || amount === 0) {
+      return res.status(400).json({ ok: false, error: 'bad_amount' });
+    }
+
+    const db = getDb();
+    const requester = await db.get(`SELECT id FROM users WHERE id = ?`, [userId]);
+    if (!requester) {
+      return res.status(404).json({ ok: false, error: 'user_not_found' });
+    }
+
+    const primaryId = await resolvePrimaryUserId(userId);
+    if (!primaryId) {
+      return res.status(404).json({ ok: false, error: 'primary_not_found' });
+    }
+
+    await db.run(`UPDATE users SET balance = balance + ? WHERE id = ?`, [amount, primaryId]);
+    const updated = await db.get(`SELECT balance FROM users WHERE id = ?`, [primaryId]);
+
+    const personRow = await db.get(
+      `
+        SELECT p.id AS person_id, p.cluster_id
+        FROM persons p
+        JOIN person_links pl
+          ON pl.person_id = p.id
+        JOIN users u
+          ON u.provider = pl.provider AND u.provider_user_id = pl.provider_user_id
+        WHERE u.id = ?
+        LIMIT 1
+      `,
+      [primaryId]
+    );
+
+    await logEvent(primaryId, 'balance_update', {
+      amount,
+      requested_user_id: userId,
+      primary_user_id: primaryId,
+      reason: reason || null,
+      person_id: personRow?.person_id ?? null,
+      cluster_id: personRow?.cluster_id || null,
+    });
+
+    res.json({ ok: true, user_id: primaryId, balance: updated?.balance ?? 0 });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || 'internal_error' });
+  }
 });
 
 // no-op чтобы убрать 404 в лобби
