@@ -158,7 +158,7 @@ router.get(['/api/auth/vk/callback','/vk/callback'], async (req, res) => {
       httpOnly: true, secure: true, sameSite: 'none', path: '/', maxAge: 60*60*24*30
     }));
 
-    logEvent(user.id, 'login', { provider: 'vk' }).catch(() => {});
+    logEvent(user.id, 'auth_success', { provider: 'vk' }).catch(() => {});
     res.redirect(frontendUrl || '/lobby.html');
   } catch (e) {
     res.status(500).send('vk: ' + (e?.message || 'unknown'));
@@ -207,7 +207,7 @@ router.get(['/api/auth/tg/callback','/tg/callback'], async (req, res) => {
       httpOnly:true, secure:true, sameSite:'none', path:'/', maxAge:60*60*24*30
     }));
 
-    logEvent(user.id, 'login', { provider: 'tg' }).catch(() => {});
+    logEvent(user.id, 'auth_success', { provider: 'tg' }).catch(() => {});
     const to = process.env.FRONT_URL || process.env.FRONTEND_URL || '/lobby.html';
     res.redirect(to);
   } catch (e) {

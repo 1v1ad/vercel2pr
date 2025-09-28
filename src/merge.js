@@ -1,6 +1,71 @@
 // src/merge.js
 import crypto from 'crypto';
-import { getDb } from './db.js';
+import { getDb, linkAccounts } from './db.js';
+
+export async function resolvePrimaryUserId(userId) {
+  if (!userId) return null;
+  const db = await getDb();
+  const user = await db.get(
+    `SELECT id, provider, provider_user_id FROM users WHERE id = ?`,
+    [userId]
+  );
+  if (!user) return null;
+
+  const link = await db.get(
+    `SELECT person_id FROM person_links WHERE provider = ? AND provider_user_id = ?`,
+    [user.provider, user.provider_user_id]
+  );
+  if (!link?.person_id) return user.id;
+
+  const person = await db.get(
+    `SELECT id, primary_user_id FROM persons WHERE id = ?`,
+    [link.person_id]
+  );
+  if (!person) return user.id;
+
+  if (person.primary_user_id) {
+    const primary = await db.get(`SELECT id FROM users WHERE id = ?`, [person.primary_user_id]);
+    if (primary) return primary.id;
+  }
+
+  const candidates = await db.all(
+    `
+      SELECT u.id, u.provider, u.created_at
+      FROM users u
+      JOIN person_links pl
+        ON pl.provider = u.provider AND pl.provider_user_id = u.provider_user_id
+      WHERE pl.person_id = ?
+      ORDER BY u.created_at ASC, u.id ASC
+    `,
+    [person.id]
+  );
+
+  if (!candidates.length) return user.id;
+
+  const vk = candidates.find((row) => row.provider === 'vk');
+  if (vk) return vk.id;
+
+  return candidates[0].id;
+}
+
+export async function autoMergeAccounts({ left, right, reason } = {}) {
+  if (!left || !right) {
+    throw new Error('autoMergeAccounts: left and right accounts are required');
+  }
+  const personId = await linkAccounts({ left, right }, { mode: 'auto', reason });
+  const db = await getDb();
+  const leftUser = await db.get(
+    `SELECT id FROM users WHERE provider=? AND provider_user_id=?`,
+    [left.provider, String(left.provider_user_id)]
+  );
+  const rightUser = await db.get(
+    `SELECT id FROM users WHERE provider=? AND provider_user_id=?`,
+    [right.provider, String(right.provider_user_id)]
+  );
+  const probe = leftUser?.id || rightUser?.id || null;
+  const primary = probe ? await resolvePrimaryUserId(probe) : null;
+  return { person_id: personId, primary_user_id: primary };
+}
 
 /**
  * Гарантируем, что в БД есть cluster_id.
