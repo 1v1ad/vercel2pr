@@ -7,7 +7,9 @@
   },
   "scripts": {
     "start": "node server.js",
-    "render-build": "npm ci --omit=dev || npm install --omit=dev"
+    "render-build": "npm ci --omit=dev || npm install --omit=dev",
+    "migrate": "node scripts/migrate.js",
+    "backfill": "node scripts/backfill-cluster.js"
   },
   "dependencies": {
     "cookie": "^0.6.0",
@@ -15,6 +17,7 @@
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "jsonwebtoken": "^9.0.2",
+    "pg": "^8",
     "sqlite": "^4.2.1",
     "sqlite3": "^5.1.7"
   }
