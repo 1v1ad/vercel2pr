@@ -33,10 +33,16 @@ async function alreadyApplied(client, id) {
   return rows.length > 0;
 }
 
-async function applyMigration(client, id, sql) {
-  console.log(`[migrate] applying ${id}`);
-  await client.query(sql);
-  await client.query('INSERT INTO migrations (id) VALUES ($1) ON CONFLICT DO NOTHING', [id]);
+async function applyMigration(client, file, id, sql) {
+  console.log(`[migrate] applying ${file}`);
+  try {
+    await client.query(sql);
+    await client.query('INSERT INTO migrations (id) VALUES ($1) ON CONFLICT DO NOTHING', [id]);
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    console.error(`[migrate] failed on ${file}: ${message}`);
+    throw err;
+  }
 }
 
 async function main() {
@@ -66,7 +72,6 @@ async function main() {
   const pool = new Pool(buildPoolConfig(url));
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
     await ensureMigrationsTable(client);
 
     for (const file of files) {
@@ -76,13 +81,11 @@ async function main() {
       }
       const fullPath = path.join(dir, file);
       const sql = await fs.readFile(fullPath, 'utf8');
-      await applyMigration(client, id, sql);
+      await applyMigration(client, file, id, sql);
     }
 
-    await client.query('COMMIT');
     console.log('[migrate] done');
   } catch (err) {
-    await client.query('ROLLBACK');
     console.error('[migrate] failed', err);
     process.exitCode = 1;
   } finally {
