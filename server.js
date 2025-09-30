@@ -1,53 +1,63 @@
 // server.js
 import express from 'express';
 import cookieParser from 'cookie-parser';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import cors from 'cors';
 
-import adminRouter from './src/routes_admin.js';
 import authRouter from './src/routes_auth.js';
-import { ensureClusterId } from './src/merge.js';
-import { initDB } from './src/db.js';
+import adminRouter from './src/routes_admin.js';
 
 const app = express();
-app.set('trust proxy', 1);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-// базовые миддлвары
-app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: '1mb' }));
+// ---- базовая диагностика окружения (без утечек значений) ----
+console.log('[BOOT] env check:', {
+  NODE_ENV: process.env.NODE_ENV,
+  PORT: process.env.PORT || 3000,
+  JWT_SECRET: !!process.env.JWT_SECRET,
+  DATABASE_URL: !!process.env.DATABASE_URL,
+  VK_CLIENT_ID: !!process.env.VK_CLIENT_ID,
+  VK_CLIENT_SECRET: !!process.env.VK_CLIENT_SECRET,
+  FEATURE_ADMIN: process.env.FEATURE_ADMIN,
+  ADMIN_PASSWORD_SET: !!process.env.ADMIN_PASSWORD,
+});
+
+// ---- CORS (по умолчанию открыто, можно сузить FRONTEND_URL) ----
+const origin = process.env.FRONTEND_URL || true;
+app.use(cors({ origin, credentials: true }));
+
+// ---- общие middlewares ----
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// health
-app.get(['/', '/health', '/healthz', '/health1'], (_req, res) =>
-  res.json({ ok: true, ts: Date.now() })
-);
+// ---- статика фронта (если используется папка public) ----
+const publicDir = path.join(__dirname, 'public');
+app.use(express.static(publicDir));
 
-// роуты (и дубль под /api для старых ссылок)
-app.use(authRouter);
-app.use('/api', authRouter);
+// ---- маршруты авторизации/апи ----
+app.use('/auth', authRouter);
 
-app.use(adminRouter);
-app.use('/api', adminRouter);
-
-const PORT = process.env.PORT || 10000;
-
-async function bootstrap() {
-  // 1) инициализируем SQLite и миграции
-  await initDB();
-
-  // 2) необязательная инициализация cluster_id (если есть)
-  try {
-    if (typeof ensureClusterId === 'function') {
-      await ensureClusterId();
-    }
-  } catch (e) {
-    console.warn('[BOOT] ensureClusterId skipped:', e?.message || e);
-  }
-
-  // 3) стартуем сервер
-  app.listen(PORT, () => console.log('[BOOT] listening on', PORT));
+// admin включает свою мидлвару авторизации внутри src/routes_admin.js
+if (process.env.FEATURE_ADMIN === 'true' || process.env.FEATURE_ADMIN === '1') {
+  app.use('/admin', adminRouter);
+  console.log('[BOOT] /admin routes enabled');
+} else {
+  console.log('[BOOT] /admin routes disabled (FEATURE_ADMIN not true)');
 }
 
-bootstrap().catch((e) => {
-  console.error('[BOOT] fatal', e);
-  process.exit(1);
+// ---- health-check ----
+app.get('/healthz', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+// ---- SPA fallback (если нужно раздавать index.html для корня) ----
+app.get('/', (req, res) => {
+  res.sendFile(path.join(publicDir, 'index.html'));
+});
+
+// ---- запуск ----
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`[BOOT] up on :${PORT}`);
 });
