@@ -26,6 +26,13 @@ router.get('/summary', async (req, res) => {
   try {
     const TZ = process.env.ADMIN_TZ || 'Europe/Moscow';
 
+    const CTZ = `
+CASE
+  WHEN pg_typeof(created_at) = 'timestamp with time zone'
+    THEN (created_at AT TIME ZONE $1)
+  ELSE ((created_at AT TIME ZONE 'UTC') AT TIME ZONE $1)
+END
+`;
     const u = await db.query('select count(*)::int as c from users');
     let users = u.rows[0]?.c ?? 0;
 
