@@ -62,6 +62,7 @@ if ((process.env.FEATURE_ADMIN || '').toLowerCase() === 'true') {
 
 // Session info для фронта
 
+
 app.get('/api/me', async (req, res) => {
   try {
     const token = req.cookies['sid'];
@@ -75,6 +76,9 @@ app.get('/api/me', async (req, res) => {
     const { rows: urows } = await db.query('select * from users where id=$1', [payload.uid]);
     const user = urows[0];
     if (!user) return res.status(401).json({ ok:false });
+
+    // cookie device id (может помочь, если у старых записей auth_accounts.user_id ещё null)
+    const deviceIdCookie = (req.cookies && req.cookies['device_id']) ? String(req.cookies['device_id']) : null;
 
     // 1) Найдём корень кластера по merged_into (если есть)
     const { rows: rootRows } = await db.query(
@@ -90,8 +94,7 @@ app.get('/api/me', async (req, res) => {
     );
     const ids = new Set(base.rows.map(r => r.id));
 
-    // 3) Расширим по device_id (auth_accounts.meta->>'device_id')
-    // Сначала возьмём все device_id у уже собранных аккаунтов
+    // 3) Расширим по device_id
     let dids = [];
     if (ids.size > 0) {
       const q1 = await db.query(
@@ -100,6 +103,8 @@ app.get('/api/me', async (req, res) => {
       );
       dids = q1.rows.map(r => r.did).filter(Boolean);
     }
+    if (deviceIdCookie) dids = Array.from(new Set([...dids, deviceIdCookie]));
+
     if (dids.length > 0) {
       const q2 = await db.query(
         "select distinct user_id from auth_accounts where user_id is not null and coalesce(meta->>'device_id','') <> '' and meta->>'device_id' = any($1::text[])",
@@ -109,12 +114,11 @@ app.get('/api/me', async (req, res) => {
     }
 
     const clusterIds = Array.from(ids);
+
     // 4) Суммарный баланс
     let effectiveBalance = user.balance ?? 0;
-    if (clusterIds.length > 1) {
-      const s = await db.query("select coalesce(sum(coalesce(balance,0)),0)::int as total from users where id = any($1::int[])", [clusterIds]);
-      effectiveBalance = (s.rows[0] && s.rows[0].total) ? s.rows[0].total : effectiveBalance;
-    }
+    const qsum = await db.query("select coalesce(sum(coalesce(balance,0)),0)::int as total from users where id = any($1::int[])", [clusterIds]);
+    if (qsum.rows && qsum.rows[0]) effectiveBalance = qsum.rows[0].total;
 
     res.json({
       ok: true,
@@ -131,6 +135,7 @@ app.get('/api/me', async (req, res) => {
     res.status(401).json({ ok: false });
   }
 });
+
 
 
 // Client events (аналитика)
