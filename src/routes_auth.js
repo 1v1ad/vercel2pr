@@ -3,7 +3,7 @@ import axios from 'axios';
 import crypto from 'crypto';
 import { createCodeVerifier, createCodeChallenge } from './pkce.js';
 import { signSession } from './jwt.js';
-import { upsertUser, logEvent } from './db.js';
+import { upsertUser, logEvent, db } from './db.js';
 
 const router = express.Router();
 
@@ -128,6 +128,20 @@ router.get('/vk/callback', async (req, res) => {
     await logEvent({ user_id:user.id, event_type:'auth_success', payload:{ vk_id }, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
     const sessionJwt = signSession({ uid: user.id, vk_id: user.vk_id });
+
+    // upsert vk auth_account with device_id and current user_id (for device-based clustering)
+    try {
+      const deviceId = (req.cookies && req.cookies['device_id']) ? String(req.cookies['device_id']) : (req.query && req.query.device_id ? String(req.query.device_id) : null);
+      await db.query(`
+        insert into auth_accounts (user_id, provider, provider_user_id, username, phone_hash, meta)
+        values ($1, 'vk', $2, $3, null, $4)
+        on conflict (provider, provider_user_id) do update set
+          user_id   = coalesce(auth_accounts.user_id, excluded.user_id),
+          username  = coalesce(excluded.username, auth_accounts.username),
+          meta      = jsonb_strip_nulls(coalesce(auth_accounts.meta,'{}'::jsonb) || excluded.meta),
+          updated_at = now()
+      `, [ user.id, String(profile.id), profile.first_name || null, JSON.stringify({ device_id: deviceId || null }) ]);
+    } catch (e) { console.warn('vk auth_account upsert failed', e && e.message); }
     res.cookie('sid', sessionJwt, {
       httpOnly: true,
       sameSite: 'none',

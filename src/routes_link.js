@@ -3,7 +3,18 @@ import { Router } from 'express';
 import { autoMergeByDevice, ensureMetaColumns } from './merge.js';
 import { db } from './db.js';
 
+
 const router = Router();
+
+function getUidFromSid(req){
+  try{
+    const t = (req.cookies && req.cookies['sid']) || null;
+    if(!t) return null;
+    const p = JSON.parse(Buffer.from(t.split('.')[1], 'base64url').toString('utf8'));
+    return p && p.uid || null;
+  }catch(_){ return null; }
+}
+
 
 router.post('/link/background', async (req, res) => {
   try {

@@ -45,12 +45,14 @@ router.all('/callback', async (req, res) => {
       try{
         await db.query(`
           insert into auth_accounts (user_id, provider, provider_user_id, username, phone_hash, meta)
-          values (null, 'tg', $1, $2, null, $3)
+          values ($1, 'tg', $2, $3, null, $4)
           on conflict (provider, provider_user_id) do update set
+            user_id   = coalesce(auth_accounts.user_id, excluded.user_id),
             username  = coalesce(excluded.username,  auth_accounts.username),
             meta      = jsonb_strip_nulls(coalesce(auth_accounts.meta,'{}'::jsonb) || excluded.meta),
             updated_at = now()
         `, [
+          user.id,
           tgId,
           safe(data.username),
           JSON.stringify({ device_id: deviceId || null })
