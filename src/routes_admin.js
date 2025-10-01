@@ -138,8 +138,20 @@ router.get('/summary/daily', async (req, res) => {
 
     // Local-date helpers to avoid TZ drift: for timestamptz convert to TZ then ::date,
     // for timestamp (no tz) take ::date as-is (treat stored local time as already TZ).
-    const LD  = "CASE WHEN pg_typeof(created_at) = 'timestamp with time zone'::regtype THEN (created_at at time zone $2)::date ELSE created_at::date END";
-    const ELD = "CASE WHEN pg_typeof(e.created_at) = 'timestamp with time zone'::regtype THEN (e.created_at at time zone $2)::date ELSE e.created_at::date END";
+    const LD = `
+CASE
+  WHEN pg_typeof(created_at) = 'timestamp with time zone'::regtype
+    THEN (created_at AT TIME ZONE $2)::date
+  ELSE ((created_at AT TIME ZONE 'UTC') AT TIME ZONE $2)::date
+END
+`;
+    const ELD = `
+CASE
+  WHEN pg_typeof(e.created_at) = 'timestamp with time zone'::regtype
+    THEN (e.created_at AT TIME ZONE $2)::date
+  ELSE ((e.created_at AT TIME ZONE 'UTC') AT TIME ZONE $2)::date
+END
+`;
 
     const sql = `
       with bounds as (
