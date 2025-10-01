@@ -1,0 +1,496 @@
+// src/routes_admin.js — add providers[] for users + keep robust behavior
+import { Router } from 'express';
+import { db } from './db.js';
+import { mergeSuggestions } from './merge.js';
+
+const router = Router();
+
+function firstIp(req){
+  const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
+  return ipHeader.split(',')[0].trim();
+}
+
+
+function adminAuth(req, res, next) {
+  const serverPass = (process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD || '').toString();
+  const given = (req.get('X-Admin-Password') || (req.body && req.body.pwd) || req.query.pwd || '').toString();
+  if (!serverPass) return res.status(401).json({ ok:false, error:'admin_password_not_set' });
+  if (given !== serverPass) return res.status(401).json({ ok:false, error:'unauthorized' });
+  next();
+}
+router.use(adminAuth);
+
+router.get('/health', (_req, res) => res.json({ ok:true }));
+
+router.get('/summary', async (req, res) => {
+  try {
+    const TZ = process.env.ADMIN_TZ || 'Europe/Moscow';
+
+    const u = await db.query('select count(*)::int as c from users');
+    let users = u.rows[0]?.c ?? 0;
+
+    const hasT = await db.query("select to_regclass('public.events') as r");
+    if (!hasT.rows[0].r) return res.json({ ok:true, users, events:0, auth7:0, unique7:0 });
+
+    
+    // Определяем доступные колонки и строим фильтр для auth_success
+    const cols = await db.query("select column_name from information_schema.columns where table_schema='public' and table_name='events'");
+    const set = new Set(cols.rows.map(r => r.column_name));
+    const hasType = set.has('type');
+    const hasEventType = set.has('event_type');
+    const parts = [];
+    const AUTH_SET = "('auth_success')";
+    if (hasEventType) parts.push(`event_type in ${AUTH_SET}`);
+    if (hasType)      parts.push(`"type" in ${AUTH_SET}`);
+    const AUTH_WHERE = parts.length ? '(' + parts.join(' or ') + ')' : 'false';
+
+    const e = await db.query('select count(*)::int as c from events');
+    const events = e.rows[0]?.c ?? 0;
+
+    // auth7: только auth_success за 7*24 часа
+    let auth7 = 0;
+    try {
+      const parts = [];
+      const AUTH_SET = "('auth_success')";
+      if (hasEventType) parts.push(`event_type in ${AUTH_SET}`);
+      if (hasType)      parts.push(`\"type\" in ${AUTH_SET}`);
+      const where = parts.length ? '(' + parts.join(' or ') + ')' : 'false';
+      const r = await db.query(
+        `select count(*)::int as c from events where ${AUTH_WHERE} and (created_at at time zone $1) > (now() at time zone $1) - interval '7 days'`,
+        [TZ]
+      );
+      auth7 = r.rows[0]?.c ?? 0;
+    } catch {}
+
+    // unique7: кластерная уникальность (device_id, иначе root_id) среди auth_success за 7*24 часа
+    let unique7 = 0;
+    try {
+      const r = await db.query(
+        `with clusters as (
+           select u.id as user_id, coalesce(nullif(u.meta->>'merged_into','')::int, u.id) as root_id
+         from users u
+       ),
+       root_devices as (
+         select distinct c.root_id, nullif(aa.meta->>'device_id','') as device_id
+           from clusters c
+           left join auth_accounts aa on aa.user_id = c.user_id
+          where coalesce(aa.meta->>'device_id','') <> ''
+       ),
+       device_min_root as (
+         select device_id, min(root_id) as min_root from root_devices group by device_id
+       ),
+       root_component as (
+         select c.root_id, coalesce(min(dmr.min_root), c.root_id) as comp_root
+           from (select distinct root_id from clusters) c
+           left join root_devices rd on rd.root_id = c.root_id
+           left join device_min_root dmr on dmr.device_id = rd.device_id
+          group by c.root_id
+       )
+       select count(distinct rc.comp_root)::int as c
+         from events e
+         join clusters cl on cl.user_id = e.user_id
+         join root_component rc on rc.root_id = cl.root_id
+        where ${AUTH_WHERE}
+          and (e.created_at at time zone $1) > (now() at time zone $1) - interval '7 days'`,
+        [TZ]
+      );
+      unique7 = r.rows[0]?.c ?? 0;
+    } catch {}
+
+    res.json({ ok:true, users, events, auth7, unique7 });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e && e.message || e) });
+  }
+});
+
+// Ежедневная сводка для графика: /api/admin/summary/daily?days=7
+router.get('/summary/daily', async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(31, parseInt(req.query.days || '7', 10) || 7));
+    const TZ = process.env.ADMIN_TZ || 'Europe/Moscow';
+
+    // Определяем наличие колонок, чтобы корректно построить фильтр авторизаций
+    const cols = await db.query(
+      "select column_name from information_schema.columns where table_schema='public' and table_name='events'"
+    );
+    const set = new Set(cols.rows.map(r => r.column_name));
+    const hasType = set.has('type');
+    const hasEventType = set.has('event_type');
+    const hasCreatedAt = set.has('created_at');
+    const hasUserId = set.has('user_id');
+
+    if (!hasCreatedAt || !hasUserId) {
+      return res.json({ ok:true, days: [] });
+    }
+
+    const AUTH_SET = "('auth_success')";
+    const parts = [];
+    if (hasEventType) parts.push(`event_type in ${AUTH_SET}`);
+    if (hasType)      parts.push(`"type" in ${AUTH_SET}`);
+    const AUTH_WHERE = parts.length ? '(' + parts.join(' or ') + ')' : 'false';
+
+    // Local-date helpers to avoid TZ drift: for timestamptz convert to TZ then ::date,
+    // for timestamp (no tz) take ::date as-is (treat stored local time as already TZ).
+    const LD  = "CASE WHEN pg_typeof(created_at) = 'timestamp with time zone'::regtype THEN (created_at at time zone $2)::date ELSE created_at::date END";
+    const ELD = "CASE WHEN pg_typeof(e.created_at) = 'timestamp with time zone'::regtype THEN (e.created_at at time zone $2)::date ELSE e.created_at::date END";
+
+    const sql = `
+      with bounds as (
+        select (date_trunc('day', (now() at time zone $2))::date) as today
+      ),
+      days as (
+        select (select today from bounds) - s as day
+          from generate_series($1::int - 1, 0, -1) s
+         order by day asc
+      ),
+      agg_auth as (
+        select ${LD} as day, count(*)::int as auth
+          from events
+         where ${AUTH_WHERE}
+           and ${LD} >= (select today from bounds) - ($1::int - 1)
+         group by 1
+      ),
+      agg_uniq as (
+        with clusters as (
+          select u.id as user_id, coalesce(nullif(u.meta->>'merged_into','')::int, u.id) as root_id
+            from users u
+        ),
+        root_devices as (
+          select distinct c.root_id, nullif(aa.meta->>'device_id','') as device_id
+            from clusters c
+            left join auth_accounts aa on aa.user_id = c.user_id
+           where coalesce(aa.meta->>'device_id','') <> ''
+        ),
+        device_min_root as (
+          select device_id, min(root_id) as min_root from root_devices group by device_id
+        ),
+        root_component as (
+          select c.root_id, coalesce(min(dmr.min_root), c.root_id) as comp_root
+            from (select distinct root_id from clusters) c
+            left join root_devices rd on rd.root_id = c.root_id
+            left join device_min_root dmr on dmr.device_id = rd.device_id
+           group by c.root_id
+        )
+        select ${ELD} as day,
+               count(distinct rc.comp_root)::int as uniq
+          from events e
+          join clusters cl on cl.user_id = e.user_id
+          join root_component rc on rc.root_id = cl.root_id
+         where ${AUTH_WHERE}
+           and ${ELD} >= (select today from bounds) - ($1::int - 1)
+         group by 1
+      )
+      select to_char(d.day, 'YYYY-MM-DD') as date,
+             coalesce(a.auth, 0) as auth,
+             coalesce(u.uniq, 0)  as "unique"
+        from days d
+        left join agg_auth a on a.day = d.day
+        left join agg_uniq u on u.day = d.day
+       order by d.day asc;
+    `;
+
+    const { rows } = await db.query(sql, [days, TZ]);
+    res.json({ ok:true, days: rows });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e && e.message || e) });
+  }
+});
+
+// USERS with providers list
+router.get('/users', async (req, res) => {
+  try {
+    const search = (req.query.search || '').toString().trim();
+    const limit  = Math.min(100, parseInt(req.query.limit || '50', 10) || 50);
+    const offset = Math.max(0, parseInt(req.query.offset || '0', 10) || 0);
+
+    const params = [];
+    function add(v){ params.push(v); return '$' + params.length; }
+
+    let where = "where coalesce(u.meta->>'merged_into','') = ''";
+    if (search) {
+      const p = add('%' + search + '%');
+      where += ' and (cast(u.vk_id as text) ilike ' + p + ' or u.first_name ilike ' + p + ' or u.last_name ilike ' + p + ')';
+    }
+
+    const sql = [
+      'select u.id, u.vk_id, u.first_name, u.last_name, u.avatar, u.balance,',
+      '       u.country_code, u.country_name, u.created_at, u.updated_at,',
+      '       coalesce(array_agg(distinct aa.provider) filter (where aa.user_id is not null), \'{}\') as providers',
+      '  from users u',
+      '  left join auth_accounts aa on aa.user_id = u.id',
+      where,
+      ' group by u.id, u.vk_id, u.first_name, u.last_name, u.avatar, u.balance, u.country_code, u.country_name, u.created_at, u.updated_at',
+      ' order by u.id desc',
+      ' limit ' + add(limit) + ' offset ' + add(offset)
+    ].join('\n');
+
+    const r = await db.query(sql, params);
+    res.json({ ok:true, users:r.rows });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e && e.message || e) });
+  }
+});
+
+router.get('/events', async (req, res) => {
+  try {
+    const cols = await db.query("select column_name from information_schema.columns where table_schema='public' and table_name='events'");
+    const set = new Set(cols.rows.map(r => r.column_name));
+    const hasType = set.has('type');
+    const hasEventType = set.has('event_type');
+    const hasIp = set.has('ip');
+    const hasUa = set.has('ua');
+    const hasCreated = set.has('created_at');
+
+    const params = [];
+    function add(v){ params.push(v); return '$' + params.length; }
+
+    const selectCols = ['id', 'user_id'];
+    if (hasEventType) selectCols.push('event_type'); else selectCols.push("NULL::text as event_type");
+    if (hasType)      selectCols.push('\"type\"'); else selectCols.push("NULL::text as type");
+    if (hasIp) selectCols.push('ip'); else selectCols.push("NULL::text as ip");
+    if (hasUa) selectCols.push('ua'); else selectCols.push("NULL::text as ua");
+    if (hasCreated) selectCols.push('created_at'); else selectCols.push('now() as created_at');
+
+    const conds = [];
+    const type = (req.query.type || '').toString().trim();
+    const event_type = (req.query.event_type || '').toString().trim();
+    const user_id = parseInt((req.query.user_id || '').toString(), 10) || null;
+    const ip = (req.query.ip || '').toString().trim();
+    const ua = (req.query.ua || '').toString().trim();
+
+    if (type && hasType)            conds.push('\"type\" = ' + add(type));
+    if (event_type && hasEventType) conds.push('event_type = ' + add(event_type));
+    if (user_id) {
+      let rootId = parseInt(user_id, 10) || 0;
+      if (rootId) {
+        try {
+          const q = await db.query("select coalesce(nullif(u.meta->>'merged_into','')::int, u.id) as root_id from users u where u.id=$1", [rootId]);
+          if (q.rows && q.rows[0] && q.rows[0].root_id) rootId = q.rows[0].root_id;
+        } catch {}
+      }
+      conds.push('user_id = ' + add(rootId));
+    }
+    if (ip && hasIp)                conds.push('ip = ' + add(ip));
+    if (ua && hasUa)                conds.push('ua ilike ' + add('%' + ua + '%'));
+
+    const where = conds.length ? (' where ' + conds.join(' and ')) : '';
+
+    const limit  = Math.min(200, parseInt(req.query.limit || '50', 10) || 50);
+    const offset = Math.max(0, parseInt(req.query.offset || '0', 10) || 0);
+
+    const sql = 'select ' + selectCols.join(', ') + ' from events' + where + ' order by id desc limit ' + add(limit) + ' offset ' + add(offset);
+    const r = await db.query(sql, params);
+    res.json({ ok:true, events:r.rows });
+
+// Manual topups list
+router.get('/topups', async (req, res) => {
+  try {
+    const limit  = Math.min(200, parseInt(req.query.limit || '50', 10) || 50);
+    const offset = Math.max(0, parseInt(req.query.offset || '0', 10) || 0);
+    const { rows } = await db.query(
+      "select id, admin_name, admin_ip, ua, user_id, amount, reason, created_at from admin_topups order by id desc limit $1 offset $2",
+      [limit, offset]
+    );
+    res.json({ ok:true, topups: rows });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e && e.message || e) });
+  }
+});
+
+
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e && e.message || e) });
+  }
+});
+
+router.post('/users/:id/topup', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const amount = parseInt((req.body && req.body.amount) || '0', 10) || 0;
+    const reason = (((req.body && req.body.reason) || '') + '').trim();
+    if (!id || !Number.isFinite(amount)) return res.status(400).json({ ok:false, error:'bad_args' });
+
+    // строгая валидация причины
+    const t = reason.trim();
+    const bad = (!t) || (t.length < 4) || (/^[\s._-]+$/.test(t)) || (/^\d{1,6}$/.test(t)) || (/^(\d)\1{2,}$/.test(t));
+    if (bad) return res.status(400).json({ ok:false, error:'bad_reason' });
+
+    // Кластер собираем для аналитики, но баланс меняем только у указанного id
+    let clusterIds = [id];
+    try {
+      await db.query("alter table users add column if not exists meta jsonb default '{}'::jsonb");
+      const rootQ = await db.query("select coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id=$1", [id]);
+      const rootId = rootQ.rows && rootQ.rows[0] && rootQ.rows[0].root_id ? rootQ.rows[0].root_id : id;
+      const baseQ = await db.query("select id from users where id=$1 or (meta->>'merged_into')::int = $1", [rootId]);
+      const set = new Set(baseQ.rows.map(r => r.id));
+      const didsQ = await db.query("select distinct meta->>'device_id' as did from auth_accounts where user_id = any($1::int[]) and coalesce(meta->>'device_id','') <> ''", [Array.from(set)]);
+      const dids = didsQ.rows.map(r => r.did).filter(Boolean);
+      if (dids.length) {
+        const moreQ = await db.query("select distinct user_id from auth_accounts where user_id is not null and coalesce(meta->>'device_id','') <> '' and meta->>'device_id' = any($1::text[])", [dids]);
+        for (const r of moreQ.rows) set.add(r.user_id);
+      }
+      clusterIds = Array.from(set);
+
+      const client = await db.connect();
+      try {
+        await client.query('BEGIN');
+
+        // Транзакция — на указанного пользователя
+        try {
+          await client.query(
+            "insert into transactions (user_id, type, amount, meta) values ($1,$2,$3,$4)",
+            [id, amount>=0 ? 'admin_topup' : 'admin_adjust', Math.abs(amount), JSON.stringify({ reason, cluster_ids: clusterIds })]
+          );
+        } catch {}
+
+        // Событие — на root
+        try {
+          const r = await db.query("select coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id=$1", [id]);
+          const rootId2 = r.rows && r.rows[0] && r.rows[0].root_id ? r.rows[0].root_id : id;
+          await client.query("insert into events (user_id, event_type, payload) values ($1,$2,$3)", [rootId2, 'admin_topup', { amount, requested_user_id:id, reason, cluster_ids: clusterIds }]);
+        } catch {}
+
+        // Меняем баланс ТОЛЬКО указанного пользователя
+        await client.query("update users set balance = coalesce(balance,0) + $2, updated_at = now() where id = $1", [id, amount]);
+
+        // Лог админ-операции
+        try {
+          const adminName = ((req.get('X-Admin-Name') || req.body?.admin_name || req.query?.admin_name || '') + '').trim().slice(0,64) || 'owner';
+          const ip = firstIp(req);
+          const ua = (req.headers['user-agent'] || '').slice(0,256);
+          const headers = { 'x-admin-name': adminName, 'x-admin-password': req.get('X-Admin-Password') ? '***' : undefined };
+          await client.query("insert into admin_topups (admin_name, admin_ip, ua, user_id, amount, reason, headers) values ($1,$2,$3,$4,$5,$6,$7)", [adminName, ip, ua, id, amount, reason, headers]);
+        } catch {}
+
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK'); throw e;
+      } finally {
+        client.release();
+      }
+    } catch {}
+
+    res.json({ ok:true, user_id: id });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e && e.message || e) });
+  }
+});
+
+router.post('/users/merge', async (req, res) => {
+  try {
+    const primaryId = parseInt((req.body && req.body.primary_id) || (req.query && req.query.primary_id) || '0', 10);
+    const secondaryId = parseInt((req.body && req.body.secondary_id) || (req.query && req.query.secondary_id) || '0', 10);
+    if (!primaryId || !secondaryId || primaryId === secondaryId) return res.status(400).json({ ok:false, error:'bad_args' });
+
+    await db.query("alter table users add column if not exists meta jsonb default '{}'::jsonb");
+
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('update auth_accounts set user_id=$1 where user_id=$2', [primaryId, secondaryId]);
+      try { await client.query('update transactions set user_id=$1 where user_id=$2', [primaryId, secondaryId]); } catch {}
+      try { await client.query('update events set user_id=$1 where user_id=$2', [primaryId, secondaryId]); } catch {}
+      await client.query('update users u set balance = coalesce(u.balance,0) + (select coalesce(balance,0) from users where id=$2) where id=$1', [primaryId, secondaryId]);
+      await client.query(
+        "update users p set first_name = coalesce(nullif(p.first_name,''), s.first_name), last_name = coalesce(nullif(p.last_name,''), s.last_name), username = coalesce(nullif(p.username,''), s.username), avatar = coalesce(nullif(p.avatar,''), s.avatar), country_code = coalesce(nullif(p.country_code,''), s.country_code) from users s where p.id=$1 and s.id=$2",
+        [primaryId, secondaryId]
+      );
+      await client.query("update users set balance=0, meta = jsonb_set(coalesce(meta,'{}'::jsonb), '{merged_into}', to_jsonb($1)::jsonb), updated_at=now() where id=$2", [primaryId, secondaryId]);
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK'); throw e;
+    } finally {
+      client.release();
+    }
+    res.json({ ok:true });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e && e.message || e) });
+  }
+});
+
+router.get('/users/merge/suggestions', async (_req, res) => {
+  try {
+    const list = await mergeSuggestions(200);
+    res.json({ ok:true, list });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e && e.message || e) });
+  }
+});
+// --- DAILY STATS (alias: /summary/daily и /daily) ---
+router.get(['/summary/daily', '/daily'], async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(31, parseInt(req.query.days || '7', 10) || 7));
+    const TZ = process.env.ADMIN_TZ || 'Europe/Moscow';
+
+    const hasT = await db.query("select to_regclass('public.events') as r");
+    if (!hasT.rows[0].r) {
+      const labels = Array.from({ length: days }, (_, i) => {
+        const d = new Date(); d.setDate(d.getDate() - (days - 1 - i));
+        return d.toISOString().slice(0,10);
+      });
+      return res.json({ ok:true, labels, auth:Array(days).fill(0), unique:Array(days).fill(0) });
+    }
+
+    const cols = await db.query(
+      "select column_name from information_schema.columns where table_schema='public' and table_name='events'"
+    );
+    const set = new Set(cols.rows.map(r => r.column_name));
+    const hasType      = set.has('type');
+    const hasEventType = set.has('event_type');
+    const hasCreated   = set.has('created_at');
+
+    if (!hasCreated) {
+      const labels = Array.from({ length: days }, (_, i) => {
+        const d = new Date(); d.setDate(d.getDate() - (days - 1 - i));
+        return d.toISOString().slice(0,10);
+      });
+      return res.json({ ok:true, labels, auth:Array(days).fill(0), unique:Array(days).fill(0) });
+    }
+
+    const parts = [];
+    if (hasEventType) parts.push("event_type in ('auth_success')");
+    if (hasType)      parts.push(' "type" in (\'auth_success\') ');
+    const authCond = parts.length ? '(' + parts.join(' or ') + ')' : 'false';
+
+    const sql = `
+      with days as (
+        select generate_series(date_trunc('day', (now() at time zone $2)) - ($1::int - 1) * interval '1 day',
+                               date_trunc('day', (now() at time zone $2)),
+                               interval '1 day') as d
+      ),
+      auth as (
+        select date_trunc('day', (created_at at time zone $2)) as d, count(*)::int as c
+          from events
+         where ${authCond}
+         group by 1
+      ),
+      uniq as (
+        select date_trunc('day', (e.created_at at time zone $2)) as d,
+               count(distinct coalesce(aa.meta->>'device_id', 'root:'||coalesce(nullif(u.meta->>'merged_into','')::int, u.id)::text))::int as c
+          from events e
+          join users u on u.id = e.user_id
+          left join auth_accounts aa on aa.user_id = u.id and coalesce(aa.meta->>'device_id','') <> ''
+         where ${authCond}
+         group by 1
+      )
+      select to_char(days.d, 'YYYY-MM-DD') as day,
+             coalesce(auth.c, 0)   as auth,
+             coalesce(uniq.c, 0)   as uniq
+        from days
+        left join auth on auth.d = days.d
+        left join uniq on uniq.d = days.d
+       order by days.d;
+    `;
+
+    const r = await db.query(sql, [days, TZ]);
+    const labels = r.rows.map(x => x.day);
+    const auth   = r.rows.map(x => x.auth);
+    const unique = r.rows.map(x => x.uniq);
+
+    res.json({ ok:true, labels, auth, unique });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e && e.message || e) });
+  }
+});
+
+export default router;
