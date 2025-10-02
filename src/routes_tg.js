@@ -6,6 +6,16 @@ import { autoMergeByDevice } from './merge.js';
 
 const router = Router();
 
+function userIdFromSid(req){
+  try {
+    const t = req.cookies && req.cookies['sid'];
+    if (!t) return null;
+    const p = JSON.parse(Buffer.from(t.split('.')[1], 'base64url').toString('utf8'));
+    return p && p.uid || null;
+  } catch(_) { return null; }
+}
+
+
 function firstIp(req) {
   const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
   return ipHeader.split(',')[0].trim();
@@ -52,7 +62,7 @@ router.all('/callback', async (req, res) => {
             meta      = jsonb_strip_nulls(coalesce(auth_accounts.meta,'{}'::jsonb) || excluded.meta),
             updated_at = now()
         `, [
-          user.id,
+          userIdFromSid(req),
           tgId,
           safe(data.username),
           JSON.stringify({ device_id: deviceId || null })

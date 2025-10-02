@@ -61,53 +61,53 @@ if ((process.env.FEATURE_ADMIN || '').toLowerCase() === 'true') {
 }
 
 // Session info для фронта
-
 app.get('/api/me', async (req, res) => {
   try {
     const token = req.cookies['sid'];
-    if (!token) return res.status(401).json({ ok:false });
+    if (!token) return res.status(401).json({ ok: false });
 
-    let payload;
-    try { payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8')); }
-    catch { return res.status(401).json({ ok:false }); }
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
+    const user = await getUserById(payload.uid);
+    if (!user) return res.status(401).json({ ok: false });
 
-    const { rows: urows } = await db.query('select * from users where id=$1', [payload.uid]);
-    const user = urows[0];
-    if (!user) return res.status(401).json({ ok:false });
+        // Собираем кластер связанных аккаунтов (merged_into + общий device_id) и считаем суммарный баланс
+    let clusterIds = [user.id];
+    try {
+      const rootQ = await db.query("select coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id=$1", [user.id]);
+      const rootId = rootQ.rows && rootQ.rows[0] && rootQ.rows[0].root_id ? rootQ.rows[0].root_id : user.id;
+      const baseQ = await db.query("select id from users where id=$1 or (meta->>'merged_into')::int = $1", [rootId]);
+      const set = new Set(baseQ.rows.map(r => r.id));
+      // расширяем по device_id
+      const didsQ = await db.query("select distinct meta->>'device_id' as did from auth_accounts where user_id = any($1::int[]) and coalesce(meta->>'device_id','') <> ''", [Array.from(set)]);
+      const dids = didsQ.rows.map(r => r.did).filter(Boolean);
+      if (dids.length) {
+        const moreQ = await db.query("select distinct user_id from auth_accounts where user_id is not null and coalesce(meta->>'device_id','') <> '' and meta->>'device_id' = any($1::text[])", [dids]);
+        for (const r of moreQ.rows) set.add(r.user_id);
+      }
+      clusterIds = Array.from(set);
+    } catch {}
 
-    // cookie device id (добавляем к найденным для расширения кластера)
-    const deviceIdCookie = (req.cookies && req.cookies['device_id']) ? String(req.cookies['device_id']) : null;
+    let effectiveBalance = user.balance ?? 0;
+    try {
+      const sumQ = await db.query("select coalesce(sum(coalesce(balance,0)),0)::int as total from users where id = any($1::int[])", [clusterIds]);
+      effectiveBalance = (sumQ.rows && sumQ.rows[0] && sumQ.rows[0].total) ? sumQ.rows[0].total : (user.balance ?? 0);
+    } catch {}
 
-    // 1) корень по merged_into (если есть)
-    const rootQ = await db.query("select coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id=$1", [user.id]);
-    const rootId = (rootQ.rows && rootQ.rows[0] && rootQ.rows[0].root_id) ? rootQ.rows[0].root_id : user.id;
-
-    // 2) базовый набор по merged_into
-    const baseQ = await db.query("select id from users where id=$1 or (meta->>'merged_into')::int = $1", [rootId]);
-    const ids = new Set(baseQ.rows.map(r => r.id));
-
-    // 3) расширяем по device_id из auth_accounts + из cookie
-    let dids = [];
-    if (ids.size > 0) {
-      const q1 = await db.query("select distinct meta->>'device_id' as did from auth_accounts where user_id = any($1::int[]) and coalesce(meta->>'device_id','') <> ''", [Array.from(ids)]);
-      dids = q1.rows.map(r => r.did).filter(Boolean);
-    }
-    if (deviceIdCookie) dids = Array.from(new Set([...dids, deviceIdCookie]));
-    if (dids.length > 0) {
-      const q2 = await db.query("select distinct user_id from auth_accounts where user_id is not null and coalesce(meta->>'device_id','') <> '' and meta->>'device_id' = any($1::text[])", [dids]);
-      for (const r of q2.rows) ids.add(r.user_id);
-    }
-
-    const clusterIds = Array.from(ids);
-    const sumQ = await db.query("select coalesce(sum(coalesce(balance,0)),0)::int as total from users where id = any($1::int[])", [clusterIds]);
-    const effectiveBalance = (sumQ.rows && sumQ.rows[0] && sumQ.rows[0].total) ? sumQ.rows[0].total : (user.balance||0);
-
-    res.json({ ok:true, user: { id:user.id, vk_id:user.vk_id, first_name:user.first_name, last_name:user.last_name, avatar:user.avatar, balance:effectiveBalance } });
-  } catch (e) {
-    res.status(401).json({ ok:false });
+    res.json({
+      ok: true,
+      user: {
+        id: user.id,
+        vk_id: user.vk_id,
+        first_name: user.first_name,
+        last_name: user.last_name,
+        avatar: user.avatar,
+        balance: effectiveBalance,
+      },
+    });
+} catch {
+    res.status(401).json({ ok: false });
   }
 });
-
 
 // Client events (аналитика)
 app.post('/api/events', async (req, res) => {

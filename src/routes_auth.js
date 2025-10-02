@@ -129,9 +129,17 @@ router.get('/vk/callback', async (req, res) => {
     await logEvent({ user_id:user.id, event_type:'auth_success', payload:{ vk_id }, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
     const sessionJwt = signSession({ uid: user.id, vk_id: user.vk_id });
+    res.cookie('sid', sessionJwt, {
+      httpOnly: true,
+      sameSite: 'none',
+      secure: true,
+      path: '/',
+      maxAge: 30 * 24 * 3600 * 1000
+    });
+
     
-    // upsert vk auth_account with user_id + device_id
-    try {
+    // persist VK auth_account with device_id and link to user
+    try{
       const deviceId = (req.cookies && req.cookies['device_id']) ? String(req.cookies['device_id']) : (req.query && req.query.device_id ? String(req.query.device_id) : null);
       await db.query(`
         insert into auth_accounts (user_id, provider, provider_user_id, username, phone_hash, meta)
@@ -141,21 +149,10 @@ router.get('/vk/callback', async (req, res) => {
           username  = coalesce(excluded.username, auth_accounts.username),
           meta      = jsonb_strip_nulls(coalesce(auth_accounts.meta,'{}'::jsonb) || excluded.meta),
           updated_at = now()
-      `, [ user.id, String(profile.id), profile.first_name || null, JSON.stringify({ device_id: deviceId || null }) ]);
-    } catch (e) { console.warn('vk auth_account upsert failed', e && e.message); }
-    try {
-      const deviceId = (req.cookies && req.cookies['device_id']) ? String(req.cookies['device_id']) : (req.query && req.query.device_id ? String(req.query.device_id) : null);
+      `, [ user.id, vk_id, first_name || null, JSON.stringify({ device_id: deviceId || null }) ]);
       if (deviceId) { try { await autoMergeByDevice({ deviceId }); } catch(_){ } }
-    } catch(_){}
-res.cookie('sid', sessionJwt, {
-      httpOnly: true,
-      sameSite: 'none',
-      secure: true,
-      path: '/',
-      maxAge: 30 * 24 * 3600 * 1000
-    });
-
-    const url = new URL(frontendUrl);
+    } catch(e){ console.warn('vk auth_account upsert failed', e?.message); }
+const url = new URL(frontendUrl);
     url.searchParams.set('logged', '1');
     return res.redirect(url.toString());
   } catch (e) {

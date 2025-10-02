@@ -22,34 +22,17 @@ router.use(adminAuth);
 
 router.get('/health', (_req, res) => res.json({ ok:true }));
 
-router.post('/repair/auth_accounts', adminAuth, async (req, res) => {
-  try {
-    const r1 = await db.query(`
-      update auth_accounts a
-         set user_id = u.id, updated_at = now()
-        from users u
-       where a.user_id is null
-         and a.provider = 'vk'
-         and u.vk_id::text = a.provider_user_id
-         and a.provider_user_id ~ '^[0-9]+$'`);
-    const r2 = await db.query(`
-      update auth_accounts a
-         set user_id = u.id, updated_at = now()
-        from users u
-       where a.user_id is null
-         and a.provider = 'tg'
-         and u.vk_id = ('tg:' || a.provider_user_id)`);
-    res.json({ ok:true, fixed_vk: (r1.rowCount||0), fixed_tg: (r2.rowCount||0) });
-  } catch (e) {
-    res.status(500).json({ ok:false, error:String(e?.message||e) });
-  }
-});
-
-
 router.get('/summary', async (req, res) => {
   try {
     const TZ = process.env.ADMIN_TZ || 'Europe/Moscow';
 
+    const CTZ = `
+CASE
+  WHEN pg_typeof(created_at) = 'timestamp with time zone'
+    THEN (created_at AT TIME ZONE $1)
+  ELSE ((created_at AT TIME ZONE 'UTC') AT TIME ZONE $1)
+END
+`;
     const u = await db.query('select count(*)::int as c from users');
     let users = u.rows[0]?.c ?? 0;
 
@@ -155,8 +138,20 @@ router.get('/summary/daily', async (req, res) => {
 
     // Local-date helpers to avoid TZ drift: for timestamptz convert to TZ then ::date,
     // for timestamp (no tz) take ::date as-is (treat stored local time as already TZ).
-    const LD  = "CASE WHEN pg_typeof(created_at) = 'timestamp with time zone'::regtype THEN (created_at at time zone $2)::date ELSE created_at::date END";
-    const ELD = "CASE WHEN pg_typeof(e.created_at) = 'timestamp with time zone'::regtype THEN (e.created_at at time zone $2)::date ELSE e.created_at::date END";
+    const LD = `
+CASE
+  WHEN pg_typeof(created_at) = 'timestamp with time zone'::regtype
+    THEN (created_at AT TIME ZONE $2)::date
+  ELSE ((created_at AT TIME ZONE 'UTC') AT TIME ZONE $2)::date
+END
+`;
+    const ELD = `
+CASE
+  WHEN pg_typeof(e.created_at) = 'timestamp with time zone'::regtype
+    THEN (e.created_at AT TIME ZONE $2)::date
+  ELSE ((e.created_at AT TIME ZONE 'UTC') AT TIME ZONE $2)::date
+END
+`;
 
     const sql = `
       with bounds as (
