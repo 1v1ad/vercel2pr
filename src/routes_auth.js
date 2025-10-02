@@ -6,6 +6,7 @@ import { signSession } from './jwt.js';
 import { upsertUser, logEvent, db } from './db.js';
 
 const router = express.Router();
+import { autoMergeByDevice } from './merge.js';
 
 function getenv() {
   const env = process.env;
@@ -128,8 +129,8 @@ router.get('/vk/callback', async (req, res) => {
     await logEvent({ user_id:user.id, event_type:'auth_success', payload:{ vk_id }, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
     const sessionJwt = signSession({ uid: user.id, vk_id: user.vk_id });
-
-    // upsert vk auth_account with device_id and current user_id (for device-based clustering)
+    
+    // upsert vk auth_account with user_id + device_id
     try {
       const deviceId = (req.cookies && req.cookies['device_id']) ? String(req.cookies['device_id']) : (req.query && req.query.device_id ? String(req.query.device_id) : null);
       await db.query(`
@@ -142,7 +143,11 @@ router.get('/vk/callback', async (req, res) => {
           updated_at = now()
       `, [ user.id, String(profile.id), profile.first_name || null, JSON.stringify({ device_id: deviceId || null }) ]);
     } catch (e) { console.warn('vk auth_account upsert failed', e && e.message); }
-    res.cookie('sid', sessionJwt, {
+    try {
+      const deviceId = (req.cookies && req.cookies['device_id']) ? String(req.cookies['device_id']) : (req.query && req.query.device_id ? String(req.query.device_id) : null);
+      if (deviceId) { try { await autoMergeByDevice({ deviceId }); } catch(_){ } }
+    } catch(_){}
+res.cookie('sid', sessionJwt, {
       httpOnly: true,
       sameSite: 'none',
       secure: true,

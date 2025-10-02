@@ -3,7 +3,6 @@ import { Router } from 'express';
 import { autoMergeByDevice, ensureMetaColumns } from './merge.js';
 import { db } from './db.js';
 
-
 const router = Router();
 
 function getUidFromSid(req){

@@ -24,7 +24,6 @@ router.get('/health', (_req, res) => res.json({ ok:true }));
 
 router.post('/repair/auth_accounts', adminAuth, async (req, res) => {
   try {
-    // Заполняем user_id у VK аккаунтов
     const r1 = await db.query(`
       update auth_accounts a
          set user_id = u.id, updated_at = now()
@@ -32,20 +31,17 @@ router.post('/repair/auth_accounts', adminAuth, async (req, res) => {
        where a.user_id is null
          and a.provider = 'vk'
          and u.vk_id::text = a.provider_user_id
-         and a.provider_user_id ~ '^[0-9]+$'
-      returning a.id`);
-    // Заполняем user_id у TG аккаунтов (users.vk_id = 'tg:<id>')
+         and a.provider_user_id ~ '^[0-9]+$'`);
     const r2 = await db.query(`
       update auth_accounts a
          set user_id = u.id, updated_at = now()
         from users u
        where a.user_id is null
          and a.provider = 'tg'
-         and u.vk_id = ('tg:' || a.provider_user_id)
-      returning a.id`);
-    res.json({ ok:true, fixed_vk: r1.rowCount || (r1.rows ? r1.rows.length : 0), fixed_tg: r2.rowCount || (r2.rows ? r2.rows.length : 0) });
+         and u.vk_id = ('tg:' || a.provider_user_id)`);
+    res.json({ ok:true, fixed_vk: (r1.rowCount||0), fixed_tg: (r2.rowCount||0) });
   } catch (e) {
-    res.status(500).json({ ok:false, error:String(e?.message || e) });
+    res.status(500).json({ ok:false, error:String(e?.message||e) });
   }
 });
 
