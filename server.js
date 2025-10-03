@@ -1,22 +1,14 @@
-// server.js — backend for vercel2pr
-// ──────────────────────────────────────────────────────────────────────────────
-// Включает:
-//  - динамический CORS с поддержкой Netlify Deploy Preview
-//  - /api/me: суммарный баланс по кластеру (VK+TG+device) + merged_into
-//  - /api/events: сбор аналитики
-//  - роуты: /api/auth/*, /api/tg/*, /api/link/*, /api/admin/*
-//  - trust proxy, cookies, json, логгирование
-// ──────────────────────────────────────────────────────────────────────────────
-
-// вариант А — короче и обычно удобнее
+// ─────────────────────────────────────────────────────────────
+// GG Room — backend (Render)
+// Этот файл — единая точка входа. Render запускает его через npm start.
+// ─────────────────────────────────────────────────────────────
 import 'dotenv/config';
+
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import morgan from 'morgan';
 import bodyParser from 'body-parser';
-import path from 'path';
-import { fileURLToPath } from 'url';
 
 import { db, ensureTables } from './src/db.js';
 import adminRoutes from './src/routes_admin.js';
@@ -24,136 +16,112 @@ import authRoutes from './src/routes_auth.js';
 import tgRoutes from './src/routes_tg.js';
 import linkRoutes from './src/routes_link.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
+// ─────────────────────────────────────────────────────────────
+// Настройки порта и базового URL фронта
+// ─────────────────────────────────────────────────────────────
+const PORT = Number(process.env.PORT || 3000);
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://sweet-twilight-63a9b6.netlify.app';
 
 const app = express();
-app.set('trust proxy', true);
 
-// ──────────────────────────────────────────────────────────────────────────────
-// CORS (динамический origin + credentials:true)
-// Разрешаем основной фронт и превью: https://deploy-preview-XX--sweet-twilight-63a9b6.netlify.app
-// Обнови FRONTEND_URL при необходимости.
-// ──────────────────────────────────────────────────────────────────────────────
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
-const allowList = new Set([
-  FRONTEND_URL,
-  'http://localhost:5173',
-  'https://sweet-twilight-63a9b6.netlify.app',
-]);
-
-function isAllowedOrigin(origin) {
-  if (!origin) return true; // curl / same-origin
-  if (allowList.has(origin)) return true;
+// ─────────────────────────────────────────────────────────────
+// CORS: позволяем onrender.com, *.netlify.app, localhost
+// с поддержкой credentials (cookies)
+// ─────────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  const origin = req.headers.origin || '';
+  let allow = false;
   try {
-    const { hostname, protocol } = new URL(origin);
-    if (!/^https?:$/.test(protocol)) return false;
-    // Любые превью Netlify для этого сайта:
-    // https://deploy-preview-<n>--sweet-twilight-63a9b6.netlify.app
-    if (hostname.endsWith('--sweet-twilight-63a9b6.netlify.app')) return true;
+    const h = new URL(origin).hostname;
+    allow =
+      h.endsWith('.netlify.app') ||
+      h.endsWith('netlify.app') ||
+      h.endsWith('.onrender.com') ||
+      h === 'localhost' || h.endsWith('.localhost');
   } catch (_) {}
-  return false;
-}
+  if (allow) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
-const corsOptions = {
-  origin: (origin, cb) => cb(null, isAllowedOrigin(origin)),
-  credentials: true,
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  methods: ['GET', 'POST', 'OPTIONS'],
-};
-
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Parsers & logging
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Общие middleware
+// ─────────────────────────────────────────────────────────────
+app.use(morgan('tiny'));
 app.use(cookieParser());
 app.use(bodyParser.json({ limit: '1mb' }));
-app.use(morgan('dev'));
+app.use(bodyParser.urlencoded({ extended: true }));
 
-// ──────────────────────────────────────────────────────────────────────────────
-// База и таблицы
-// ──────────────────────────────────────────────────────────────────────────────
-await ensureTables();
-
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // Вспомогалки
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 function firstIp(req) {
   const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
   return ipHeader.split(',')[0].trim();
 }
 
-async function getUserById(id) {
-  const { rows } = await db.query('select * from users where id=$1', [id]);
-  return rows[0] || null;
-}
-
-// Дешифровка sid без проверки подписи (как в роут-пакетах)
 function uidFromSid(req) {
   try {
-    const t = req.cookies && req.cookies.sid;
+    const t = (req.cookies && req.cookies['sid']) || null;
     if (!t) return null;
     const p = JSON.parse(Buffer.from(t.split('.')[1], 'base64url').toString('utf8'));
-    return p && p.uid || null;
-  } catch (_) {
+    return (p && p.uid) || null;
+  } catch {
     return null;
   }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// /api/me — суммарный баланс по кластеру (VK+TG+device + merged_into)
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// API: /api/me — возвращает пользователя и СУММАРНЫЙ баланс по кластеру
+// (объединение VK+TG+device, плюс merged_into)
+// ─────────────────────────────────────────────────────────────
 app.get('/api/me', async (req, res) => {
   try {
     const uid = uidFromSid(req);
-    if (!uid) return res.status(401).json({ ok: false });
+    if (!uid) return res.json({ ok: false });
 
-    const user = await getUserById(uid);
-    if (!user) return res.status(401).json({ ok: false });
+    const { rows: r0 } = await db.query('select * from users where id=$1 limit 1', [uid]);
+    if (!r0.length) return res.json({ ok: false });
+    const user = r0[0];
 
+    // собираем кластер id по session user
     const ids = new Set([user.id]);
 
-    // 1) расширяем кластер через merged_into (корень + участники)
-    const rootsQ = await db.query(
-      "select id, coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id = any($1::int[])",
-      [[user.id]]
+    // 1) находим "root" по merged_into
+    const { rows: rRoot } = await db.query(
+      "select id, coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id=$1",
+      [user.id]
     );
-    const extraRoots = new Set();
-    for (const row of rootsQ.rows) {
-      if (row.root_id && !ids.has(row.root_id)) extraRoots.add(row.root_id);
-    }
-    for (const root of extraRoots) ids.add(root);
-    if (extraRoots.size) {
-      const membersQ = await db.query(
-        "select id from users where (meta->>'merged_into')::int = any($1::int[])",
-        [Array.from(extraRoots)]
-      );
-      for (const row of membersQ.rows) ids.add(row.id);
-    }
+    const rootId = rRoot[0]?.root_id || user.id;
+    ids.add(rootId);
 
-    // 2) собираем device_id из cookie и учётных записей, связанных с пользователем
-    const dids = new Set();
-    const deviceCookie = req.cookies && req.cookies['device_id'] ? String(req.cookies['device_id']) : null;
-    if (deviceCookie) dids.add(deviceCookie);
-
-    const q1 = await db.query(
-      "select distinct nullif(meta->>'device_id','') as did from auth_accounts where user_id = any($1::int[]) and coalesce(meta->>'device_id','') <> ''",
-      [[user.id]]
+    // 2) добавляем всех, кто в этот root слит
+    const { rows: rMembers } = await db.query(
+      "select id from users where (meta->>'merged_into')::int = $1",
+      [rootId]
     );
-    for (const r of q1.rows) if (r.did) dids.add(r.did);
+    for (const r of rMembers) ids.add(r.id);
 
-    const didList = Array.from(dids);
+    // 3) device_id из cookie
+    const deviceIdCookie = (req.cookies && req.cookies['device_id']) ? String(req.cookies['device_id']) : null;
+    const dids = [];
+    if (deviceIdCookie) dids.push(deviceIdCookie);
 
-    // 3) по device_id подтягиваем user_id из auth_accounts + fallback через provider_user_id
-    if (didList.length) {
+    // 4) по device_id тянем user_id из auth_accounts
+    if (dids.length) {
       const q2 = await db.query(
         "select distinct user_id from auth_accounts where user_id is not null and coalesce(meta->>'device_id','')<>'' and meta->>'device_id' = any($1::text[])",
-        [didList]
+        [dids]
       );
-      for (const r of q2.rows) if (r.user_id) ids.add(r.user_id);
+      for (const r of q2.rows) ids.add(r.user_id);
 
+      // фоллбек через provider_user_id → users
       const q2b = await db.query(`
         select distinct
           case
@@ -162,30 +130,29 @@ app.get('/api/me', async (req, res) => {
             else null
           end as uid
         from auth_accounts a
-        where coalesce(a.meta->>'device_id','') <> ''
-          and a.meta->>'device_id' = any($1::text[])
-      `, [didList]);
+        where coalesce(a.meta->>'device_id','')<>'' and a.meta->>'device_id' = any($1::text[])
+      `, [dids]);
       for (const r of q2b.rows) if (r.uid) ids.add(r.uid);
     }
 
-    // 4) финально снова расширим по merged_into на случай, если подтянули новые id
+    // 5) ещё раз добавим root/members для всех найденных
     if (ids.size) {
       const allIds = Array.from(ids);
-      const rootsQ2 = await db.query(
+      const rootsQ = await db.query(
         "select id, coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id = any($1::int[])",
         [allIds]
       );
-      const extraRoots2 = new Set();
-      for (const row of rootsQ2.rows) {
-        if (row.root_id && !ids.has(row.root_id)) extraRoots2.add(row.root_id);
+      const extraRoots = new Set();
+      for (const row of rootsQ.rows) {
+        if (row.root_id && !ids.has(row.root_id)) extraRoots.add(row.root_id);
       }
-      for (const root of extraRoots2) ids.add(root);
-      if (extraRoots2.size) {
-        const membersQ2 = await db.query(
+      for (const root of extraRoots) ids.add(root);
+      if (extraRoots.size) {
+        const membersQ = await db.query(
           "select id from users where (meta->>'merged_into')::int = any($1::int[])",
-          [Array.from(extraRoots2)]
+          [Array.from(extraRoots)]
         );
-        for (const row of membersQ2.rows) ids.add(row.id);
+        for (const row of membersQ.rows) ids.add(row.id);
       }
     }
 
@@ -194,7 +161,7 @@ app.get('/api/me', async (req, res) => {
       "select coalesce(sum(coalesce(balance,0)),0)::int as total from users where id = any($1::int[])",
       [clusterIds]
     );
-    const total = (sumRows[0] && sumRows[0].total) ? sumRows[0].total : (user.balance || 0);
+    const total = sumRows[0]?.total ?? (user.balance || 0);
 
     res.json({
       ok: true,
@@ -204,56 +171,49 @@ app.get('/api/me', async (req, res) => {
         first_name: user.first_name,
         last_name: user.last_name,
         avatar: user.avatar,
-        balance: total,
+        balance: total
       }
     });
   } catch (e) {
-    console.error('/api/me error:', e?.message || e);
     res.status(401).json({ ok: false });
   }
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
-// /api/events — сбор аналитики с клиента
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// API: /api/events — лог клиентских событий
+// ─────────────────────────────────────────────────────────────
 app.post('/api/events', async (req, res) => {
   try {
-    const { type, event_type, payload } = req.body || {};
+    const { type, payload } = req.body || {};
     const uid = uidFromSid(req);
-    const ip = firstIp(req);
-    const ua = (req.headers['user-agent'] || '').toString().slice(0, 512);
-
-    // Совместимость: поле event_type — основное; type — на всякий случай
-    const et = (event_type || type || '').toString().slice(0, 64) || 'client_event';
-
     await db.query(
       'insert into events (user_id, event_type, payload, ip, ua) values ($1,$2,$3,$4,$5)',
-      [uid, et, payload || {}, ip, ua]
+      [ uid, String(type || ''), payload || {}, firstIp(req), (req.headers['user-agent']||'').slice(0,256) ]
     );
     res.json({ ok: true });
   } catch (e) {
-    console.error('/api/events error:', e?.message || e);
-    res.status(500).json({ ok: false });
+    res.status(500).json({ ok:false, error: String(e?.message || e) });
   }
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Подключаем роуты
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Маршруты
+// ─────────────────────────────────────────────────────────────
 app.use('/api/admin', adminRoutes);
 app.use('/api/auth',  authRoutes);
 app.use('/api/tg',    tgRoutes);
 app.use('/api/link',  linkRoutes);
 
-// healthcheck
-app.get('/api/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
-
-// Статические файлы (если нужны)
-app.use('/static', express.static(path.join(__dirname, 'public')));
-
-// ──────────────────────────────────────────────────────────────────────────────
-const PORT = Number(process.env.PORT || 3000);
-app.listen(PORT, () => {
-  console.log(`API listening on :${PORT}`);
-  console.log('FRONTEND_URL:', FRONTEND_URL);
-});
+// ─────────────────────────────────────────────────────────────
+// Старт
+// ─────────────────────────────────────────────────────────────
+ensureTables()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`GG backend listening on :${PORT}; FRONTEND_URL=${FRONTEND_URL}`);
+    });
+  })
+  .catch((e) => {
+    console.error('ensureTables failed', e);
+    process.exit(1);
+  });
