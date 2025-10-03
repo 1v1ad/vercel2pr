@@ -8,7 +8,8 @@
 //  - trust proxy, cookies, json, логгирование
 // ──────────────────────────────────────────────────────────────────────────────
 
-import 'dotenv/config.js';
+// вариант А — короче и обычно удобнее
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
