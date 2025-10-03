@@ -7,12 +7,12 @@ import { autoMergeByDevice } from './merge.js';
 const router = Router();
 
 function userIdFromSid(req){
-  try {
+  try{
     const t = req.cookies && req.cookies['sid'];
-    if (!t) return null;
+    if(!t) return null;
     const p = JSON.parse(Buffer.from(t.split('.')[1], 'base64url').toString('utf8'));
     return p && p.uid || null;
-  } catch(_) { return null; }
+  }catch(_){ return null; }
 }
 
 

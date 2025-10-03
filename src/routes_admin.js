@@ -22,6 +22,28 @@ router.use(adminAuth);
 
 router.get('/health', (_req, res) => res.json({ ok:true }));
 
+router.post('/repair/auth_accounts', adminAuth, async (req, res) => {
+  try {
+    const r1 = await db.query(`
+      update auth_accounts a
+         set user_id = u.id, updated_at = now()
+        from users u
+       where a.user_id is null
+         and a.provider = 'vk'
+         and u.vk_id::text = a.provider_user_id
+         and a.provider_user_id ~ '^[0-9]+$'`);
+    const r2 = await db.query(`
+      update auth_accounts a
+         set user_id = u.id, updated_at = now()
+        from users u
+       where a.user_id is null
+         and a.provider = 'tg'
+         and u.vk_id = ('tg:' || a.provider_user_id)`);
+    res.json({ ok:true, fixed_vk: r1.rowCount||0, fixed_tg: r2.rowCount||0 });
+  } catch (e) { res.status(500).json({ ok:false, error:String(e?.message||e) }); }
+});
+
+
 router.get('/summary', async (req, res) => {
   try {
     const TZ = process.env.ADMIN_TZ || 'Europe/Moscow';

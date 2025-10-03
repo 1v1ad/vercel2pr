@@ -138,9 +138,10 @@ router.get('/vk/callback', async (req, res) => {
     });
 
     
-    // persist VK auth_account with device_id and link to user
-    try{
-      const deviceId = (req.cookies && req.cookies['device_id']) ? String(req.cookies['device_id']) : (req.query && req.query.device_id ? String(req.query.device_id) : null);
+    // vk auth_account upsert (attach device_id & link to user), then soft auto-merge by device
+    try {
+      const deviceId = (req.cookies && req.cookies['device_id']) ? String(req.cookies['device_id'])
+                     : (req.query && req.query.device_id ? String(req.query.device_id) : null);
       await db.query(`
         insert into auth_accounts (user_id, provider, provider_user_id, username, phone_hash, meta)
         values ($1, 'vk', $2, $3, null, $4)
@@ -151,7 +152,7 @@ router.get('/vk/callback', async (req, res) => {
           updated_at = now()
       `, [ user.id, vk_id, first_name || null, JSON.stringify({ device_id: deviceId || null }) ]);
       if (deviceId) { try { await autoMergeByDevice({ deviceId }); } catch(_){ } }
-    } catch(e){ console.warn('vk auth_account upsert failed', e?.message); }
+    } catch (e) { console.warn('vk auth_account upsert failed', e && e.message); }
 const url = new URL(frontendUrl);
     url.searchParams.set('logged', '1');
     return res.redirect(url.toString());
