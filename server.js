@@ -1,111 +1,157 @@
+// server.js — backend for vercel2pr
+// ──────────────────────────────────────────────────────────────────────────────
+// Включает:
+//  - динамический CORS с поддержкой Netlify Deploy Preview
+//  - /api/me: суммарный баланс по кластеру (VK+TG+device) + merged_into
+//  - /api/events: сбор аналитики
+//  - роуты: /api/auth/*, /api/tg/*, /api/link/*, /api/admin/*
+//  - trust proxy, cookies, json, логгирование
+// ──────────────────────────────────────────────────────────────────────────────
+
+import 'dotenv/config.js';
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
-import dotenv from 'dotenv';
-import geoip from 'geoip-lite';
+import morgan from 'morgan';
+import bodyParser from 'body-parser';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-import { db, ensureTables, getUserById, logEvent, updateUserCountryIfNull } from './src/db.js';
-import authRouter from './src/routes_auth.js';
-import linkRouter from './src/routes_link.js';
-import tgRouter from './src/routes_tg.js'; // ← Добавили
+import { db, ensureTables } from './src/db.js';
+import adminRoutes from './src/routes_admin.js';
+import authRoutes from './src/routes_auth.js';
+import tgRoutes from './src/routes_tg.js';
+import linkRoutes from './src/routes_link.js';
 
-dotenv.config();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
 
 const app = express();
+app.set('trust proxy', true);
 
-app.use((req, res, next) => {
-  const origin = req.headers.origin || '*';
-  res.setHeader('Access-Control-Allow-Origin', origin);
-  res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  const requested = (req.headers['access-control-request-headers'] || '').toString().toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
-  const base = ['content-type','x-admin-password','x-admin-name'];
-  res.setHeader('Access-Control-Allow-Headers', Array.from(new Set([...base, ...requested])).join(', '));
-  if (req.method === 'OPTIONS') return res.status(204).end();
-  next();
-});
-app.set('trust proxy', 1);
+// ──────────────────────────────────────────────────────────────────────────────
+// CORS (динамический origin + credentials:true)
+// Разрешаем основной фронт и превью: https://deploy-preview-XX--sweet-twilight-63a9b6.netlify.app
+// Обнови FRONTEND_URL при необходимости.
+// ──────────────────────────────────────────────────────────────────────────────
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+const allowList = new Set([
+  FRONTEND_URL,
+  'http://localhost:5173',
+  'https://sweet-twilight-63a9b6.netlify.app',
+]);
 
-const FRONTEND_URL = process.env.FRONTEND_URL;
-
-app.use(cors({
-  origin: [
-    FRONTEND_URL,
-    'https://sweet-twilight-63a9b6.netlify.app',
-  ].filter(Boolean),
-  credentials: true,
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Password'],
-  maxAge: 86400,
-}));
-app.options('*', cors());
-
-app.use(express.json());
-app.use(express.urlencoded({ extended: true })); // ← Добавили для form-urlencoded
-app.use(cookieParser());
-
-// Health (прогрев)
-app.get('/health', (_, res) => res.status(200).send('ok'));
-
-// Telegram auth callback (НОВОЕ)
-app.use('/api/auth/tg', tgRouter);
-
-// Остальные маршруты
-app.use('/api', linkRouter);
-app.use('/api/auth', authRouter);
-
-// === Admin feature (optional) ===
-if ((process.env.FEATURE_ADMIN || '').toLowerCase() === 'true') {
-  const { default: adminRouter } = await import('./src/routes_admin.js');
-  app.use('/api/admin', adminRouter);
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // curl / same-origin
+  if (allowList.has(origin)) return true;
+  try {
+    const { hostname, protocol } = new URL(origin);
+    if (!/^https?:$/.test(protocol)) return false;
+    // Любые превью Netlify для этого сайта:
+    // https://deploy-preview-<n>--sweet-twilight-63a9b6.netlify.app
+    if (hostname.endsWith('--sweet-twilight-63a9b6.netlify.app')) return true;
+  } catch (_) {}
+  return false;
 }
 
-// Session info для фронта
+const corsOptions = {
+  origin: (origin, cb) => cb(null, isAllowedOrigin(origin)),
+  credentials: true,
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ['GET', 'POST', 'OPTIONS'],
+};
 
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Parsers & logging
+// ──────────────────────────────────────────────────────────────────────────────
+app.use(cookieParser());
+app.use(bodyParser.json({ limit: '1mb' }));
+app.use(morgan('dev'));
+
+// ──────────────────────────────────────────────────────────────────────────────
+// База и таблицы
+// ──────────────────────────────────────────────────────────────────────────────
+await ensureTables();
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Вспомогалки
+// ──────────────────────────────────────────────────────────────────────────────
+function firstIp(req) {
+  const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
+  return ipHeader.split(',')[0].trim();
+}
+
+async function getUserById(id) {
+  const { rows } = await db.query('select * from users where id=$1', [id]);
+  return rows[0] || null;
+}
+
+// Дешифровка sid без проверки подписи (как в роут-пакетах)
+function uidFromSid(req) {
+  try {
+    const t = req.cookies && req.cookies.sid;
+    if (!t) return null;
+    const p = JSON.parse(Buffer.from(t.split('.')[1], 'base64url').toString('utf8'));
+    return p && p.uid || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// /api/me — суммарный баланс по кластеру (VK+TG+device + merged_into)
+// ──────────────────────────────────────────────────────────────────────────────
 app.get('/api/me', async (req, res) => {
   try {
-    const token = req.cookies['sid'];
-    if (!token) return res.status(401).json({ ok:false });
+    const uid = uidFromSid(req);
+    if (!uid) return res.status(401).json({ ok: false });
 
-    let payload;
-    try { payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8')); }
-    catch { return res.status(401).json({ ok:false }); }
+    const user = await getUserById(uid);
+    if (!user) return res.status(401).json({ ok: false });
 
-    const { rows: urows } = await db.query('select * from users where id=$1', [payload.uid]);
-    const user = urows[0];
-    if (!user) return res.status(401).json({ ok:false });
+    const ids = new Set([user.id]);
 
-    const deviceIdCookie = (req.cookies && req.cookies['device_id']) ? String(req.cookies['device_id']) : null;
-
-    // 1) rootId по merged_into
-    const rootQ = await db.query(
-      "select coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id=$1",
-      [user.id]
+    // 1) расширяем кластер через merged_into (корень + участники)
+    const rootsQ = await db.query(
+      "select id, coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id = any($1::int[])",
+      [[user.id]]
     );
-    const rootId = (rootQ.rows && rootQ.rows[0] && rootQ.rows[0].root_id) ? rootQ.rows[0].root_id : user.id;
-
-    // 2) базовый набор id: root + все merged_into=root
-    const baseQ = await db.query("select id from users where id=$1 or (meta->>'merged_into')::int = $1", [rootId]);
-    const ids = new Set(baseQ.rows.map(r => r.id));
-
-    // 3) собираем device_id: из auth_accounts по известным id + из cookie; учитываем строки с user_id is null
-    let dids = [];
-    if (ids.size) {
-      const q1 = await db.query(
-        "select distinct meta->>'device_id' as did from auth_accounts where coalesce(meta->>'device_id','')<>'' and (user_id = any($1::int[]) or user_id is null)",
-        [Array.from(ids)]
-      );
-      dids = q1.rows.map(r => r.did).filter(Boolean);
+    const extraRoots = new Set();
+    for (const row of rootsQ.rows) {
+      if (row.root_id && !ids.has(row.root_id)) extraRoots.add(row.root_id);
     }
-    if (deviceIdCookie) dids = Array.from(new Set([...dids, deviceIdCookie]));
+    for (const root of extraRoots) ids.add(root);
+    if (extraRoots.size) {
+      const membersQ = await db.query(
+        "select id from users where (meta->>'merged_into')::int = any($1::int[])",
+        [Array.from(extraRoots)]
+      );
+      for (const row of membersQ.rows) ids.add(row.id);
+    }
 
-    // 4) расширяем кластер по dids: user_id из auth_accounts + fallback через provider_user_id
-    if (dids.length) {
+    // 2) собираем device_id из cookie и учётных записей, связанных с пользователем
+    const dids = new Set();
+    const deviceCookie = req.cookies && req.cookies['device_id'] ? String(req.cookies['device_id']) : null;
+    if (deviceCookie) dids.add(deviceCookie);
+
+    const q1 = await db.query(
+      "select distinct nullif(meta->>'device_id','') as did from auth_accounts where user_id = any($1::int[]) and coalesce(meta->>'device_id','') <> ''",
+      [[user.id]]
+    );
+    for (const r of q1.rows) if (r.did) dids.add(r.did);
+
+    const didList = Array.from(dids);
+
+    // 3) по device_id подтягиваем user_id из auth_accounts + fallback через provider_user_id
+    if (didList.length) {
       const q2 = await db.query(
         "select distinct user_id from auth_accounts where user_id is not null and coalesce(meta->>'device_id','')<>'' and meta->>'device_id' = any($1::text[])",
-        [dids]
+        [didList]
       );
-      for (const r of q2.rows) ids.add(r.user_id);
+      for (const r of q2.rows) if (r.user_id) ids.add(r.user_id);
 
       const q2b = await db.query(`
         select distinct
@@ -115,111 +161,98 @@ app.get('/api/me', async (req, res) => {
             else null
           end as uid
         from auth_accounts a
-        where coalesce(a.meta->>'device_id','')<>''
+        where coalesce(a.meta->>'device_id','') <> ''
           and a.meta->>'device_id' = any($1::text[])
-      `, [dids]);
+      `, [didList]);
       for (const r of q2b.rows) if (r.uid) ids.add(r.uid);
     }
 
+    // 4) финально снова расширим по merged_into на случай, если подтянули новые id
     if (ids.size) {
       const allIds = Array.from(ids);
-      const rootsQ = await db.query(
+      const rootsQ2 = await db.query(
         "select id, coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id = any($1::int[])",
         [allIds]
       );
-      const extraRoots = new Set();
-      for (const row of rootsQ.rows) {
-        if (row.root_id && !ids.has(row.root_id)) extraRoots.add(row.root_id);
+      const extraRoots2 = new Set();
+      for (const row of rootsQ2.rows) {
+        if (row.root_id && !ids.has(row.root_id)) extraRoots2.add(row.root_id);
       }
-      for (const root of extraRoots) ids.add(root);
-      if (extraRoots.size) {
-        const membersQ = await db.query(
+      for (const root of extraRoots2) ids.add(root);
+      if (extraRoots2.size) {
+        const membersQ2 = await db.query(
           "select id from users where (meta->>'merged_into')::int = any($1::int[])",
-          [Array.from(extraRoots)]
+          [Array.from(extraRoots2)]
         );
-        for (const row of membersQ.rows) ids.add(row.id);
+        for (const row of membersQ2.rows) ids.add(row.id);
       }
     }
 
     const clusterIds = Array.from(ids);
-    const sumQ = await db.query("select coalesce(sum(coalesce(balance,0)),0)::int as total from users where id = any($1::int[])", [clusterIds]);
-    const total = (sumQ.rows && sumQ.rows[0] && sumQ.rows[0].total) ? sumQ.rows[0].total : (user.balance||0);
+    const { rows: sumRows } = await db.query(
+      "select coalesce(sum(coalesce(balance,0)),0)::int as total from users where id = any($1::int[])",
+      [clusterIds]
+    );
+    const total = (sumRows[0] && sumRows[0].total) ? sumRows[0].total : (user.balance || 0);
 
     res.json({
-      ok:true,
+      ok: true,
       user: {
         id: user.id,
         vk_id: user.vk_id,
         first_name: user.first_name,
         last_name: user.last_name,
         avatar: user.avatar,
-        balance: total
+        balance: total,
       }
     });
   } catch (e) {
-    res.status(401).json({ ok:false });
+    console.error('/api/me error:', e?.message || e);
+    res.status(401).json({ ok: false });
   }
 });
 
-
-// Client events (аналитика)
+// ──────────────────────────────────────────────────────────────────────────────
+// /api/events — сбор аналитики с клиента
+// ──────────────────────────────────────────────────────────────────────────────
 app.post('/api/events', async (req, res) => {
   try {
-    const { type, payload } = req.body || {};
-    if (!type) return res.status(400).json({ ok: false, error: 'type required' });
+    const { type, event_type, payload } = req.body || {};
+    const uid = uidFromSid(req);
+    const ip = firstIp(req);
+    const ua = (req.headers['user-agent'] || '').toString().slice(0, 512);
 
-    const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
-    const ip = ipHeader.split(',')[0].trim();
-    let userId = null;
+    // Совместимость: поле event_type — основное; type — на всякий случай
+    const et = (event_type || type || '').toString().slice(0, 64) || 'client_event';
 
-    let country_code = null;
-    try {
-      const hit = ip && geoip.lookup(ip);
-      if (hit && hit.country) country_code = hit.country;
-    } catch {}
-
-    const token = req.cookies['sid'];
-    if (token) {
-      try {
-        const p = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
-        userId = p.uid || null;
-      } catch {}
-    }
-
-    await logEvent({
-      user_id: userId,
-      event_type: String(type).slice(0, 64),
-      payload: payload || null,
-      ip,
-      ua: (req.headers['user-agent'] || '').slice(0, 256),
-      country_code,
-    });
-
-    if (userId && country_code) {
-      await updateUserCountryIfNull(userId, { country_code, country_name: country_code });
-    }
-
+    await db.query(
+      'insert into events (user_id, event_type, payload, ip, ua) values ($1,$2,$3,$4,$5)',
+      [uid, et, payload || {}, ip, ua]
+    );
     res.json({ ok: true });
   } catch (e) {
-    console.error('events error', e);
+    console.error('/api/events error:', e?.message || e);
     res.status(500).json({ ok: false });
   }
 });
 
-// Root
-app.get('/', (_, res) => res.send('VK Auth backend up'));
+// ──────────────────────────────────────────────────────────────────────────────
+// Подключаем роуты
+// ──────────────────────────────────────────────────────────────────────────────
+app.use('/api/admin', adminRoutes);
+app.use('/api/auth',  authRoutes);
+app.use('/api/tg',    tgRoutes);
+app.use('/api/link',  linkRoutes);
 
-const PORT = process.env.PORT || 3001;
+// healthcheck
+app.get('/api/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// слушаем порт сразу, чтобы Render не «висел» при пробуждении
-app.listen(PORT, () => console.log(`API on :${PORT}`));
+// Статические файлы (если нужны)
+app.use('/static', express.static(path.join(__dirname, 'public')));
 
-// Инициализацию БД запускаем асинхронно, без блокировки старта
-(async () => {
-  try {
-    await ensureTables();
-    console.log('DB ready (ensureTables done)');
-  } catch (e) {
-    console.error('DB init error (non-fatal):', e);
-  }
-})();
+// ──────────────────────────────────────────────────────────────────────────────
+const PORT = Number(process.env.PORT || 3000);
+app.listen(PORT, () => {
+  console.log(`API listening on :${PORT}`);
+  console.log('FRONTEND_URL:', FRONTEND_URL);
+});
