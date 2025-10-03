@@ -1,119 +1,82 @@
-// ─────────────────────────────────────────────────────────────
-// GG Room — backend (Render)
-// Этот файл — единая точка входа. Render запускает его через npm start.
-// ─────────────────────────────────────────────────────────────
+// Lightweight Express backend for Render — resilient to missing 'pg'
 import 'dotenv/config';
-
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
-import morgan from 'morgan';
-import bodyParser from 'body-parser';
+import jwt from 'jsonwebtoken';
 
-import { db, ensureTables } from './src/db.js';
-import adminRoutes from './src/routes_admin.js';
-import authRoutes from './src/routes_auth.js';
-import tgRoutes from './src/routes_tg.js';
-import linkRoutes from './src/routes_link.js';
-
-// ─────────────────────────────────────────────────────────────
-// Настройки порта и базового URL фронта
-// ─────────────────────────────────────────────────────────────
-const PORT = Number(process.env.PORT || 3000);
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://sweet-twilight-63a9b6.netlify.app';
+const PORT          = process.env.PORT || 3000;
+const FRONTEND_URL  = process.env.FRONTEND_URL || '*';
+const JWT_SECRET    = process.env.JWT_SECRET || 'dev-secret';
+const ADMIN_PASSWORD= process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD || 'admin';
+const DATABASE_URL  = process.env.DATABASE_URL || '';
 
 const app = express();
-
-// ─────────────────────────────────────────────────────────────
-// CORS: позволяем onrender.com, *.netlify.app, localhost
-// с поддержкой credentials (cookies)
-// ─────────────────────────────────────────────────────────────
-app.use((req, res, next) => {
-  const origin = req.headers.origin || '';
-  let allow = false;
-  try {
-    const h = new URL(origin).hostname;
-    allow =
-      h.endsWith('.netlify.app') ||
-      h.endsWith('netlify.app') ||
-      h.endsWith('.onrender.com') ||
-      h === 'localhost' || h.endsWith('.localhost');
-  } catch (_) {}
-  if (allow) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  }
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
-
-// ─────────────────────────────────────────────────────────────
-// Общие middleware
-// ─────────────────────────────────────────────────────────────
-app.use(morgan('tiny'));
+app.use(express.json());
 app.use(cookieParser());
-app.use(bodyParser.json({ limit: '1mb' }));
-app.use(bodyParser.urlencoded({ extended: true }));
+app.use(cors({
+  origin: (_origin, cb) => cb(null, true),
+  credentials: true
+}));
 
-// ─────────────────────────────────────────────────────────────
-// Вспомогалки
-// ─────────────────────────────────────────────────────────────
-function firstIp(req) {
-  const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
-  return ipHeader.split(',')[0].trim();
+// ---- DB (optional). Service starts even if 'pg' is not installed or DATABASE_URL is empty.
+let db = null;
+if (DATABASE_URL) {
+  try {
+    const pg = await import('pg'); // dynamic import avoids startup crash if pg is missing
+    const { Pool } = pg;
+    db = new Pool({
+      connectionString: DATABASE_URL,
+      ssl: DATABASE_URL.includes('sslmode=require')
+        ? { rejectUnauthorized: false }
+        : false
+    });
+    console.log('[boot] PG pool ready');
+  } catch (e) {
+    console.warn('[boot] PG not available, running without DB:', e?.message || e);
+    db = null;
+  }
 }
 
-function uidFromSid(req) {
+function signSession(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
+}
+function parseSid(req) {
   try {
-    const t = (req.cookies && req.cookies['sid']) || null;
+    const t = req.cookies?.sid;
     if (!t) return null;
-    const p = JSON.parse(Buffer.from(t.split('.')[1], 'base64url').toString('utf8'));
-    return (p && p.uid) || null;
+    return jwt.verify(t, JWT_SECRET);
   } catch {
     return null;
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// API: /api/me — возвращает пользователя и СУММАРНЫЙ баланс по кластеру
-// (объединение VK+TG+device, плюс merged_into)
-// ─────────────────────────────────────────────────────────────
+// ---- health
+app.get('/healthz', (_req, res) => res.json({ ok: true, ts: Date.now(), db: Boolean(db) }));
+
+// ---- /api/me (clustered balance if DB is present)
 app.get('/api/me', async (req, res) => {
   try {
-    const uid = uidFromSid(req);
-    if (!uid) return res.json({ ok: false });
+    if (!db) return res.json({ ok: true, user: null, note: 'no-db' });
 
-    const { rows: r0 } = await db.query('select * from users where id=$1 limit 1', [uid]);
-    if (!r0.length) return res.json({ ok: false });
-    const user = r0[0];
+    const sid = parseSid(req);
+    let user = null;
 
-    // собираем кластер id по session user
-    const ids = new Set([user.id]);
+    if (sid?.uid) {
+      const { rows } = await db.query(
+        'select id, vk_id, first_name, last_name, avatar, balance, meta from users where id=$1',
+        [sid.uid]
+      );
+      user = rows[0] || null;
+    }
 
-    // 1) находим "root" по merged_into
-    const { rows: rRoot } = await db.query(
-      "select id, coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id=$1",
-      [user.id]
-    );
-    const rootId = rRoot[0]?.root_id || user.id;
-    ids.add(rootId);
-
-    // 2) добавляем всех, кто в этот root слит
-    const { rows: rMembers } = await db.query(
-      "select id from users where (meta->>'merged_into')::int = $1",
-      [rootId]
-    );
-    for (const r of rMembers) ids.add(r.id);
-
-    // 3) device_id из cookie
-    const deviceIdCookie = (req.cookies && req.cookies['device_id']) ? String(req.cookies['device_id']) : null;
+    const deviceIdCookie = (req.cookies?.device_id || '').trim();
     const dids = [];
     if (deviceIdCookie) dids.push(deviceIdCookie);
 
-    // 4) по device_id тянем user_id из auth_accounts
+    const ids = new Set();
+    if (user?.id) ids.add(user.id);
+
     if (dids.length) {
       const q2 = await db.query(
         "select distinct user_id from auth_accounts where user_id is not null and coalesce(meta->>'device_id','')<>'' and meta->>'device_id' = any($1::text[])",
@@ -121,7 +84,6 @@ app.get('/api/me', async (req, res) => {
       );
       for (const r of q2.rows) ids.add(r.user_id);
 
-      // фоллбек через provider_user_id → users
       const q2b = await db.query(`
         select distinct
           case
@@ -135,7 +97,6 @@ app.get('/api/me', async (req, res) => {
       for (const r of q2b.rows) if (r.uid) ids.add(r.uid);
     }
 
-    // 5) ещё раз добавим root/members для всех найденных
     if (ids.size) {
       const allIds = Array.from(ids);
       const rootsQ = await db.query(
@@ -143,10 +104,9 @@ app.get('/api/me', async (req, res) => {
         [allIds]
       );
       const extraRoots = new Set();
-      for (const row of rootsQ.rows) {
-        if (row.root_id && !ids.has(row.root_id)) extraRoots.add(row.root_id);
-      }
+      for (const row of rootsQ.rows) if (row.root_id && !ids.has(row.root_id)) extraRoots.add(row.root_id);
       for (const root of extraRoots) ids.add(root);
+
       if (extraRoots.size) {
         const membersQ = await db.query(
           "select id from users where (meta->>'merged_into')::int = any($1::int[])",
@@ -157,63 +117,55 @@ app.get('/api/me', async (req, res) => {
     }
 
     const clusterIds = Array.from(ids);
-    const { rows: sumRows } = await db.query(
-      "select coalesce(sum(coalesce(balance,0)),0)::int as total from users where id = any($1::int[])",
-      [clusterIds]
-    );
-    const total = sumRows[0]?.total ?? (user.balance || 0);
+    let total = user?.balance || 0;
+    if (clusterIds.length) {
+      const sumQ = await db.query(
+        "select coalesce(sum(coalesce(balance,0)),0)::int as total from users where id = any($1::int[])",
+        [clusterIds]
+      );
+      total = sumQ.rows?.[0]?.total ?? total;
+    }
 
     res.json({
       ok: true,
-      user: {
+      user: user ? {
         id: user.id,
         vk_id: user.vk_id,
         first_name: user.first_name,
         last_name: user.last_name,
         avatar: user.avatar,
         balance: total
-      }
+      } : null
     });
   } catch (e) {
-    res.status(401).json({ ok: false });
+    console.error('/api/me error', e);
+    res.status(500).json({ ok:false });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// API: /api/events — лог клиентских событий
-// ─────────────────────────────────────────────────────────────
-app.post('/api/events', async (req, res) => {
+// ---- background link stub (safe even without DB)
+app.post('/api/link/background', async (req, res) => {
   try {
-    const { type, payload } = req.body || {};
-    const uid = uidFromSid(req);
-    await db.query(
-      'insert into events (user_id, event_type, payload, ip, ua) values ($1,$2,$3,$4,$5)',
-      [ uid, String(type || ''), payload || {}, firstIp(req), (req.headers['user-agent']||'').slice(0,256) ]
-    );
-    res.json({ ok: true });
+    if (!db) return res.json({ ok:true, merged:false, note:'no-db' });
+    const { provider, provider_user_id, username, device_id } = req.body || {};
+    if (!provider || !provider_user_id) return res.json({ ok:false, reason:'bad_payload' });
+
+    await db.query(`
+      insert into auth_accounts (user_id, provider, provider_user_id, username, phone_hash, meta)
+      values (null, $1, $2, $3, null, jsonb_build_object('device_id',$4))
+      on conflict (provider, provider_user_id) do update set
+        username = coalesce(excluded.username, auth_accounts.username),
+        meta     = jsonb_strip_nulls(coalesce(auth_accounts.meta,'{}'::jsonb) || excluded.meta),
+        updated_at = now()
+    `, [provider, String(provider_user_id), username || null, device_id || null]);
+
+    res.json({ ok:true, merged:false });
   } catch (e) {
-    res.status(500).json({ ok:false, error: String(e?.message || e) });
+    console.warn('link/background error', e?.message);
+    res.json({ ok:false, error:String(e?.message || e) });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// Маршруты
-// ─────────────────────────────────────────────────────────────
-app.use('/api/admin', adminRoutes);
-app.use('/api/auth',  authRoutes);
-app.use('/api/tg',    tgRoutes);
-app.use('/api/link',  linkRoutes);
-
-// ─────────────────────────────────────────────────────────────
-// Старт
-// ─────────────────────────────────────────────────────────────
-ensureTables()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`GG backend listening on :${PORT}; FRONTEND_URL=${FRONTEND_URL}`);
-    });
-  })
-  .catch((e) => {
-    console.error('ensureTables failed', e);
-    process.exit(1);
-  });
+app.listen(PORT, () => {
+  console.log('server listening on :' + PORT);
+});
