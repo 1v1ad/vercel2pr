@@ -17,8 +17,9 @@ export async function ensureTables() {
   ADD COLUMN IF NOT EXISTS country_code text,
   ADD COLUMN IF NOT EXISTS country_name text;`);
 
-await client.query(`ALTER TABLE events
+    await client.query(`ALTER TABLE events
   ADD COLUMN IF NOT EXISTS country_code text;`);
+    await client.query("alter table users add column if not exists meta jsonb default '{}'::jsonb");
 
     await client.query(`create table if not exists users (
       id serial primary key,
@@ -53,7 +54,7 @@ await client.query(`ALTER TABLE events
   
 
 // --- Linking tables ---
-await client.query(`create table if not exists auth_accounts (
+    await client.query(`create table if not exists auth_accounts (
   id serial primary key,
   user_id integer references users(id) on delete cascade,
   provider varchar(16) not null,
@@ -65,8 +66,13 @@ await client.query(`create table if not exists auth_accounts (
   updated_at timestamp default now(),
   unique(provider, provider_user_id)
 );`);
-await client.query('create index if not exists idx_auth_accounts_phone_hash on auth_accounts(phone_hash)');
-await client.query(`create table if not exists link_codes (
+    try { await client.query("alter table auth_accounts add column if not exists meta jsonb default '{}'::jsonb"); } catch {}
+    await client.query('create index if not exists idx_auth_accounts_phone_hash on auth_accounts(phone_hash)');
+    await client.query('create index if not exists auth_accounts_provider_user on auth_accounts(provider, provider_user_id)');
+    await client.query("create index if not exists auth_accounts_device on auth_accounts ((meta->>'device_id'))");
+    await client.query("create index if not exists users_merged_into on users (((meta->>'merged_into')::int))");
+    await client.query('create index if not exists events_created_at on events(created_at)');
+    await client.query(`create table if not exists link_codes (
   id serial primary key,
   user_id integer references users(id) on delete cascade,
   code varchar(16) unique not null,
@@ -74,7 +80,7 @@ await client.query(`create table if not exists link_codes (
   used_at timestamp,
   created_at timestamp default now()
 );`);
-await client.query(`create table if not exists admin_topups (
+    await client.query(`create table if not exists admin_topups (
   id serial primary key,
   admin_name text,
   admin_ip text,
@@ -85,7 +91,7 @@ await client.query(`create table if not exists admin_topups (
   headers jsonb,
   created_at timestamp default now()
 );`);
-await client.query(`create table if not exists link_audit (
+    await client.query(`create table if not exists link_audit (
   id serial primary key,
   primary_id integer,
   merged_id integer,

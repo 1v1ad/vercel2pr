@@ -28,7 +28,7 @@ router.all('/callback', async (req, res) => {
   try { await logEvent({ user_id:null, event_type:'auth_start', payload:{ provider:'tg' }, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) }); } catch {}
   try {
     const data = { ...(req.query || {}), ...(req.body || {}) };
-    const deviceId = safe(req.query?.device_id || req.cookies?.device_id || '');
+    const deviceId = safe(req.query?.device_id ?? req.cookies?.device_id ?? null);
     const tgId = safe(data.id || '');
 
     // set session to primary user by deviceId (if known)
@@ -55,7 +55,7 @@ router.all('/callback', async (req, res) => {
       try{
         await db.query(`
           insert into auth_accounts (user_id, provider, provider_user_id, username, phone_hash, meta)
-          values ($1, 'tg', $2, $3, null, $4)
+          values ($1, 'tg', $2, $3, null, jsonb_build_object('device_id',$4))
           on conflict (provider, provider_user_id) do update set
             user_id   = coalesce(auth_accounts.user_id, excluded.user_id),
             username  = coalesce(excluded.username,  auth_accounts.username),
@@ -65,7 +65,7 @@ router.all('/callback', async (req, res) => {
           userIdFromSid(req),
           tgId,
           safe(data.username),
-          JSON.stringify({ device_id: deviceId || null })
+          deviceId || null
         ]);
       }catch(e){ console.warn('tg upsert failed', e?.message); }
     }

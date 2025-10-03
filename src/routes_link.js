@@ -25,23 +25,23 @@ router.post('/link/background', async (req, res) => {
 
     await ensureMetaColumns();
 
-    // 1) Пробуем обновить meta.device_id у текущего аккаунта (он должен существовать после авторизации)
-    let updated = 0;
-    try {
-      const upd = await db.query(
-        "update auth_accounts set meta = jsonb_set(coalesce(meta,'{}'::jsonb), '{device_id}', to_jsonb($3::text), true), updated_at=now() where provider=$1 and provider_user_id=$2",
-        [provider, provider_user_id, device_id || null]
-      );
-      updated = upd.rowCount || 0;
-    } catch {}
-
-    // 2) На всякий случай, если записи нет — создадим «мягко» (без user_id, чтобы не сломать внешние ключи)
-    if (!updated && provider && provider_user_id) {
+    if (provider && provider_user_id) {
       try {
-        await db.query(
-          "insert into auth_accounts (provider, provider_user_id, username, meta) values ($1,$2,$3, jsonb_build_object('device_id',$4)) on conflict do nothing",
-          [provider, provider_user_id, username || null, device_id || null]
-        );
+        await db.query(`
+          insert into auth_accounts (user_id, provider, provider_user_id, username, phone_hash, meta)
+          values ($5, $1, $2, $3, null, jsonb_build_object('device_id',$4))
+          on conflict (provider, provider_user_id) do update set
+            user_id   = coalesce(auth_accounts.user_id, excluded.user_id),
+            username  = coalesce(excluded.username,  auth_accounts.username),
+            meta      = jsonb_strip_nulls(coalesce(auth_accounts.meta,'{}'::jsonb) || excluded.meta),
+            updated_at = now()
+        `, [
+          provider,
+          provider_user_id,
+          username || null,
+          device_id || null,
+          getUidFromSid(req)
+        ]);
       } catch {}
     }
 
