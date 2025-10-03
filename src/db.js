@@ -1,112 +1,133 @@
 import dotenv from 'dotenv';
-import pkg from 'pg';
+import postgres from 'postgres';
 dotenv.config();
-const { Pool } = pkg;
 
-// Neon: sslmode=require in connection string
-const ssl = (process.env.DATABASE_URL && process.env.DATABASE_URL.includes('sslmode=require'))
-  ? { rejectUnauthorized: false }
-  : false;
+// --- Настройка SSL для Neon/Render ---
+const needSSL = process.env.DATABASE_URL && /sslmode=require|neon/i.test(process.env.DATABASE_URL);
+const ssl = needSSL ? { rejectUnauthorized: false } : undefined;
 
-export const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl });
+// Единый клиент (аналог Pool)
+const sql = postgres(process.env.DATABASE_URL, {
+  ssl,
+  max: 10,
+  idle_timeout: 30,
+  connect_timeout: 30
+});
 
+// Адаптер в стиль node-postgres Pool
+export const db = {
+  async query(text, params = []) {
+    const rows = await sql.unsafe(text, params);
+    return { rows };
+  },
+  async connect() {
+    return {
+      query: (t, p) => db.query(t, p),
+      release: () => {}
+    };
+  },
+  async end() { await sql.end(); }
+};
+
+// --- Инициализация схемы (оставляем твою логику) ---
 export async function ensureTables() {
-  const client = await db.connect();
-  try {
-    await client.query(`ALTER TABLE users
-  ADD COLUMN IF NOT EXISTS country_code text,
-  ADD COLUMN IF NOT EXISTS country_name text;`);
+  // безопасные ALTER'ы
+  await db.query(`alter table if exists users
+    add column if not exists country_code text,
+    add column if not exists country_name text,
+    add column if not exists meta jsonb default '{}'::jsonb;`);
 
-    await client.query(`ALTER TABLE events
-  ADD COLUMN IF NOT EXISTS country_code text;`);
-    await client.query("alter table users add column if not exists meta jsonb default '{}'::jsonb");
+  await db.query(`alter table if exists events
+    add column if not exists country_code text;`);
 
-    await client.query(`create table if not exists users (
-      id serial primary key,
-      vk_id varchar(64) unique not null,
-      first_name text,
-      last_name text,
-      avatar text,
-      balance integer default 0,
-      ref_by varchar(64),
-      created_at timestamp default now(),
-      updated_at timestamp default now()
-    );`);
+  // таблицы
+  await db.query(`create table if not exists users (
+    id serial primary key,
+    vk_id varchar(64) unique not null,
+    first_name text,
+    last_name text,
+    avatar text,
+    balance integer default 0,
+    ref_by varchar(64),
+    meta jsonb default '{}'::jsonb,
+    created_at timestamp default now(),
+    updated_at timestamp default now()
+  );`);
 
-    await client.query(`create table if not exists transactions (
-      id serial primary key,
-      user_id integer references users(id) on delete cascade,
-      type varchar(32) not null,
-      amount integer not null,
-      meta jsonb,
-      created_at timestamp default now()
-    );`);
+  await db.query(`create table if not exists transactions (
+    id serial primary key,
+    user_id integer references users(id) on delete cascade,
+    type varchar(32) not null,
+    amount integer not null,
+    meta jsonb,
+    created_at timestamp default now()
+  );`);
 
-    await client.query(`create table if not exists events (
-      id serial primary key,
-      user_id integer references users(id) on delete set null,
-      event_type varchar(64) not null,
-      payload jsonb,
-      ip text,        -- text: чтобы не падать на нескольких IP в x-forwarded-for
-      ua text,
-      created_at timestamp default now()
-    );`);
-  
+  await db.query(`create table if not exists events (
+    id serial primary key,
+    user_id integer references users(id) on delete set null,
+    event_type varchar(64) not null,
+    payload jsonb,
+    ip text,
+    ua text,
+    created_at timestamp default now()
+  );`);
 
-// --- Linking tables ---
-    await client.query(`create table if not exists auth_accounts (
-  id serial primary key,
-  user_id integer references users(id) on delete cascade,
-  provider varchar(16) not null,
-  provider_user_id varchar(128) not null,
-  username text,
-  phone_hash text,
-  meta jsonb,
-  created_at timestamp default now(),
-  updated_at timestamp default now(),
-  unique(provider, provider_user_id)
-);`);
-    try { await client.query("alter table auth_accounts add column if not exists meta jsonb default '{}'::jsonb"); } catch {}
-    await client.query('create index if not exists idx_auth_accounts_phone_hash on auth_accounts(phone_hash)');
-    await client.query('create index if not exists auth_accounts_provider_user on auth_accounts(provider, provider_user_id)');
-    await client.query("create index if not exists auth_accounts_device on auth_accounts ((meta->>'device_id'))");
-    await client.query("create index if not exists users_merged_into on users (((meta->>'merged_into')::int))");
-    await client.query('create index if not exists events_created_at on events(created_at)');
-    await client.query(`create table if not exists link_codes (
-  id serial primary key,
-  user_id integer references users(id) on delete cascade,
-  code varchar(16) unique not null,
-  expires_at timestamp not null,
-  used_at timestamp,
-  created_at timestamp default now()
-);`);
-    await client.query(`create table if not exists admin_topups (
-  id serial primary key,
-  admin_name text,
-  admin_ip text,
-  ua text,
-  user_id integer references users(id) on delete set null,
-  amount integer not null,
-  reason text not null,
-  headers jsonb,
-  created_at timestamp default now()
-);`);
-    await client.query(`create table if not exists link_audit (
-  id serial primary key,
-  primary_id integer,
-  merged_id integer,
-  method varchar(32),
-  source varchar(32),
-  ip text,
-  ua text,
-  details jsonb,
-  created_at timestamp default now()
-);`);
-} finally {
-    client.release();
-  }
+  await db.query(`create table if not exists auth_accounts (
+    id serial primary key,
+    user_id integer references users(id) on delete cascade,
+    provider varchar(16) not null,
+    provider_user_id varchar(128) not null,
+    username text,
+    phone_hash text,
+    meta jsonb,
+    created_at timestamp default now(),
+    updated_at timestamp default now(),
+    unique(provider, provider_user_id)
+  );`);
+
+  // индексы (idempotent)
+  await db.query(`create index if not exists events_created_at on events(created_at);`);
+  await db.query(`create index if not exists idx_auth_accounts_phone_hash on auth_accounts(phone_hash);`);
+  await db.query(`create index if not exists auth_accounts_provider_user on auth_accounts(provider, provider_user_id);`);
+  await db.query(`create index if not exists auth_accounts_device on auth_accounts ((meta->>'device_id'));`);
+  await db.query(`create index if not exists users_merged_into on users (((meta->>'merged_into')::int));`);
+
+  await db.query(`create table if not exists link_codes (
+    id serial primary key,
+    user_id integer references users(id) on delete cascade,
+    code varchar(16) unique not null,
+    expires_at timestamp not null,
+    used_at timestamp,
+    created_at timestamp default now()
+  );`);
+
+  await db.query(`create table if not exists admin_topups (
+    id serial primary key,
+    admin_name text,
+    admin_ip text,
+    ua text,
+    user_id integer references users(id) on delete set null,
+    amount integer not null,
+    reason text not null,
+    headers jsonb,
+    created_at timestamp default now()
+  );`);
+
+  await db.query(`create table if not exists link_audit (
+    id serial primary key,
+    primary_id integer,
+    merged_id integer,
+    method varchar(32),
+    source varchar(32),
+    ip text,
+    ua text,
+    details jsonb,
+    created_at timestamp default now()
+  );`);
 }
 
+// Нужна в авторизации VK/TG
 export async function upsertUser({ vk_id, first_name, last_name, avatar }) {
   const q = `insert into users (vk_id, first_name, last_name, avatar)
     values ($1,$2,$3,$4)
@@ -118,55 +139,4 @@ export async function upsertUser({ vk_id, first_name, last_name, avatar }) {
     returning *;`;
   const { rows } = await db.query(q, [vk_id, first_name, last_name, avatar]);
   return rows[0];
-}
-
-export async function getUserByVkId(vk_id) {
-  const { rows } = await db.query('select * from users where vk_id = $1', [vk_id]);
-  return rows[0] || null;
-}
-
-export async function getUserById(id) {
-  const { rows } = await db.query('select * from users where id = $1', [id]);
-  return rows[0] || null;
-}
-
-export async function logEvent({ user_id, event_type, payload, ip, ua, country_code }) {
-  await db.query(
-    'insert into events (user_id, event_type, payload, ip, ua, country_code) values ($1,$2,$3,$4,$5,$6)',
-    [user_id || null, event_type, payload || null, ip || null, ua || null, country_code || null]
-  );
-}
-
-
-export async function updateUserCountryIfNull(userId, { country_code, country_name }) {
-  if (!userId || !country_code) return;
-  await db.query(
-    `UPDATE users
-       SET country_code = COALESCE(country_code, $2),
-           country_name = COALESCE(country_name, $3)
-     WHERE id = $1`,
-    [userId, country_code, country_name || country_code]
-  );
-}
-
-
-export async function adminAdjustBalance(userId, delta, reason) {
-  if (!userId || !Number.isInteger(delta)) throw new Error('bad_args');
-  const client = await db.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query(
-      "insert into transactions (user_id, type, amount, meta) values ($1, $2, $3, $4)",
-      [userId, (delta>=0?'admin_topup':'admin_adjust'), Math.abs(delta), JSON.stringify({ reason: reason || 'manual' })]
-    );
-    await client.query(
-      "update users set balance = coalesce(balance,0) + $2, updated_at = now() where id = $1",
-      [userId, delta]
-    );
-    await client.query('COMMIT');
-  } catch (e) {
-    await client.query('ROLLBACK'); throw e;
-  } finally {
-    client.release();
-  }
 }
