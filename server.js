@@ -121,6 +121,26 @@ app.get('/api/me', async (req, res) => {
       for (const r of q2b.rows) if (r.uid) ids.add(r.uid);
     }
 
+    if (ids.size) {
+      const allIds = Array.from(ids);
+      const rootsQ = await db.query(
+        "select id, coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id = any($1::int[])",
+        [allIds]
+      );
+      const extraRoots = new Set();
+      for (const row of rootsQ.rows) {
+        if (row.root_id && !ids.has(row.root_id)) extraRoots.add(row.root_id);
+      }
+      for (const root of extraRoots) ids.add(root);
+      if (extraRoots.size) {
+        const membersQ = await db.query(
+          "select id from users where (meta->>'merged_into')::int = any($1::int[])",
+          [Array.from(extraRoots)]
+        );
+        for (const row of membersQ.rows) ids.add(row.id);
+      }
+    }
+
     const clusterIds = Array.from(ids);
     const sumQ = await db.query("select coalesce(sum(coalesce(balance,0)),0)::int as total from users where id = any($1::int[])", [clusterIds]);
     const total = (sumQ.rows && sumQ.rows[0] && sumQ.rows[0].total) ? sumQ.rows[0].total : (user.balance||0);

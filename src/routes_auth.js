@@ -144,13 +144,13 @@ router.get('/vk/callback', async (req, res) => {
                      : (req.query && req.query.device_id ? String(req.query.device_id) : null);
       await db.query(`
         insert into auth_accounts (user_id, provider, provider_user_id, username, phone_hash, meta)
-        values ($1, 'vk', $2, $3, null, $4)
+        values ($1, 'vk', $2, $3, null, jsonb_build_object('device_id',$4))
         on conflict (provider, provider_user_id) do update set
           user_id   = coalesce(auth_accounts.user_id, excluded.user_id),
           username  = coalesce(excluded.username, auth_accounts.username),
           meta      = jsonb_strip_nulls(coalesce(auth_accounts.meta,'{}'::jsonb) || excluded.meta),
           updated_at = now()
-      `, [ user.id, vk_id, first_name || null, JSON.stringify({ device_id: deviceId || null }) ]);
+      `, [ user.id, vk_id, first_name || null, deviceId || null ]);
       if (deviceId) { try { await autoMergeByDevice({ deviceId }); } catch(_){ } }
     } catch (e) { console.warn('vk auth_account upsert failed', e && e.message); }
 const url = new URL(frontendUrl);
