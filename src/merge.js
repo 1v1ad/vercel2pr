@@ -15,15 +15,7 @@ export async function adminMergeUsersTx(client, primaryId, secondaryId) {
     "update users p set first_name = coalesce(nullif(p.first_name,''), s.first_name), last_name = coalesce(nullif(p.last_name,''), s.last_name), username = coalesce(nullif(p.username,''), s.username), avatar = coalesce(nullif(p.avatar,''), s.avatar), country_code = coalesce(nullif(p.country_code,''), s.country_code) from users s where p.id=$1 and s.id=$2",
     [primaryId, secondaryId]
   );
-  
-  // HUMid: переносим людей в один кластер
-  try {
-    // убедимся, что у primary есть hum_id
-    await client.query("update users set hum_id = coalesce(hum_id, id) where id = $1", [primaryId]);
-    // всем secondary и тем, кто был склеен в него ранее, присвоим hum_id primary
-    await client.query("update users set hum_id = (select hum_id from users where id=$1) where id = $2 or coalesce((meta->>'merged_into')::int,0) = $2", [primaryId, secondaryId]);
-  } catch {}
-await client.query("update users set balance=0, meta = jsonb_set(coalesce(meta,'{}'::jsonb), '{merged_into}', to_jsonb($1)::jsonb), updated_at=now() where id=$2", [primaryId, secondaryId]);
+  await client.query("update users set balance=0, meta = jsonb_set(coalesce(meta,'{}'::jsonb), '{merged_into}', to_jsonb($1)::jsonb), updated_at=now() where id=$2", [primaryId, secondaryId]);
 }
 
 // PRIMARY: выбираем VK, если есть запись с таким device_id; иначе любой
