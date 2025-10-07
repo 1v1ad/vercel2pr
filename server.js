@@ -1,171 +1,160 @@
-// Lightweight Express backend for Render — resilient to missing 'pg'
-import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
-import jwt from 'jsonwebtoken';
+import dotenv from 'dotenv';
+import geoip from 'geoip-lite';
 
-const PORT          = process.env.PORT || 3000;
-const FRONTEND_URL  = process.env.FRONTEND_URL || '*';
-const JWT_SECRET    = process.env.JWT_SECRET || 'dev-secret';
-const ADMIN_PASSWORD= process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD || 'admin';
-const DATABASE_URL  = process.env.DATABASE_URL || '';
+import { db, ensureTables, getUserById, logEvent, updateUserCountryIfNull } from './src/db.js';
+import authRouter from './src/routes_auth.js';
+import linkRouter from './src/routes_link.js';
+import tgRouter from './src/routes_tg.js'; // ← Добавили
+
+dotenv.config();
 
 const app = express();
-app.use(express.json());
-app.use(cookieParser());
+app.set('trust proxy', 1);
+
+const FRONTEND_URL = process.env.FRONTEND_URL;
+
 app.use(cors({
-  origin: (_origin, cb) => cb(null, true),
-  credentials: true
+  origin: [
+    FRONTEND_URL,
+    'https://sweet-twilight-63a9b6.netlify.app',
+  ].filter(Boolean),
+  credentials: true,
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Password'],
+  maxAge: 86400,
 }));
+app.options('*', cors());
 
-// ---- DB (optional). Service starts even if 'pg' is not installed or DATABASE_URL is empty.
-let db = null;
-if (DATABASE_URL) {
-  try {
-    const pg = await import('pg'); // dynamic import avoids startup crash if pg is missing
-    const { Pool } = pg;
-    db = new Pool({
-      connectionString: DATABASE_URL,
-      ssl: DATABASE_URL.includes('sslmode=require')
-        ? { rejectUnauthorized: false }
-        : false
-    });
-    console.log('[boot] PG pool ready');
-  } catch (e) {
-    console.warn('[boot] PG not available, running without DB:', e?.message || e);
-    db = null;
-  }
+app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // ← Добавили для form-urlencoded
+app.use(cookieParser());
+
+// Health (прогрев)
+app.get('/health', (_, res) => res.status(200).send('ok'));
+
+// Telegram auth callback (НОВОЕ)
+app.use('/api/auth/tg', tgRouter);
+
+// Остальные маршруты
+app.use('/api', linkRouter);
+app.use('/api/auth', authRouter);
+
+// === Admin feature (optional) ===
+if ((process.env.FEATURE_ADMIN || '').toLowerCase() === 'true') {
+  const { default: adminRouter } = await import('./src/routes_admin.js');
+  app.use('/api/admin', adminRouter);
 }
 
-function signSession(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
-}
-function parseSid(req) {
-  try {
-    const t = req.cookies?.sid;
-    if (!t) return null;
-    return jwt.verify(t, JWT_SECRET);
-  } catch {
-    return null;
-  }
-}
-
-// ---- health
-app.get('/healthz', (_req, res) => res.json({ ok: true, ts: Date.now(), db: Boolean(db) }));
-
-// ---- /api/me (clustered balance if DB is present)
+// Session info для фронта
 app.get('/api/me', async (req, res) => {
   try {
-    if (!db) return res.json({ ok: true, user: null, note: 'no-db' });
+    const token = req.cookies['sid'];
+    if (!token) return res.status(401).json({ ok: false });
 
-    const sid = parseSid(req);
-    let user = null;
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
+    const user = await getUserById(payload.uid);
+    if (!user) return res.status(401).json({ ok: false });
 
-    if (sid?.uid) {
-      const { rows } = await db.query(
-        'select id, vk_id, first_name, last_name, avatar, balance, meta from users where id=$1',
-        [sid.uid]
-      );
-      user = rows[0] || null;
-    }
-
-    const deviceIdCookie = (req.cookies?.device_id || '').trim();
-    const dids = [];
-    if (deviceIdCookie) dids.push(deviceIdCookie);
-
-    const ids = new Set();
-    if (user?.id) ids.add(user.id);
-
-    if (dids.length) {
-      const q2 = await db.query(
-        "select distinct user_id from auth_accounts where user_id is not null and coalesce(meta->>'device_id','')<>'' and meta->>'device_id' = any($1::text[])",
-        [dids]
-      );
-      for (const r of q2.rows) ids.add(r.user_id);
-
-      const q2b = await db.query(`
-        select distinct
-          case
-            when provider='vk' then (select id from users u where u.vk_id::text = a.provider_user_id limit 1)
-            when provider='tg' then (select id from users u where u.vk_id = 'tg:' || a.provider_user_id limit 1)
-            else null
-          end as uid
-        from auth_accounts a
-        where coalesce(a.meta->>'device_id','')<>'' and a.meta->>'device_id' = any($1::text[])
-      `, [dids]);
-      for (const r of q2b.rows) if (r.uid) ids.add(r.uid);
-    }
-
-    if (ids.size) {
-      const allIds = Array.from(ids);
-      const rootsQ = await db.query(
-        "select id, coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id = any($1::int[])",
-        [allIds]
-      );
-      const extraRoots = new Set();
-      for (const row of rootsQ.rows) if (row.root_id && !ids.has(row.root_id)) extraRoots.add(row.root_id);
-      for (const root of extraRoots) ids.add(root);
-
-      if (extraRoots.size) {
-        const membersQ = await db.query(
-          "select id from users where (meta->>'merged_into')::int = any($1::int[])",
-          [Array.from(extraRoots)]
-        );
-        for (const row of membersQ.rows) ids.add(row.id);
+        // Собираем кластер связанных аккаунтов (merged_into + общий device_id) и считаем суммарный баланс
+    let clusterIds = [user.id];
+    try {
+      const rootQ = await db.query("select coalesce(nullif(meta->>'merged_into','')::int, id) as root_id from users where id=$1", [user.id]);
+      const rootId = rootQ.rows && rootQ.rows[0] && rootQ.rows[0].root_id ? rootQ.rows[0].root_id : user.id;
+      const baseQ = await db.query("select id from users where id=$1 or (meta->>'merged_into')::int = $1", [rootId]);
+      const set = new Set(baseQ.rows.map(r => r.id));
+      // расширяем по device_id
+      const didsQ = await db.query("select distinct meta->>'device_id' as did from auth_accounts where user_id = any($1::int[]) and coalesce(meta->>'device_id','') <> ''", [Array.from(set)]);
+      const dids = didsQ.rows.map(r => r.did).filter(Boolean);
+      if (dids.length) {
+        const moreQ = await db.query("select distinct user_id from auth_accounts where user_id is not null and coalesce(meta->>'device_id','') <> '' and meta->>'device_id' = any($1::text[])", [dids]);
+        for (const r of moreQ.rows) set.add(r.user_id);
       }
-    }
+      clusterIds = Array.from(set);
+    } catch {}
 
-    const clusterIds = Array.from(ids);
-    let total = user?.balance || 0;
-    if (clusterIds.length) {
-      const sumQ = await db.query(
-        "select coalesce(sum(coalesce(balance,0)),0)::int as total from users where id = any($1::int[])",
-        [clusterIds]
-      );
-      total = sumQ.rows?.[0]?.total ?? total;
-    }
+    let effectiveBalance = user.balance ?? 0;
+    try {
+      const sumQ = await db.query("select coalesce(sum(coalesce(balance,0)),0)::int as total from users where id = any($1::int[])", [clusterIds]);
+      effectiveBalance = (sumQ.rows && sumQ.rows[0] && sumQ.rows[0].total) ? sumQ.rows[0].total : (user.balance ?? 0);
+    } catch {}
 
     res.json({
       ok: true,
-      user: user ? {
+      user: {
         id: user.id,
         vk_id: user.vk_id,
         first_name: user.first_name,
         last_name: user.last_name,
         avatar: user.avatar,
-        balance: total
-      } : null
+        balance: effectiveBalance,
+      },
     });
-  } catch (e) {
-    console.error('/api/me error', e);
-    res.status(500).json({ ok:false });
+} catch {
+    res.status(401).json({ ok: false });
   }
 });
 
-// ---- background link stub (safe even without DB)
-app.post('/api/link/background', async (req, res) => {
+// Client events (аналитика)
+app.post('/api/events', async (req, res) => {
   try {
-    if (!db) return res.json({ ok:true, merged:false, note:'no-db' });
-    const { provider, provider_user_id, username, device_id } = req.body || {};
-    if (!provider || !provider_user_id) return res.json({ ok:false, reason:'bad_payload' });
+    const { type, payload } = req.body || {};
+    if (!type) return res.status(400).json({ ok: false, error: 'type required' });
 
-    await db.query(`
-      insert into auth_accounts (user_id, provider, provider_user_id, username, phone_hash, meta)
-      values (null, $1, $2, $3, null, jsonb_build_object('device_id',$4))
-      on conflict (provider, provider_user_id) do update set
-        username = coalesce(excluded.username, auth_accounts.username),
-        meta     = jsonb_strip_nulls(coalesce(auth_accounts.meta,'{}'::jsonb) || excluded.meta),
-        updated_at = now()
-    `, [provider, String(provider_user_id), username || null, device_id || null]);
+    const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
+    const ip = ipHeader.split(',')[0].trim();
+    let userId = null;
 
-    res.json({ ok:true, merged:false });
+    let country_code = null;
+    try {
+      const hit = ip && geoip.lookup(ip);
+      if (hit && hit.country) country_code = hit.country;
+    } catch {}
+
+    const token = req.cookies['sid'];
+    if (token) {
+      try {
+        const p = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
+        userId = p.uid || null;
+      } catch {}
+    }
+
+    await logEvent({
+      user_id: userId,
+      event_type: String(type).slice(0, 64),
+      payload: payload || null,
+      ip,
+      ua: (req.headers['user-agent'] || '').slice(0, 256),
+      country_code,
+    });
+
+    if (userId && country_code) {
+      await updateUserCountryIfNull(userId, { country_code, country_name: country_code });
+    }
+
+    res.json({ ok: true });
   } catch (e) {
-    console.warn('link/background error', e?.message);
-    res.json({ ok:false, error:String(e?.message || e) });
+    console.error('events error', e);
+    res.status(500).json({ ok: false });
   }
 });
 
-app.listen(PORT, () => {
-  console.log('server listening on :' + PORT);
-});
+// Root
+app.get('/', (_, res) => res.send('VK Auth backend up'));
+
+const PORT = process.env.PORT || 3001;
+
+// слушаем порт сразу, чтобы Render не «висел» при пробуждении
+app.listen(PORT, () => console.log(`API on :${PORT}`));
+
+// Инициализацию БД запускаем асинхронно, без блокировки старта
+(async () => {
+  try {
+    await ensureTables();
+    console.log('DB ready (ensureTables done)');
+  } catch (e) {
+    console.error('DB init error (non-fatal):', e);
+  }
+})();
