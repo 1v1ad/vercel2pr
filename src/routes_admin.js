@@ -29,7 +29,7 @@ router.get('/summary', async (_req, res) => {
     const hasType = set.has('type');
     const hasEventType = set.has('event_type');
 
-    const e = await db.query('select count(*)::int as c from events');
+    const e = await db.query('select count(*)::int as c from events e left join users u on u.id = e.user_id');
     const events = e.rows[0]?.c ?? 0;
 
     let auth7 = 0;
@@ -37,12 +37,12 @@ router.get('/summary', async (_req, res) => {
       const parts = [];
       if (hasEventType) parts.push("event_type in ('auth','login','auth_start','auth_callback')");
       if (hasType)      parts.push('\"type\" in (\'auth\',\'login\',\'auth_start\',\'auth_callback\')');
-      const sql = 'select count(*)::int as c from events where (' + parts.join(' or ') + ") and created_at > now() - interval '7 days'";
+      const sql = 'select count(*)::int as c from events e left join users u on u.id = e.user_id where (' + parts.join(' or ') + ") and created_at > now() - interval '7 days'";
       const r = await db.query(sql);
       auth7 = r.rows[0]?.c ?? 0;
     }
 
-    const uq = await db.query("select count(distinct user_id)::int as c from events where created_at > now() - interval '7 days'");
+    const uq = await db.query("select count(distinct user_id)::int as c from events e left join users u on u.id = e.user_id where created_at > now() - interval '7 days'");
     const unique7 = uq.rows[0]?.c ?? 0;
 
     res.json({ ok:true, users, events, auth7, unique7 });
@@ -106,7 +106,7 @@ router.get('/summary/daily', async (req, res) => {
         select
           (created_at at time zone $2)::date as day,
           count(*) as auth
-        from events
+        from events e left join users u on u.id = e.user_id
         where ${AUTH_WHERE}
           and created_at >= ((select today from bounds)::timestamp - ($1::int - 1) * interval '1 day')
         group by 1
@@ -115,7 +115,7 @@ router.get('/summary/daily', async (req, res) => {
         select
           (created_at at time zone $2)::date as day,
           count(distinct user_id) as uniq
-        from events
+        from events e left join users u on u.id = e.user_id
         where created_at >= ((select today from bounds)::timestamp - ($1::int - 1) * interval '1 day')
         group by 1
       )
@@ -147,21 +147,21 @@ router.get('/users', async (req, res) => {
     const params = [];
     function add(v){ params.push(v); return '$' + params.length; }
 
-    let where = "where coalesce(u.meta->>'merged_into','') = ''";
+    let where = "where 1=1";
     if (search) {
       const p = add('%' + search + '%');
       where += ' and (cast(u.vk_id as text) ilike ' + p + ' or u.first_name ilike ' + p + ' or u.last_name ilike ' + p + ')';
     }
 
     const sql = [
-      'select u.id, u.vk_id, u.first_name, u.last_name, u.avatar, u.balance,',
+      'select u.hum_id, u.id as user_id, u.vk_id, u.first_name, u.last_name, u.avatar, u.balance,',
       '       u.country_code, u.country_name, u.created_at, u.updated_at,',
       '       coalesce(array_agg(distinct aa.provider) filter (where aa.user_id is not null), \'{}\') as providers',
       '  from users u',
       '  left join auth_accounts aa on aa.user_id = u.id',
       where,
-      ' group by u.id, u.vk_id, u.first_name, u.last_name, u.avatar, u.balance, u.country_code, u.country_name, u.created_at, u.updated_at',
-      ' order by u.id desc',
+      ' group by u.hum_id, u.id, u.vk_id, u.first_name, u.last_name, u.avatar, u.balance, u.country_code, u.country_name, u.created_at, u.updated_at',
+      ' order by u.hum_id asc, u.id asc',
       ' limit ' + add(limit) + ' offset ' + add(offset)
     ].join('\n');
 
@@ -185,7 +185,7 @@ router.get('/events', async (req, res) => {
     const params = [];
     function add(v){ params.push(v); return '$' + params.length; }
 
-    const selectCols = ['id as event_id','user_id', (hasEventType ? 'event_type' : "NULL::text as event_type"), (hasType ? '"type"' : "NULL::text as type"), (hasIp ? 'ip' : "NULL::text as ip"), (hasUa ? 'ua' : "NULL::text as ua"), (hasCreated ? 'created_at' : "now() as created_at")];
+    const selectCols = ['e.id as event_id','u.hum_id','e.user_id', (hasEventType ? 'e.event_type' : "NULL::text as event_type"), (hasType ? 'e."type"' : "NULL::text as type"), (hasIp ? 'e.ip' : "NULL::text as ip"), (hasUa ? 'e.ua' : "NULL::text as ua"), (hasCreated ? 'e.created_at' : "now() as created_at")];
     if (hasEventType) selectCols.push('event_type'); else selectCols.push("NULL::text as event_type");
     if (hasType)      selectCols.push('\"type\"'); else selectCols.push("NULL::text as type");
     if (hasIp) selectCols.push('ip'); else selectCols.push("NULL::text as ip");
@@ -210,7 +210,7 @@ router.get('/events', async (req, res) => {
     const limit  = Math.min(200, parseInt(req.query.limit || '50', 10) || 50);
     const offset = Math.max(0, parseInt(req.query.offset || '0', 10) || 0);
 
-    const sql = 'select ' + selectCols.join(', ') + ' from events' + where + ' order by id desc limit ' + add(limit) + ' offset ' + add(offset);
+    const sql = 'select ' + selectCols.join(', ') + ' from events e left join users u on u.id = e.user_id' + where + ' order by id desc limit ' + add(limit) + ' offset ' + add(offset);
     const r = await db.query(sql, params);
     res.json({ ok:true, events:r.rows });
   } catch (e) {
@@ -364,13 +364,13 @@ router.get(['/summary/daily', '/daily'], async (req, res) => {
       ),
       auth as (
         select date_trunc('day', created_at) as d, count(*)::int as c
-          from events
+          from events e left join users u on u.id = e.user_id
          where ${authCond}
          group by 1
       ),
       uniq as (
         select date_trunc('day', created_at) as d, count(distinct user_id)::int as c
-          from events
+          from events e left join users u on u.id = e.user_id
          group by 1
       )
       select to_char(days.d, 'YYYY-MM-DD') as day,
