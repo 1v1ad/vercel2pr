@@ -2,7 +2,7 @@
 // минимальный и детерминированный роутер админки
 
 import express from 'express';
-import db from './db.js'; // важно: расширение .js в ESM
+import { db } from './db.js';   // именованный экспорт
 
 const router = express.Router();
 
