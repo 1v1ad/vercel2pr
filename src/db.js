@@ -13,6 +13,11 @@ export const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl });
 export async function ensureTables() {
   const client = await db.connect();
   try {
+    // HUMid: единый id человека
+    await client.query("alter table users add column if not exists hum_id int");
+    await client.query("update users set hum_id = id where hum_id is null");
+    await client.query("create index if not exists idx_users_hum_id on users(hum_id)");
+
     await client.query(`ALTER TABLE users
   ADD COLUMN IF NOT EXISTS country_code text,
   ADD COLUMN IF NOT EXISTS country_name text;`);
