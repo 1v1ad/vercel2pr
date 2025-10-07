@@ -1,37 +1,35 @@
-// src/routes_admin.js — минимальный, устойчивый админ-роутер
-const express = require('express');
-const router = express.Router();
-const db = require('./db'); // тот же модуль, который используется в проекте
+// src/routes_admin.js (ESM)
+// минимальный и детерминированный роутер админки
 
-// простая проверка пароля
-function adminGuard(req, res, next) {
+import express from 'express';
+import db from './db.js'; // важно: расширение .js в ESM
+
+const router = express.Router();
+
+// --- guard ---
+router.use((req, res, next) => {
   const need = process.env.ADMIN_PASSWORD || '';
-  const got = req.get('X-Admin-Password') || '';
+  const got  = req.get('X-Admin-Password') || '';
   if (!need || got !== need) return res.status(401).json({ ok: false });
   next();
-}
-router.use(adminGuard);
+});
 
-// ---------- USERS ----------
+// --- USERS ---
 router.get('/users', async (req, res) => {
   try {
-    const take = Math.max(1, Math.min(500, parseInt(req.query.take || '50', 10)));
-    const page = Math.max(0, parseInt(req.query.page || '0', 10));
+    const take   = Math.max(1, Math.min(500, parseInt(req.query.take || '50', 10)));
+    const page   = Math.max(0, parseInt(req.query.page || '0', 10));
     const offset = page * take;
 
-    // опциональный поиск по vk_id, имени, фамилии, user_id
     const search = (req.query.search || '').trim();
     const params = [];
     let where = 'where 1=1';
     if (search) {
-      params.push(`%${search}%`);
-      params.push(`%${search}%`);
-      params.push(search);
-      params.push(search);
+      params.push(`%${search}%`, `%${search}%`, search, search);
       where += ` and (
-        coalesce(u.vk_id::text, '') ilike $${params.length - 3} or
-        coalesce(u.first_name,'') ilike $${params.length - 2} or
-        u.id::text = $${params.length - 1} or
+        coalesce(u.vk_id::text,'') ilike $${params.length-3} or
+        coalesce(u.first_name,'') ilike $${params.length-2} or
+        u.id::text = $${params.length-1} or
         coalesce(u.last_name,'') ilike $${params.length}
       )`;
     }
@@ -39,19 +37,19 @@ router.get('/users', async (req, res) => {
 
     const sql = `
       select
-        coalesce(u.hum_id, u.id)                as hum_id,
-        u.id                                    as user_id,
-        u.vk_id,                                -- в tg у нас там строка вида 'tg:165…'
-        coalesce(u.first_name,'')               as first_name,
-        coalesce(u.last_name,'')                as last_name,
-        coalesce(u.balance,0)                   as balance,
-        coalesce(u.country_code,'')             as country_code,
-        coalesce(u.country_name,'')             as country_name,
-        coalesce(u.created_at, now())           as created_at,
+        coalesce(u.hum_id, u.id)      as hum_id,
+        u.id                          as user_id,
+        u.vk_id,
+        coalesce(u.first_name,'')     as first_name,
+        coalesce(u.last_name,'')      as last_name,
+        coalesce(u.balance,0)         as balance,
+        coalesce(u.country_code,'')   as country_code,
+        coalesce(u.country_name,'')   as country_name,
+        coalesce(u.created_at, now()) as created_at,
         array_remove(array[
           case when u.vk_id is not null and u.vk_id !~ '^tg:' then 'vk' end,
           case when u.vk_id ilike 'tg:%' then 'tg' end
-        ], null)                                as providers
+        ], null)                      as providers
       from users u
       ${where}
       order by hum_id asc, user_id asc
@@ -64,11 +62,11 @@ router.get('/users', async (req, res) => {
   }
 });
 
-// ---------- EVENTS ----------
+// --- EVENTS ---
 router.get('/events', async (req, res) => {
   try {
-    const take = Math.max(1, Math.min(500, parseInt(req.query.take || '50', 10)));
-    const page = Math.max(0, parseInt(req.query.page || '0', 10));
+    const take   = Math.max(1, Math.min(500, parseInt(req.query.take || '50', 10)));
+    const page   = Math.max(0, parseInt(req.query.page || '0', 10));
     const offset = page * take;
 
     const filters = [];
@@ -88,13 +86,13 @@ router.get('/events', async (req, res) => {
 
     const sql = `
       select
-        e.id                         as event_id,
-        coalesce(u.hum_id, u.id)     as hum_id,
+        e.id                          as event_id,
+        coalesce(u.hum_id, u.id)      as hum_id,
         e.user_id,
-        coalesce(e.event_type,'')    as event_type,
-        coalesce(e."type",'')        as "type",
-        coalesce(e.ip,'')            as ip,
-        coalesce(e.ua,'')            as ua,
+        coalesce(e.event_type,'')     as event_type,
+        coalesce(e."type",'')         as "type",
+        coalesce(e.ip,'')             as ip,
+        coalesce(e.ua,'')             as ua,
         coalesce(e.created_at, now()) as created_at
       from events e
       left join users u on u.id = e.user_id
@@ -109,16 +107,14 @@ router.get('/events', async (req, res) => {
   }
 });
 
-// ---------- SUMMARY (daily) ----------
-router.get('/summary/daily', async (req, res) => {
+// --- SUMMARY (daily) ---
+async function summaryDaily(req, res) {
   try {
     const days = Math.max(1, Math.min(31, parseInt(req.query.days || '7', 10)));
     const tz   = (req.query.tz || 'Europe/Moscow').toString();
 
     const sql = `
-      with bounds as (
-        select (date_trunc('day', (now() at time zone $2))::date) as today
-      ),
+      with bounds as (select (date_trunc('day', (now() at time zone $2))::date) as today),
       days as (
         select (select today from bounds) - s as day
         from generate_series($1::int - 1, 0, -1) s
@@ -150,12 +146,8 @@ router.get('/summary/daily', async (req, res) => {
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
-});
+}
+router.get('/summary/daily', summaryDaily);
+router.get('/daily', summaryDaily);
 
-// короткий алиас, чтобы фронт мог звать /daily
-router.get('/daily', (req, res, next) => {
-  req.url = req.url.replace('/daily', '/summary/daily');
-  next();
-}, router._router.stack.find(l => l.route && l.route.path === '/summary/daily').route.stack[0].handle);
-
-module.exports = router;
+export default router;
