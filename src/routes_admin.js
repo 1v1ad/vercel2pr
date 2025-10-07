@@ -1,20 +1,25 @@
-// src/routes_admin.js (ESM)
-// минимальный и детерминированный роутер админки
+// src/routes_admin.js (ESM, stable)
+// Минимальный и детерминированный роутер для админки GGRoom.
+// Совместим с "type":"module". Требует именованный экспорт { db } из ./db.js
 
 import express from 'express';
-import { db } from './db.js';   // именованный экспорт
+import { db } from './db.js'; // именованный экспорт!
 
 const router = express.Router();
 
-// --- guard ---
+// ---------------- Guard ----------------
 router.use((req, res, next) => {
-  const need = process.env.ADMIN_PASSWORD || '';
-  const got  = req.get('X-Admin-Password') || '';
-  if (!need || got !== need) return res.status(401).json({ ok: false });
-  next();
+  try {
+    const need = (process.env.ADMIN_PASSWORD || '').toString();
+    const got  = (req.get('X-Admin-Password') || '').toString();
+    if (!need || got !== need) return res.status(401).json({ ok:false });
+    next();
+  } catch {
+    return res.status(401).json({ ok:false });
+  }
 });
 
-// --- USERS ---
+// ---------------- USERS ----------------
 router.get('/users', async (req, res) => {
   try {
     const take   = Math.max(1, Math.min(500, parseInt(req.query.take || '50', 10)));
@@ -56,13 +61,13 @@ router.get('/users', async (req, res) => {
       limit $${params.length-1} offset $${params.length}
     `;
     const r = await db.query(sql, params);
-    res.json({ ok: true, users: r.rows });
+    res.json({ ok:true, users:r.rows });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    res.status(500).json({ ok:false, error:String(e && e.message || e) });
   }
 });
 
-// --- EVENTS ---
+// ---------------- EVENTS ----------------
 router.get('/events', async (req, res) => {
   try {
     const take   = Math.max(1, Math.min(500, parseInt(req.query.take || '50', 10)));
@@ -73,14 +78,13 @@ router.get('/events', async (req, res) => {
     const params  = [];
 
     if (req.query.event_type) {
-      params.push(req.query.event_type);
+      params.push(req.query.event_type.toString());
       filters.push(`e.event_type = $${params.length}`);
     }
     if (req.query.user_id) {
       params.push(parseInt(req.query.user_id, 10));
       filters.push(`e.user_id = $${params.length}`);
     }
-
     const where = filters.length ? `where ${filters.join(' and ')}` : '';
     params.push(take, offset);
 
@@ -101,14 +105,50 @@ router.get('/events', async (req, res) => {
       limit $${params.length-1} offset $${params.length}
     `;
     const r = await db.query(sql, params);
-    res.json({ ok: true, events: r.rows });
+    res.json({ ok:true, events:r.rows });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    res.status(500).json({ ok:false, error:String(e && e.message || e) });
   }
 });
 
-// --- SUMMARY (daily) ---
-async function summaryDaily(req, res) {
+// -------- Summary cards (/summary) --------
+router.get('/summary', async (req, res) => {
+  try {
+    const r = await db.query(`
+      with recent as (
+        select now() - interval '7 days' as ts
+      ),
+      counts as (
+        select
+          (select count(*) from users) as users_total,
+          (select count(*) from events) as events_total,
+          (select count(*)
+             from events e
+            where e.created_at >= (select ts from recent)
+              and (coalesce(e.event_type,'') ilike 'auth%%'
+                   or coalesce(e.event_type,'') ilike 'login%%')) as auth7_total,
+          (select count(distinct coalesce(u.hum_id, u.id))
+             from events e
+             join users u on u.id = e.user_id
+            where e.created_at >= (select ts from recent)) as unique7_total
+      )
+      select * from counts
+    `);
+    const row = r.rows?.[0] || {};
+    res.json({
+      ok: true,
+      users:   Number(row.users_total   || 0),
+      events:  Number(row.events_total  || 0),
+      auth7:   Number(row.auth7_total   || 0),
+      unique7: Number(row.unique7_total || 0)
+    });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e && e.message || e) });
+  }
+});
+
+// -------- Daily for chart (/summary/daily + /daily) --------
+async function handleDaily(req, res){
   try {
     const days = Math.max(1, Math.min(31, parseInt(req.query.days || '7', 10)));
     const tz   = (req.query.tz || 'Europe/Moscow').toString();
@@ -124,6 +164,7 @@ async function summaryDaily(req, res) {
         select (e.created_at at time zone $2)::date d, count(*) c
         from events e
         where e.created_at >= ((select today from bounds)::timestamp - ($1::int - 1) * interval '1 day')
+          and (coalesce(e.event_type,'') ilike 'auth%%' or coalesce(e.event_type,'') ilike 'login%%')
         group by 1
       ),
       uniq as (
@@ -142,12 +183,12 @@ async function summaryDaily(req, res) {
       order by d.day asc
     `;
     const r = await db.query(sql, [days, tz]);
-    res.json({ ok: true, users: r.rows });
+    res.json({ ok:true, users:r.rows });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    res.status(500).json({ ok:false, error:String(e && e.message || e) });
   }
 }
-router.get('/summary/daily', summaryDaily);
-router.get('/daily', summaryDaily);
+router.get('/summary/daily', handleDaily);
+router.get('/daily',          handleDaily);
 
 export default router;
