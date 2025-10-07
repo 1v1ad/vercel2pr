@@ -1,9 +1,12 @@
-// src/routes_admin.js (ESM, stable, v2)
+// src/routes_admin.js (ESM, stable, v3)
+// Совместимо с "type":"module". Требует именованный экспорт { db } из ./db.js
+
 import express from 'express';
 import { db } from './db.js';
 
 const router = express.Router();
 
+// ---------- Guard ----------
 router.use((req, res, next) => {
   const need = (process.env.ADMIN_PASSWORD || '').toString();
   const got  = (req.get('X-Admin-Password') || '').toString();
@@ -11,9 +14,10 @@ router.use((req, res, next) => {
   next();
 });
 
+// ---------- USERS ----------
 router.get('/users', async (req, res) => {
   try {
-    const take   = Math.max(1, Math.min(500, parseInt(req.query.take || '50', 10)));
+    const take   = Math.max(1, Math.min(500, parseInt(req.query.take || '25', 10)));
     const skip   = Math.max(0, parseInt(req.query.skip || '0', 10));
     const offset = skip;
 
@@ -53,10 +57,12 @@ router.get('/users', async (req, res) => {
     `;
     const r = await db.query(sql, params);
     const rows = r.rows || [];
+    // frontend ожидает столбец HUMid, но берёт значение из u.id — отдадим оба
     res.json({
       ok: true,
       users: rows.map(u => ({
-        HUMid: u.hum_id,
+        id: u.hum_id,                // для рендера первой колонки (HUMid)
+        HUMid: u.hum_id,             // пригодится в дальнейшем и для API
         user_id: u.user_id,
         vk_id: u.vk_id,
         first_name: u.first_name,
@@ -72,6 +78,7 @@ router.get('/users', async (req, res) => {
   }
 });
 
+// ---------- EVENTS ----------
 router.get('/events', async (req, res) => {
   try {
     const take   = Math.max(1, Math.min(500, parseInt(req.query.take || '50', 10)));
@@ -81,14 +88,20 @@ router.get('/events', async (req, res) => {
     const filters = [];
     const params  = [];
 
-    if (req.query.event_type) {
-      params.push(req.query.event_type.toString());
+    // event_type: принимать только буквенно-цифровые/подчёркивание и не "user_id"
+    const et = (req.query.event_type || '').toString().trim();
+    if (et && et !== 'user_id' && /^[a-zA-Z0-9_:-]+$/.test(et)) {
+      params.push(et);
       filters.push(`e.event_type = $${params.length}`);
     }
-    if (req.query.user_id) {
-      params.push(parseInt(req.query.user_id, 10));
+
+    // user_id: только целое число
+    const uidRaw = (req.query.user_id || '').toString().trim();
+    if (/^\d+$/.test(uidRaw)) {
+      params.push(Number(uidRaw));
       filters.push(`e.user_id = $${params.length}`);
     }
+
     const where = filters.length ? `where ${filters.join(' and ')}` : '';
     params.push(take, offset);
 
@@ -98,7 +111,7 @@ router.get('/events', async (req, res) => {
         coalesce(u.hum_id, u.id)      as hum_id,
         e.user_id,
         coalesce(e.event_type,'')     as event_type,
-        ''::text                      as "type",
+        ''::text                      as "type",      -- фолбэк: колонка могла отсутствовать
         coalesce(e.ip,'')             as ip,
         coalesce(e.ua,'')             as ua,
         coalesce(e.created_at, now()) as created_at
@@ -128,12 +141,11 @@ router.get('/events', async (req, res) => {
   }
 });
 
+// ---------- SUMMARY cards ----------
 router.get('/summary', async (req, res) => {
   try {
     const r = await db.query(`
-      with recent as (
-        select now() - interval '7 days' as ts
-      ),
+      with recent as ( select now() - interval '7 days' as ts ),
       counts as (
         select
           (select count(*) from users) as users_total,
@@ -163,6 +175,8 @@ router.get('/summary', async (req, res) => {
   }
 });
 
+// ---------- DAILY for chart ----------
+// chart.js принимает один из форматов; отдадим самый совместимый: { ok:true, days:[{date, auth, unique}] }
 async function handleDaily(req, res){
   try {
     const days = Math.max(1, Math.min(31, parseInt(req.query.days || '7', 10)));
@@ -198,8 +212,12 @@ async function handleDaily(req, res){
       order by d.day asc
     `;
     const r = await db.query(sql, [days, tz]);
-    const rows = r.rows || [];
-    res.json({ ok:true, users: rows, data: rows });
+    const rows = (r.rows || []).map(x => ({
+      date: x.day,                 // то, что ждёт chart.js
+      auth: Number(x.auth || 0),
+      unique: Number(x.uniq || 0),
+    }));
+    res.json({ ok:true, days: rows });
   } catch (e) {
     res.status(500).json({ ok:false, error:String(e && e.message || e) });
   }
