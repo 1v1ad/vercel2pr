@@ -1,4 +1,4 @@
-// src/routes_admin.js — V3.7 (MSK-safe dates, auth_success only, robust /events)
+// src/routes_admin.js — V3.8 (MSK, canonical logins, robust events)
 import express from 'express';
 import { db } from './db.js';
 
@@ -13,6 +13,7 @@ router.use((req,res,next)=>{
   next();
 });
 
+/* ---------- helpers ---------- */
 const getCols = async (table) => {
   const r = await db.query(`
     select column_name from information_schema.columns
@@ -21,16 +22,17 @@ const getCols = async (table) => {
   return new Set((r.rows||[]).map(x=>x.column_name));
 };
 
-// перенос времени в указанную TZ с безопасной проверкой типа столбца
-const tzExpr = (alias='created_at', tbl='e') => `
+// tzExprN(placeholderIndex, col, tbl)
+// безопасно приводит created_at к нужной TZ, учитывая timestamp/timestamptz
+const tzExprN = (n=1, col='created_at', tbl='e') => `
 CASE
-  WHEN pg_typeof(${tbl}.${alias}) = 'timestamp with time zone'::regtype
-    THEN (${tbl}.${alias} AT TIME ZONE $1)
-  ELSE ((${tbl}.${alias} AT TIME ZONE 'UTC') AT TIME ZONE $1)
+  WHEN pg_typeof(${tbl}.${col}) = 'timestamp with time zone'::regtype
+    THEN (${tbl}.${col} AT TIME ZONE $${n})
+  ELSE ((${tbl}.${col} AT TIME ZONE 'UTC') AT TIME ZONE $${n})
 END
 `;
 
-/* ---------- USERS (как было) ---------- */
+/* ---------- USERS ---------- */
 router.get('/users', async (req,res)=>{
   try{
     const take = Math.max(1,Math.min(500,parseInt(req.query.take||'50',10)));
@@ -97,23 +99,24 @@ router.get('/events', async (req,res)=>{
     const take = Math.min(200, Math.max(1, parseInt(req.query.take||'50',10)));
     const skip = Math.max(0, parseInt(req.query.skip||'0',10));
 
-    // какие колонки реально есть
     const has = (c)=>cols.has(c);
     const idCol   = has('id') ? 'e.id' : 'row_number() over()';
-    const uidCol  = has('user_id') ? 'e.user_id' : null;
+    const uidCol  = has('user_id') ? 'e.user_id'
+                  : has('uid')      ? 'e.uid'
+                  : has('user')     ? 'e."user"'
+                  : null;
     const typeCol = has('event_type') ? 'e.event_type'
-                 : has('type')       ? 'e."type"'
-                 : `NULL::text`;
+                  : has('type')       ? 'e."type"'
+                  : `NULL::text`;
     const ipCol   = has('ip')        ? 'e.ip' : `NULL::text`;
     const uaCol   = has('ua')        ? 'e.ua'
-                 : has('user_agent') ? 'e.user_agent'
-                 : `NULL::text`;
+                  : has('user_agent') ? 'e.user_agent'
+                  : `NULL::text`;
     const tsCol   = has('created_at')? 'e.created_at'
-                 : has('ts')         ? 'e.ts'
-                 : has('time')       ? 'e.time'
-                 : 'now()';
+                  : has('ts')         ? 'e.ts'
+                  : has('time')       ? 'e.time'
+                  : 'now()';
 
-    // WHERE
     const p=[]; const cond=[];
     const et = (req.query.type || req.query.event_type || '').toString().trim();
     if (et && (has('event_type') || has('type'))) {
@@ -124,7 +127,7 @@ router.get('/events', async (req,res)=>{
     if (uid && uidCol) cond.push(`${uidCol} = $${p.push(parseInt(uid,10)||0)}`);
     const where = cond.length ? ('where ' + cond.join(' and ')) : '';
 
-    const joinUsers = !!uidCol; // HUMid только если есть user_id
+    const joinUsers = !!uidCol;
     p.push(take, skip);
     const sql = `
       select
@@ -151,7 +154,7 @@ router.get('/events', async (req,res)=>{
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
 
-/* ---------- SUMMARY (MSK dates, только auth_success) ---------- */
+/* ---------- SUMMARY (MSK + канонические логины) ---------- */
 router.get('/summary', async (req,res)=>{
   try{
     const tz = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
@@ -161,91 +164,109 @@ router.get('/summary', async (req,res)=>{
 
     const haveEvents = await db.query("select to_regclass('public.events') as r");
     if (!haveEvents.rows?.[0]?.r) {
-      return res.json({ ok:true, users, events:0, auth7:0, unique7:0 });
+      return res.json({ ok:true, users, events:0, auth7:0, auth7_total:0, unique7:0 });
     }
 
-    const cols = await getCols('events');
-    const hasType = cols.has('type');
-    const hasEventType = cols.has('event_type');
-
-    // только auth_success
-    const authWhere = hasEventType ? 'e.event_type = \'auth_success\''
-                    : hasType      ? 'e."type"     = \'auth_success\''
-                    : 'false';
+    // канонизация логинов: login_success + orphan auth_success (±10 мин от login_success того же user_id)
+    const sql = `
+      with b as (
+        select (now() at time zone $1)::date as today,
+               ((now() at time zone $1)::date - interval '7 days') as since
+      ),
+      ev as (
+        select e.user_id,
+               ${tzExprN(1,'created_at','e')} as ts_msk,
+               coalesce(e.event_type::text, e."type"::text) as et
+        from events e
+      ),
+      login as (select user_id, ts_msk from ev where et ilike '%login%success%'),
+      auth  as (select user_id, ts_msk from ev where et ilike '%auth%success%'),
+      auth_orphan as (
+        select a.user_id, a.ts_msk
+        from auth a
+        left join login l
+          on l.user_id = a.user_id
+         and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
+        where l.user_id is null
+      ),
+      canon as (
+        select * from login
+        union all
+        select * from auth_orphan
+      )
+      select
+        (select count(*)::int
+           from canon c
+          where c.ts_msk::date >= (select since from b)
+        ) as auth7_total,
+        (select count(distinct coalesce(u.hum_id,u.id))::int
+           from canon c join users u on u.id=c.user_id
+          where c.ts_msk::date >= (select since from b)
+        ) as auth7
+    `;
+    const r = await db.query(sql, [tz]);
+    const x = r.rows?.[0] || {};
 
     const e = await db.query('select count(*)::int as c from events');
     const events = e.rows?.[0]?.c ?? 0;
 
-    // 7 дней с учётом TZ и типа created_at
-    const r1 = await db.query(
-      `select count(*)::int as c
-         from events e
-        where ${authWhere}
-          and ${tzExpr('created_at','e')} > (now() at time zone $1) - interval '7 days'`,
-      [tz]
-    );
-    const auth7_total = r1.rows?.[0]?.c ?? 0;
-
-    // уникальные HUM по auth_success за 7 дней
-    const r2 = await db.query(
+    // для твоей карточки «Уникальные (7д)» — по любым событиям
+    const rU = await db.query(
       `select count(distinct coalesce(u.hum_id,u.id))::int as c
-         from events e
-         join users u on u.id = e.user_id
-        where ${authWhere}
-          and ${tzExpr('created_at','e')} > (now() at time zone $1) - interval '7 days'`,
+         from events e join users u on u.id=e.user_id
+        where (${tzExprN(1,'created_at','e')}) > (now() at time zone $1) - interval '7 days'`,
       [tz]
     );
-    const auth7 = r2.rows?.[0]?.c ?? 0;
 
-    // уникальные HUM по всем событиям (для твоей карточки "Уникальные (7д)")
-    const r3 = await db.query(
-      `select count(distinct coalesce(u.hum_id,u.id))::int as c
-         from events e
-         join users u on u.id = e.user_id
-        where ${tzExpr('created_at','e')} > (now() at time zone $1) - interval '7 days'`,
-      [tz]
-    );
-    const unique7 = r3.rows?.[0]?.c ?? 0;
-
-    res.json({ ok:true, users, events, auth7, auth7_total, unique7 });
+    res.json({
+      ok:true,
+      users,
+      events,
+      auth7_total: Number(x.auth7_total || 0),
+      auth7:       Number(x.auth7 || 0),
+      unique7:     Number(rU.rows?.[0]?.c || 0),
+    });
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
 
-/* ---------- DAILY (MSK dates, только auth_success) ---------- */
+/* ---------- DAILY (MSK + канон. логины, фикс плейсхолдера) ---------- */
 async function daily(req,res){
   try{
-    const days=Math.max(1,Math.min(31,parseInt(req.query.days||'7',10)));
-    const tz  = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
+    const days = Math.max(1,Math.min(31,parseInt(req.query.days||'7',10)));
+    const tz   = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
 
-    const cols = await getCols('events');
-    const hasType = cols.has('type');
-    const hasEventType = cols.has('event_type');
-
-    const authCond = hasEventType ? 'e.event_type = \'auth_success\''
-                    : hasType      ? 'e."type"     = \'auth_success\''
-                    : 'false';
-
-    const r=await db.query(`
+    // Порядок плейсхолдеров: $1 = tz, $2 = days (чтобы tzExprN(1,…) попал в $1)
+    const sql = `
       with b as (
-        select (now() at time zone $2)::date as today,
-               ((now() at time zone $2)::date - ($1::int - 1)) as since
+        select (now() at time zone $1)::date as today,
+               ((now() at time zone $1)::date - ($2::int - 1)) as since
       ),
       d(day) as (select generate_series((select since from b),(select today from b), interval '1 day')),
-      totals as (
-        select (${tzExpr('created_at','e')})::date as d, count(*) c
+      ev as (
+        select e.user_id,
+               ${tzExprN(1,'created_at','e')} as ts_msk,
+               coalesce(e.event_type::text, e."type"::text) as et
           from events e
-         where ${authCond}
-           and (${tzExpr('created_at','e')})::date >= (select since from b)
-         group by 1
+         where (${tzExprN(1,'created_at','e')})::date >= (select since from b)
       ),
-      uniq as (
-        select (${tzExpr('created_at','e')})::date as d,
-               count(distinct coalesce(u.hum_id,u.id)) c
-          from events e join users u on u.id=e.user_id
-         where ${authCond}
-           and (${tzExpr('created_at','e')})::date >= (select since from b)
-         group by 1
-      )
+      login as (select user_id, ts_msk from ev where et ilike '%login%success%'),
+      auth  as (select user_id, ts_msk from ev where et ilike '%auth%success%'),
+      auth_orphan as (
+        select a.user_id, a.ts_msk
+          from auth a
+          left join login l
+            on l.user_id = a.user_id
+           and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
+         where l.user_id is null
+      ),
+      canon as (
+        select * from login
+        union all
+        select * from auth_orphan
+      ),
+      totals as ( select c.ts_msk::date d, count(*) c from canon c group by 1 ),
+      uniq   as ( select c.ts_msk::date d, count(distinct coalesce(u.hum_id,u.id)) c
+                  from canon c join users u on u.id=c.user_id group by 1 )
       select to_char(d.day,'YYYY-MM-DD') as day,
              coalesce(t.c,0) as auth_total,
              coalesce(u.c,0) as auth_unique
@@ -253,9 +274,9 @@ async function daily(req,res){
         left join totals t on t.d=d.day
         left join uniq   u on u.d=d.day
        order by d.day asc
-    `,[days,tz]);
-
-    const rows=(r.rows||[]).map(x=>({
+    `;
+    const r = await db.query(sql, [tz, days]);
+    const rows = (r.rows||[]).map(x=>({
       date:x.day,
       auth_total:Number(x.auth_total||0),
       auth_unique:Number(x.auth_unique||0)
