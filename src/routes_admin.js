@@ -1,8 +1,11 @@
-// src/routes_admin.js — V3.9 (safe typeExpr, MSK, canonical logins, robust events)
+// src/routes_admin.js — V3.10 (safe typeExpr, MSK, canonical logins, robust events, topup)
 import express from 'express';
 import { db } from './db.js';
 
 const router = express.Router();
+
+// гарантировано парсим JSON для POST
+router.use(express.json());
 
 /* ---------- auth ---------- */
 router.use((req,res,next)=>{
@@ -87,6 +90,67 @@ router.get('/users', async (req,res)=>{
     }));
     res.json({ ok:true, users:rows, rows });
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
+});
+
+/* ---------- TOPUP (пополнение конкретного user_id) ---------- */
+// POST /api/admin/users/:id/topup   body: { amount: number }
+router.post('/users/:id/topup', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const amount = Number(req.body?.amount);
+
+    if (!id || !Number.isFinite(amount)) {
+      return res.status(400).json({ ok:false, error:'bad_args' });
+    }
+    if (amount === 0) {
+      return res.json({ ok:true, updated:0, new_balance: null });
+    }
+
+    // Обновляем баланс КОНКРЕТНОГО user_id
+    const upd = await db.query(
+      `update users set balance = coalesce(balance,0) + $1 where id = $2 returning balance`,
+      [amount, id]
+    );
+    if ((upd.rowCount||0) === 0) {
+      return res.status(404).json({ ok:false, error:'user_not_found' });
+    }
+    const newBalance = Number(upd.rows?.[0]?.balance ?? 0);
+
+    // Пишем событие, если таблица events существует
+    try {
+      const reg = await db.query(`select to_regclass('public.events') as r`);
+      if (reg.rows?.[0]?.r) {
+        const colsQ = await db.query(`
+          select column_name from information_schema.columns
+          where table_schema='public' and table_name='events'
+        `);
+        const cols = new Set((colsQ.rows||[]).map(x=>x.column_name));
+
+        const fields = [];
+        const params = [];
+        const values = [];
+        let n = 1;
+
+        if (cols.has('user_id'))    { fields.push('user_id');    values.push(`$${n++}`); params.push(id); }
+        if (cols.has('event_type')) { fields.push('event_type'); values.push(`$${n++}`); params.push('topup_admin'); }
+        // если есть поле amount — тоже сохраним
+        if (cols.has('amount'))     { fields.push('amount');     values.push(`$${n++}`); params.push(amount); }
+        if (cols.has('ip'))         { fields.push('ip');         values.push(`$${n++}`); params.push(''); }
+        if (cols.has('ua'))         { fields.push('ua');         values.push(`$${n++}`); params.push(''); }
+        // created_at пусть ставит БД по умолчанию
+
+        if (fields.length) {
+          await db.query(`insert into events (${fields.join(',')}) values (${values.join(',')})`, params);
+        }
+      }
+    } catch(_e) {
+      // логирование не считаем фатальным
+    }
+
+    return res.json({ ok:true, updated: upd.rowCount || 0, new_balance: newBalance });
+  } catch (e) {
+    return res.status(500).json({ ok:false, error: String(e?.message || e) });
+  }
 });
 
 /* ---------- EVENTS (устойчиво к разной схеме) ---------- */
