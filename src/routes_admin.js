@@ -1,4 +1,4 @@
-// src/routes_admin.js — V3.8 (MSK, canonical logins, robust events)
+// src/routes_admin.js — V3.9 (safe typeExpr, MSK, canonical logins, robust events)
 import express from 'express';
 import { db } from './db.js';
 
@@ -23,7 +23,6 @@ const getCols = async (table) => {
 };
 
 // tzExprN(placeholderIndex, col, tbl)
-// безопасно приводит created_at к нужной TZ, учитывая timestamp/timestamptz
 const tzExprN = (n=1, col='created_at', tbl='e') => `
 CASE
   WHEN pg_typeof(${tbl}.${col}) = 'timestamp with time zone'::regtype
@@ -105,8 +104,8 @@ router.get('/events', async (req,res)=>{
                   : has('uid')      ? 'e.uid'
                   : has('user')     ? 'e."user"'
                   : null;
-    const typeCol = has('event_type') ? 'e.event_type'
-                  : has('type')       ? 'e."type"'
+    const typeExpr= has('event_type') ? 'e.event_type::text'
+                  : has('type')       ? 'e."type"::text'
                   : `NULL::text`;
     const ipCol   = has('ip')        ? 'e.ip' : `NULL::text`;
     const uaCol   = has('ua')        ? 'e.ua'
@@ -120,8 +119,8 @@ router.get('/events', async (req,res)=>{
     const p=[]; const cond=[];
     const et = (req.query.type || req.query.event_type || '').toString().trim();
     if (et && (has('event_type') || has('type'))) {
-      if (has('event_type')) cond.push(`e.event_type = $${p.push(et)}`);
-      else                   cond.push(`e."type"     = $${p.push(et)}`);
+      if (cols.has('event_type')) cond.push(`e.event_type = $${p.push(et)}`);
+      else                        cond.push(`e."type"     = $${p.push(et)}`);
     }
     const uid = (req.query.user_id||'').toString().trim();
     if (uid && uidCol) cond.push(`${uidCol} = $${p.push(parseInt(uid,10)||0)}`);
@@ -134,14 +133,14 @@ router.get('/events', async (req,res)=>{
         ${idCol}  as event_id,
         ${uidCol ? 'coalesce(u.hum_id, u.id)' : 'NULL'} as hum_id,
         ${uidCol ? uidCol : 'NULL'} as user_id,
-        ${typeCol} as event_type,
+        ${typeExpr} as event_type,
         ${ipCol}   as ip,
         ${uaCol}   as ua,
         ${tsCol}   as created_at
       from events e
       ${joinUsers ? `left join users u on u.id = ${uidCol}` : ''}
       ${where}
-      order by ${has('id') ? 'e.id' : '1'} desc
+      order by ${cols.has('id') ? 'e.id' : '1'} desc
       limit $${p.length-1} offset $${p.length};
     `;
     const r=await db.query(sql,p);
@@ -154,7 +153,7 @@ router.get('/events', async (req,res)=>{
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
 
-/* ---------- SUMMARY (MSK + канонические логины) ---------- */
+/* ---------- SUMMARY (MSK + канон. логины, безопасный typeExpr) ---------- */
 router.get('/summary', async (req,res)=>{
   try{
     const tz = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
@@ -167,7 +166,14 @@ router.get('/summary', async (req,res)=>{
       return res.json({ ok:true, users, events:0, auth7:0, auth7_total:0, unique7:0 });
     }
 
-    // канонизация логинов: login_success + orphan auth_success (±10 мин от login_success того же user_id)
+    const cols = await getCols('events');
+    const typeExpr = cols.has('event_type') ? 'e.event_type::text'
+                    : cols.has('type')       ? 'e."type"::text'
+                    : `NULL::text`;
+
+    const e = await db.query('select count(*)::int as c from events');
+    const events = e.rows?.[0]?.c ?? 0;
+
     const sql = `
       with b as (
         select (now() at time zone $1)::date as today,
@@ -176,18 +182,18 @@ router.get('/summary', async (req,res)=>{
       ev as (
         select e.user_id,
                ${tzExprN(1,'created_at','e')} as ts_msk,
-               coalesce(e.event_type::text, e."type"::text) as et
-        from events e
+               ${typeExpr} as et
+          from events e
       ),
       login as (select user_id, ts_msk from ev where et ilike '%login%success%'),
       auth  as (select user_id, ts_msk from ev where et ilike '%auth%success%'),
       auth_orphan as (
         select a.user_id, a.ts_msk
-        from auth a
-        left join login l
-          on l.user_id = a.user_id
-         and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
-        where l.user_id is null
+          from auth a
+          left join login l
+            on l.user_id = a.user_id
+           and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
+         where l.user_id is null
       ),
       canon as (
         select * from login
@@ -207,10 +213,6 @@ router.get('/summary', async (req,res)=>{
     const r = await db.query(sql, [tz]);
     const x = r.rows?.[0] || {};
 
-    const e = await db.query('select count(*)::int as c from events');
-    const events = e.rows?.[0]?.c ?? 0;
-
-    // для твоей карточки «Уникальные (7д)» — по любым событиям
     const rU = await db.query(
       `select count(distinct coalesce(u.hum_id,u.id))::int as c
          from events e join users u on u.id=e.user_id
@@ -229,13 +231,17 @@ router.get('/summary', async (req,res)=>{
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
 
-/* ---------- DAILY (MSK + канон. логины, фикс плейсхолдера) ---------- */
+/* ---------- DAILY (MSK + канон. логины, безопасный typeExpr) ---------- */
 async function daily(req,res){
   try{
     const days = Math.max(1,Math.min(31,parseInt(req.query.days||'7',10)));
     const tz   = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
 
-    // Порядок плейсхолдеров: $1 = tz, $2 = days (чтобы tzExprN(1,…) попал в $1)
+    const cols = await getCols('events');
+    const typeExpr = cols.has('event_type') ? 'e.event_type::text'
+                    : cols.has('type')       ? 'e."type"::text'
+                    : `NULL::text`;
+
     const sql = `
       with b as (
         select (now() at time zone $1)::date as today,
@@ -245,7 +251,7 @@ async function daily(req,res){
       ev as (
         select e.user_id,
                ${tzExprN(1,'created_at','e')} as ts_msk,
-               coalesce(e.event_type::text, e."type"::text) as et
+               ${typeExpr} as et
           from events e
          where (${tzExprN(1,'created_at','e')})::date >= (select since from b)
       ),
