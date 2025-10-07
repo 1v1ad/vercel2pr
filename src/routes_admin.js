@@ -1,30 +1,21 @@
-// src/routes_admin.js (ESM, stable)
-// Минимальный и детерминированный роутер для админки GGRoom.
-// Совместим с "type":"module". Требует именованный экспорт { db } из ./db.js
-
+// src/routes_admin.js (ESM, stable, v2)
 import express from 'express';
-import { db } from './db.js'; // именованный экспорт!
+import { db } from './db.js';
 
 const router = express.Router();
 
-// ---------------- Guard ----------------
 router.use((req, res, next) => {
-  try {
-    const need = (process.env.ADMIN_PASSWORD || '').toString();
-    const got  = (req.get('X-Admin-Password') || '').toString();
-    if (!need || got !== need) return res.status(401).json({ ok:false });
-    next();
-  } catch {
-    return res.status(401).json({ ok:false });
-  }
+  const need = (process.env.ADMIN_PASSWORD || '').toString();
+  const got  = (req.get('X-Admin-Password') || '').toString();
+  if (!need || got !== need) return res.status(401).json({ ok:false });
+  next();
 });
 
-// ---------------- USERS ----------------
 router.get('/users', async (req, res) => {
   try {
     const take   = Math.max(1, Math.min(500, parseInt(req.query.take || '50', 10)));
-    const page   = Math.max(0, parseInt(req.query.page || '0', 10));
-    const offset = page * take;
+    const skip   = Math.max(0, parseInt(req.query.skip || '0', 10));
+    const offset = skip;
 
     const search = (req.query.search || '').trim();
     const params = [];
@@ -61,18 +52,31 @@ router.get('/users', async (req, res) => {
       limit $${params.length-1} offset $${params.length}
     `;
     const r = await db.query(sql, params);
-    res.json({ ok:true, users:r.rows });
+    const rows = r.rows || [];
+    res.json({
+      ok: true,
+      users: rows.map(u => ({
+        HUMid: u.hum_id,
+        user_id: u.user_id,
+        vk_id: u.vk_id,
+        first_name: u.first_name,
+        last_name: u.last_name,
+        balance: u.balance,
+        country: u.country_code || u.country_name || '',
+        created_at: u.created_at,
+        providers: u.providers
+      })),
+    });
   } catch (e) {
     res.status(500).json({ ok:false, error:String(e && e.message || e) });
   }
 });
 
-// ---------------- EVENTS ----------------
 router.get('/events', async (req, res) => {
   try {
     const take   = Math.max(1, Math.min(500, parseInt(req.query.take || '50', 10)));
-    const page   = Math.max(0, parseInt(req.query.page || '0', 10));
-    const offset = page * take;
+    const skip   = Math.max(0, parseInt(req.query.skip || '0', 10));
+    const offset = skip;
 
     const filters = [];
     const params  = [];
@@ -94,7 +98,7 @@ router.get('/events', async (req, res) => {
         coalesce(u.hum_id, u.id)      as hum_id,
         e.user_id,
         coalesce(e.event_type,'')     as event_type,
-        coalesce(e."type",'')         as "type",
+        ''::text                      as "type",
         coalesce(e.ip,'')             as ip,
         coalesce(e.ua,'')             as ua,
         coalesce(e.created_at, now()) as created_at
@@ -105,13 +109,25 @@ router.get('/events', async (req, res) => {
       limit $${params.length-1} offset $${params.length}
     `;
     const r = await db.query(sql, params);
-    res.json({ ok:true, events:r.rows });
+    const rows = r.rows || [];
+    res.json({
+      ok: true,
+      events: rows.map(e => ({
+        id: e.event_id,
+        HUMid: e.hum_id,
+        user_id: e.user_id,
+        event_type: e.event_type,
+        type: e.type,
+        ip: e.ip,
+        UA: e.ua,
+        created_at: e.created_at
+      })),
+    });
   } catch (e) {
     res.status(500).json({ ok:false, error:String(e && e.message || e) });
   }
 });
 
-// -------- Summary cards (/summary) --------
 router.get('/summary', async (req, res) => {
   try {
     const r = await db.query(`
@@ -147,7 +163,6 @@ router.get('/summary', async (req, res) => {
   }
 });
 
-// -------- Daily for chart (/summary/daily + /daily) --------
 async function handleDaily(req, res){
   try {
     const days = Math.max(1, Math.min(31, parseInt(req.query.days || '7', 10)));
@@ -183,7 +198,8 @@ async function handleDaily(req, res){
       order by d.day asc
     `;
     const r = await db.query(sql, [days, tz]);
-    res.json({ ok:true, users:r.rows });
+    const rows = r.rows || [];
+    res.json({ ok:true, users: rows, data: rows });
   } catch (e) {
     res.status(500).json({ ok:false, error:String(e && e.message || e) });
   }
