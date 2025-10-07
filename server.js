@@ -49,10 +49,46 @@ if ((process.env.FEATURE_ADMIN || '').toLowerCase() === 'true') {
 }
 
 // Session info для фронта
+
 app.get('/api/me', async (req, res) => {
   try {
     const token = req.cookies['sid'];
     if (!token) return res.status(401).json({ ok: false });
+
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
+    const user = await getUserById(payload.uid);
+    if (!user) return res.status(401).json({ ok: false });
+
+    // HUMid cluster
+    let humId = null;
+    try {
+      const r = await db.query("select coalesce(hum_id, id) as hum_id from users where id=$1", [user.id]);
+      humId = r.rows?.[0]?.hum_id || user.id;
+    } catch { humId = user.id; }
+
+    let effectiveBalance = user.balance ?? 0;
+    try {
+      const sumQ = await db.query("select coalesce(sum(coalesce(balance,0)),0) as total from users where hum_id = $1", [humId]);
+      effectiveBalance = sumQ.rows?.[0]?.total ?? effectiveBalance;
+    } catch {}
+
+    res.json({
+      ok: true,
+      user: {
+        id: user.id,
+        vk_id: user.vk_id,
+        first_name: user.first_name,
+        last_name: user.last_name,
+        avatar: user.avatar,
+        balance: effectiveBalance,
+        hum_id: humId,
+      },
+    });
+  } catch {
+    res.status(401).json({ ok: false });
+  }
+});
+
 
     const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
     const user = await getUserById(payload.uid);

@@ -125,20 +125,7 @@ router.get('/vk/callback', async (req, res) => {
     const vk_id = String(tokenData?.user_id || tokenData?.user?.id || 'unknown');
     const user = await upsertUser({ vk_id, first_name, last_name, avatar });
 
-    
-    // Optional device_id background linking (VK path)
-    const deviceId = (req.query && req.query.device_id) || (req.cookies && req.cookies.device_id) || '';
-    try {
-      if (deviceId) {
-        // remember device on VK auth_account
-        await db.query(
-          "insert into auth_accounts(provider, provider_user_id, user_id, meta) values('vk', $1, $2, jsonb_build_object('device_id',$3)) ON CONFLICT (provider, provider_user_id) DO UPDATE SET user_id=$2, meta = jsonb_set(coalesce(auth_accounts.meta,'{}'::jsonb), '{device_id}', to_jsonb($3::text), true), updated_at = now()",
-          [String(user.vk_id || ''), user.id, String(deviceId)]
-        );
-        try { await autoMergeByDevice({ deviceId: String(deviceId) }); } catch {}
-      }
-    } catch {}
-await logEvent({ user_id:user.id, event_type:'auth_success', payload:{ vk_id }, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
+    await logEvent({ user_id:user.id, event_type:'auth_success', payload:{ vk_id }, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) });
 
     const sessionJwt = signSession({ uid: user.id, vk_id: user.vk_id });
     res.cookie('sid', sessionJwt, {
