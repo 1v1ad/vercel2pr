@@ -5,8 +5,8 @@
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
-import { db } from './db.js';
-import adminRoutes from './routes_admin.js';
+import { db } from './src/db.js';
+import adminRoutes from './src/routes_admin.js';
 
 // ── конфиг ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 10000;

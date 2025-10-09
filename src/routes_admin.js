@@ -16,6 +16,17 @@ router.use((req,res,next)=>{
   next();
 });
 
+/* simple health check (and optional DB ping) */
+router.get('/health', async (req,res)=>{
+  try{
+    await db.query('select 1');
+    res.json({ ok:true, ts:new Date().toISOString() });
+  }catch(e){
+    res.status(500).json({ ok:false, error:String(e?.message||e) });
+  }
+});
+
+
 /* ---------- helpers ---------- */
 const getCols = async (table) => {
   const r = await db.query(`
@@ -94,13 +105,48 @@ router.get('/users', async (req,res)=>{
 
 /* ---------- TOPUP (пополнение конкретного user_id) ---------- */
 // POST /api/admin/users/:id/topup   body: { amount: number }
-router.post('/users/:id/topup', async (req, res) => {
-  try {
-    const id = parseInt(req.params.id, 10);
-    const amount = Number(req.body?.amount);
 
-    if (!id || !Number.isFinite(amount)) {
-      return res.status(400).json({ ok:false, error:'bad_args' });
+router.post('/users/:id/topup', async (req,res)=>{
+  try{
+    const cols = await getCols('events');
+    const id = parseInt(req.params.id||'0',10);
+    const amount = Number(req.body?.amount || 0);
+    const commentRaw = (req.body?.comment || '').toString().trim();
+    const forbidden = new Set(['', '111','123','000','test','тест','-', '.', '[]','{}']);
+    const onlyDigits = /^\d{1,4}$/;
+
+    if (!id || !Number.isFinite(amount) || !amount) {
+      return res.status(400).json({ ok:false, error:'bad_parameters' });
+    }
+    if (!commentRaw || commentRaw.length < 4 || forbidden.has(commentRaw.toLowerCase()) || onlyDigits.test(commentRaw)) {
+      return res.status(400).json({ ok:false, error:'comment_required' });
+    }
+
+    // update personal balance
+    await db.query('update users set balance = coalesce(balance,0) + $1 where id = $2', [amount, id]);
+
+    const ip = (req.headers['x-forwarded-for']||'').split(',')[0].trim() || req.socket?.remoteAddress || '';
+    const ua = req.get('user-agent') || '';
+    const adminActor = req.get('X-Admin-Actor') || 'admin';
+
+    if (cols.has('meta')){
+      await db.query(
+        `insert into events (user_id, event_type, type, ip, ua, meta, created_at)
+         values ($1,$2,$2,$3,$4,$5, now())`,
+        [id, 'topup_manual', ip, ua, { amount, comment: commentRaw, actor: adminActor }]
+      );
+    } else {
+      // fallback without meta column: encode comment into ua tail
+      const ua2 = ua + ' | topup: ' + amount + ' | comment: ' + commentRaw;
+      await db.query(
+        'insert into events (user_id, event_type, type, ip, ua, created_at) values ($1,$2,$2,$3,$4,now())',
+        [id, 'topup_manual', ip, ua2]
+      );
+    }
+
+    res.json({ ok:true });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
+});
     }
     if (amount === 0) {
       return res.json({ ok:true, updated:0, new_balance: null });
