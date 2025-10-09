@@ -1,80 +1,59 @@
-// src/routes_admin.js — V4.0
+// src/routes_admin.js — V3.10 (safe typeExpr, MSK, canonical logins, robust events, topup)
 import express from 'express';
 import { db } from './db.js';
 
 const router = express.Router();
 
-// Чтобы читать JSON в POST (topup и т.п.)
+// гарантировано парсим JSON для POST
 router.use(express.json());
 
-/* ---------- admin auth ---------- */
-router.use((req, res, next) => {
+/* ---------- auth ---------- */
+router.use((req,res,next)=>{
   const need = String(process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD || '');
-  const got =
-    String(req.get('X-Admin-Password') || req.body?.pwd || req.query?.pwd || '');
-
-  if (!need) return res.status(401).json({ ok: false, error: 'admin_password_not_set' });
-  if (got !== need) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  const got  = String(req.get('X-Admin-Password') || req.body?.pwd || req.query?.pwd || '');
+  if (!need) return res.status(401).json({ ok:false, error:'admin_password_not_set' });
+  if (got !== need) return res.status(401).json({ ok:false, error:'unauthorized' });
   next();
 });
 
 /* ---------- helpers ---------- */
 const getCols = async (table) => {
-  const r = await db.query(
-    `
-    select column_name
-      from information_schema.columns
-     where table_schema='public' and table_name=$1
-  `,
-    [table]
-  );
-  return new Set((r.rows || []).map((x) => x.column_name));
+  const r = await db.query(`
+    select column_name from information_schema.columns
+    where table_schema='public' and table_name=$1
+  `,[table]);
+  return new Set((r.rows||[]).map(x=>x.column_name));
 };
 
-// tzExprN(n, col, tbl) — корректно приводит к заданному TZ,
-// независимо от типа (timestamp / timestamptz)
-const tzExprN = (n = 1, col = 'created_at', tbl = 'e') => `
+// tzExprN(placeholderIndex, col, tbl)
+const tzExprN = (n=1, col='created_at', tbl='e') => `
 CASE
   WHEN pg_typeof(${tbl}.${col}) = 'timestamp with time zone'::regtype
-       THEN (${tbl}.${col} AT TIME ZONE $${n})
-  ELSE  ((${tbl}.${col} AT TIME ZONE 'UTC') AT TIME ZONE $${n})
+    THEN (${tbl}.${col} AT TIME ZONE $${n})
+  ELSE ((${tbl}.${col} AT TIME ZONE 'UTC') AT TIME ZONE $${n})
 END
 `;
 
-/* ---------- health ---------- */
-router.get('/health', async (req, res) => {
-  try {
-    const r = await db.query('select 1 as ok');
-    return res.json({ ok: true, db: r.rows?.[0]?.ok === 1 });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
 /* ---------- USERS ---------- */
-router.get('/users', async (req, res) => {
-  try {
-    const take = Math.max(1, Math.min(500, parseInt(req.query.take || '50', 10)));
-    const skip = Math.max(0, parseInt(req.query.skip || '0', 10));
-    const search = (req.query.search || '').trim();
+router.get('/users', async (req,res)=>{
+  try{
+    const take = Math.max(1,Math.min(500,parseInt(req.query.take||'50',10)));
+    const skip = Math.max(0,parseInt(req.query.skip||'0',10));
+    const search = (req.query.search||'').trim();
 
-    const p = [];
-    let where = 'where 1=1';
-
-    if (search) {
-      // ищем по имени/фамилии/точному id/частичному vk_id
-      p.push(`%${search}%`, `%${search}%`, search, `%${search}%`);
+    const p=[]; let where='where 1=1';
+    if (search){
+      p.push(`%${search}%`,`%${search}%`,search,`%${search}%`);
       where += ` and (
-        coalesce(u.first_name,'') ilike $${p.length - 3} or
-        coalesce(u.last_name ,'') ilike $${p.length - 0} or
-        u.id::text = $${p.length - 1} or
-        coalesce(u.vk_id::text,'') ilike $${p.length - 2}
+        coalesce(u.first_name,'') ilike $${p.length-3} or
+        coalesce(u.last_name ,'') ilike $${p.length-0} or
+        u.id::text = $${p.length-1} or
+        coalesce(u.vk_id::text,'') ilike $${p.length-2}
       )`;
     }
-
     p.push(take, skip);
 
-    const sql = `
+    const sql=`
       with base as (
         select
           coalesce(u.hum_id, u.id) as hum_id,
@@ -93,93 +72,126 @@ router.get('/users', async (req, res) => {
         from users u
         ${where}
         order by 1 asc, 2 asc
-        limit $${p.length - 1} offset $${p.length}
+        limit $${p.length-1} offset $${p.length}
       )
       select b.*, sum(b.balance_raw) over(partition by b.hum_id) as balance_hum
-      from base b
+      from base b;
     `;
-
-    const r = await db.query(sql, p);
-    const rows = (r.rows || []).map((u) => ({
-      HUMid: u.hum_id,
-      hum_id: u.hum_id,
-      id: u.hum_id,
-      user_id: u.user_id,
-      vk_id: u.vk_id,
-      first_name: u.first_name,
-      last_name: u.last_name,
-      balance_raw: Number(u.balance_raw || 0),
-      balance: Number(u.balance_hum || 0), // HUM-баланс
-      country: u.country_code || u.country_name || '',
-      country_code: u.country_code,
-      country_name: u.country_name,
-      created_at: u.created_at,
-      providers: u.providers
+    const r=await db.query(sql,p);
+    const rows=(r.rows||[]).map(u=>({
+      HUMid:u.hum_id, hum_id:u.hum_id, id:u.hum_id,
+      user_id:u.user_id, vk_id:u.vk_id,
+      first_name:u.first_name, last_name:u.last_name,
+      balance_raw:Number(u.balance_raw||0),
+      balance:Number(u.balance_hum||0),
+      country:u.country_code || u.country_name || '',
+      country_code:u.country_code, country_name:u.country_name,
+      created_at:u.created_at, providers:u.providers
     }));
+    res.json({ ok:true, users:rows, rows });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
+});
 
-    return res.json({ ok: true, users: rows, rows });
+/* ---------- TOPUP (пополнение конкретного user_id) ---------- */
+// POST /api/admin/users/:id/topup   body: { amount: number }
+router.post('/users/:id/topup', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const amount = Number(req.body?.amount);
+
+    if (!id || !Number.isFinite(amount)) {
+      return res.status(400).json({ ok:false, error:'bad_args' });
+    }
+    if (amount === 0) {
+      return res.json({ ok:true, updated:0, new_balance: null });
+    }
+
+    // Обновляем баланс КОНКРЕТНОГО user_id
+    const upd = await db.query(
+      `update users set balance = coalesce(balance,0) + $1 where id = $2 returning balance`,
+      [amount, id]
+    );
+    if ((upd.rowCount||0) === 0) {
+      return res.status(404).json({ ok:false, error:'user_not_found' });
+    }
+    const newBalance = Number(upd.rows?.[0]?.balance ?? 0);
+
+    // Пишем событие, если таблица events существует
+    try {
+      const reg = await db.query(`select to_regclass('public.events') as r`);
+      if (reg.rows?.[0]?.r) {
+        const colsQ = await db.query(`
+          select column_name from information_schema.columns
+          where table_schema='public' and table_name='events'
+        `);
+        const cols = new Set((colsQ.rows||[]).map(x=>x.column_name));
+
+        const fields = [];
+        const params = [];
+        const values = [];
+        let n = 1;
+
+        if (cols.has('user_id'))    { fields.push('user_id');    values.push(`$${n++}`); params.push(id); }
+        if (cols.has('event_type')) { fields.push('event_type'); values.push(`$${n++}`); params.push('topup_admin'); }
+        // если есть поле amount — тоже сохраним
+        if (cols.has('amount'))     { fields.push('amount');     values.push(`$${n++}`); params.push(amount); }
+        if (cols.has('ip'))         { fields.push('ip');         values.push(`$${n++}`); params.push(''); }
+        if (cols.has('ua'))         { fields.push('ua');         values.push(`$${n++}`); params.push(''); }
+        // created_at пусть ставит БД по умолчанию
+
+        if (fields.length) {
+          await db.query(`insert into events (${fields.join(',')}) values (${values.join(',')})`, params);
+        }
+      }
+    } catch(_e) {
+      // логирование не считаем фатальным
+    }
+
+    return res.json({ ok:true, updated: upd.rowCount || 0, new_balance: newBalance });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok:false, error: String(e?.message || e) });
   }
 });
 
 /* ---------- EVENTS (устойчиво к разной схеме) ---------- */
-router.get('/events', async (req, res) => {
-  try {
+router.get('/events', async (req,res)=>{
+  try{
     const cols = await getCols('events');
-    if (!cols.size) return res.json({ ok: true, events: [], rows: [] });
+    if (!cols.size) return res.json({ ok:true, events:[], rows:[] });
 
-    const take = Math.min(200, Math.max(1, parseInt(req.query.take || '50', 10)));
-    const skip = Math.max(0, parseInt(req.query.skip || '0', 10));
+    const take = Math.min(200, Math.max(1, parseInt(req.query.take||'50',10)));
+    const skip = Math.max(0, parseInt(req.query.skip||'0',10));
 
-    const has = (c) => cols.has(c);
-    const idCol = has('id') ? 'e.id' : 'row_number() over()';
-    const uidCol = has('user_id')
-      ? 'e.user_id'
-      : has('uid')
-      ? 'e.uid'
-      : has('user')
-      ? 'e."user"'
-      : null;
+    const has = (c)=>cols.has(c);
+    const idCol   = has('id') ? 'e.id' : 'row_number() over()';
+    const uidCol  = has('user_id') ? 'e.user_id'
+                  : has('uid')      ? 'e.uid'
+                  : has('user')     ? 'e."user"'
+                  : null;
+    const typeExpr= has('event_type') ? 'e.event_type::text'
+                  : has('type')       ? 'e."type"::text'
+                  : `NULL::text`;
+    const ipCol   = has('ip')        ? 'e.ip' : `NULL::text`;
+    const uaCol   = has('ua')        ? 'e.ua'
+                  : has('user_agent') ? 'e.user_agent'
+                  : `NULL::text`;
+    const tsCol   = has('created_at')? 'e.created_at'
+                  : has('ts')         ? 'e.ts'
+                  : has('time')       ? 'e.time'
+                  : 'now()';
 
-    const typeExpr = has('event_type')
-      ? 'e.event_type::text'
-      : has('type')
-      ? 'e."type"::text'
-      : `NULL::text`;
-
-    const ipCol = has('ip') ? 'e.ip' : `NULL::text`;
-    const uaCol = has('ua')
-      ? 'e.ua'
-      : has('user_agent')
-      ? 'e.user_agent'
-      : `NULL::text`;
-
-    const tsCol = has('created_at')
-      ? 'e.created_at'
-      : has('ts')
-      ? 'e.ts'
-      : has('time')
-      ? 'e.time'
-      : 'now()';
-
-    const p = [];
-    const cond = [];
-
+    const p=[]; const cond=[];
     const et = (req.query.type || req.query.event_type || '').toString().trim();
-    if (et && (cols.has('event_type') || cols.has('type'))) {
+    if (et && (has('event_type') || has('type'))) {
       if (cols.has('event_type')) cond.push(`e.event_type = $${p.push(et)}`);
-      else cond.push(`e."type" = $${p.push(et)}`);
+      else                        cond.push(`e."type"     = $${p.push(et)}`);
     }
-
-    const uid = (req.query.user_id || '').toString().trim();
-    if (uid && uidCol) cond.push(`${uidCol} = $${p.push(parseInt(uid, 10) || 0)}`);
-
-    const where = cond.length ? 'where ' + cond.join(' and ') : '';
+    const uid = (req.query.user_id||'').toString().trim();
+    if (uid && uidCol) cond.push(`${uidCol} = $${p.push(parseInt(uid,10)||0)}`);
+    const where = cond.length ? ('where ' + cond.join(' and ')) : '';
 
     const joinUsers = !!uidCol;
     p.push(take, skip);
-
     const sql = `
       select
         ${idCol}  as event_id,
@@ -193,30 +205,21 @@ router.get('/events', async (req, res) => {
       ${joinUsers ? `left join users u on u.id = ${uidCol}` : ''}
       ${where}
       order by ${cols.has('id') ? 'e.id' : '1'} desc
-      limit $${p.length - 1} offset $${p.length}
+      limit $${p.length-1} offset $${p.length};
     `;
-
-    const r = await db.query(sql, p);
-    const rows = (r.rows || []).map((e) => ({
-      id: e.event_id,
-      HUMid: e.hum_id,
-      user_id: e.user_id,
-      event_type: e.event_type,
-      type: e.event_type,
-      ip: e.ip,
-      ua: e.ua,
-      created_at: e.created_at
+    const r=await db.query(sql,p);
+    const rows=(r.rows||[]).map(e=>({
+      id:e.event_id, HUMid:e.hum_id, user_id:e.user_id,
+      event_type:e.event_type, type:e.event_type,
+      ip:e.ip, ua:e.ua, created_at:e.created_at
     }));
-
-    return res.json({ ok: true, events: rows, rows });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
+    res.json({ ok:true, events:rows, rows });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
 
-/* ---------- SUMMARY (MSK + канон. логины) ---------- */
-router.get('/summary', async (req, res) => {
-  try {
+/* ---------- SUMMARY (MSK + канон. логины, безопасный typeExpr) ---------- */
+router.get('/summary', async (req,res)=>{
+  try{
     const tz = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
 
     const u = await db.query('select count(*)::int as c from users');
@@ -224,12 +227,13 @@ router.get('/summary', async (req, res) => {
 
     const haveEvents = await db.query("select to_regclass('public.events') as r");
     if (!haveEvents.rows?.[0]?.r) {
-      return res.json({ ok: true, users, events: 0, auth7: 0, auth7_total: 0, unique7: 0 });
+      return res.json({ ok:true, users, events:0, auth7:0, auth7_total:0, unique7:0 });
     }
 
     const cols = await getCols('events');
-    const typeExpr =
-      cols.has('event_type') ? 'e.event_type::text' : cols.has('type') ? 'e."type"::text' : `NULL::text`;
+    const typeExpr = cols.has('event_type') ? 'e.event_type::text'
+                    : cols.has('type')       ? 'e."type"::text'
+                    : `NULL::text`;
 
     const e = await db.query('select count(*)::int as c from events');
     const events = e.rows?.[0]?.c ?? 0;
@@ -241,7 +245,7 @@ router.get('/summary', async (req, res) => {
       ),
       ev as (
         select e.user_id,
-               ${tzExprN(1, 'created_at', 'e')} as ts_msk,
+               ${tzExprN(1,'created_at','e')} as ts_msk,
                ${typeExpr} as et
           from events e
       ),
@@ -276,32 +280,31 @@ router.get('/summary', async (req, res) => {
     const rU = await db.query(
       `select count(distinct coalesce(u.hum_id,u.id))::int as c
          from events e join users u on u.id=e.user_id
-        where (${tzExprN(1, 'created_at', 'e')}) > (now() at time zone $1) - interval '7 days'`,
+        where (${tzExprN(1,'created_at','e')}) > (now() at time zone $1) - interval '7 days'`,
       [tz]
     );
 
-    return res.json({
-      ok: true,
+    res.json({
+      ok:true,
       users,
       events,
       auth7_total: Number(x.auth7_total || 0),
-      auth7: Number(x.auth7 || 0),
-      unique7: Number(rU.rows?.[0]?.c || 0)
+      auth7:       Number(x.auth7 || 0),
+      unique7:     Number(rU.rows?.[0]?.c || 0),
     });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
+  }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
 
-/* ---------- DAILY (MSK + канон. логины) ---------- */
-async function daily(req, res) {
-  try {
-    const days = Math.max(1, Math.min(31, parseInt(req.query.days || '7', 10)));
-    const tz = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
+/* ---------- DAILY (MSK + канон. логины, безопасный typeExpr) ---------- */
+async function daily(req,res){
+  try{
+    const days = Math.max(1,Math.min(31,parseInt(req.query.days||'7',10)));
+    const tz   = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
 
     const cols = await getCols('events');
-    const typeExpr =
-      cols.has('event_type') ? 'e.event_type::text' : cols.has('type') ? 'e."type"::text' : `NULL::text`;
+    const typeExpr = cols.has('event_type') ? 'e.event_type::text'
+                    : cols.has('type')       ? 'e."type"::text'
+                    : `NULL::text`;
 
     const sql = `
       with b as (
@@ -311,10 +314,10 @@ async function daily(req, res) {
       d(day) as (select generate_series((select since from b),(select today from b), interval '1 day')),
       ev as (
         select e.user_id,
-               ${tzExprN(1, 'created_at', 'e')} as ts_msk,
+               ${tzExprN(1,'created_at','e')} as ts_msk,
                ${typeExpr} as et
           from events e
-         where (${tzExprN(1, 'created_at', 'e')})::date >= (select since from b)
+         where (${tzExprN(1,'created_at','e')})::date >= (select since from b)
       ),
       login as (select user_id, ts_msk from ev where et ilike '%login%success%'),
       auth  as (select user_id, ts_msk from ev where et ilike '%auth%success%'),
@@ -343,70 +346,15 @@ async function daily(req, res) {
        order by d.day asc
     `;
     const r = await db.query(sql, [tz, days]);
-    const rows = (r.rows || []).map((x) => ({
-      date: x.day,
-      auth_total: Number(x.auth_total || 0),
-      auth_unique: Number(x.auth_unique || 0)
+    const rows = (r.rows||[]).map(x=>({
+      date:x.day,
+      auth_total:Number(x.auth_total||0),
+      auth_unique:Number(x.auth_unique||0)
     }));
-    return res.json({ ok: true, days: rows });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
+    res.json({ ok:true, days: rows });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 }
 router.get('/daily', daily);
 router.get('/summary/daily', daily);
-
-/* ---------- TOPUP (жёсткая валидация комментария + лог события) ---------- */
-router.post('/users/:id/topup', async (req, res) => {
-  try {
-    const uid = parseInt(req.params.id, 10);
-    const amount = Number(req.body?.amount || 0);
-    const commentRaw = String(req.body?.comment || '').trim();
-
-    if (!uid || !Number.isFinite(amount)) {
-      return res.status(400).json({ ok: false, error: 'bad_request' });
-    }
-    if (amount === 0) {
-      return res.status(400).json({ ok: false, error: 'amount_zero' });
-    }
-
-    // обязательный осмысленный комментарий
-    const banned = new Set(['', '111', '123', '000', 'test', 'тест', '-', '.', '[]', '{}']);
-    const looksNumericShort = /^\d{1,4}$/.test(commentRaw);
-    if (banned.has(commentRaw.toLowerCase()) || looksNumericShort) {
-      return res.status(400).json({ ok: false, error: 'comment_required' });
-    }
-
-    // пополняем личный баланс записи пользователя
-    await db.query(
-      'update users set balance = coalesce(balance,0) + $2 where id = $1',
-      [uid, amount]
-    );
-
-    // лог события
-    const cols = await getCols('events');
-    const hasMeta = cols.has('meta');
-    const meta = { amount, comment: commentRaw, actor: 'admin' };
-
-    if (hasMeta) {
-      await db.query(
-        `insert into events (user_id, event_type, ip, ua, created_at, meta)
-         values ($1, $2, $3, $4, now(), $5)`,
-        [uid, 'topup_manual', req.ip || null, req.get('user-agent') || null, meta]
-      );
-    } else {
-      const ua = (req.get('user-agent') || '') + ` [topup:${amount} comment:${commentRaw}]`;
-      await db.query(
-        `insert into events (user_id, event_type, ip, ua, created_at)
-         values ($1, $2, $3, $4, now())`,
-        [uid, 'topup_manual', req.ip || null, ua]
-      );
-    }
-
-    return res.json({ ok: true });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
 
 export default router;
