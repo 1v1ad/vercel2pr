@@ -22,12 +22,14 @@ await client.query(`ALTER TABLE events
 
     await client.query(`create table if not exists users (
       id serial primary key,
+      hum_id bigint,
       vk_id varchar(64) unique not null,
       first_name text,
       last_name text,
       avatar text,
       balance integer default 0,
       ref_by varchar(64),
+      merged_via_proof boolean default false,
       created_at timestamp default now(),
       updated_at timestamp default now()
     );`);
@@ -44,12 +46,33 @@ await client.query(`ALTER TABLE events
     await client.query(`create table if not exists events (
       id serial primary key,
       user_id integer references users(id) on delete set null,
+      hum_id bigint,
       event_type varchar(64) not null,
       payload jsonb,
+      amount bigint,
+      meta jsonb default '{}'::jsonb,
       ip text,        -- text: чтобы не падать на нескольких IP в x-forwarded-for
       ua text,
       created_at timestamp default now()
     );`);
+
+    await client.query(`
+      create table if not exists link_tokens (
+        token text primary key,
+        user_id bigint not null,
+        target text not null,
+        created_at timestamp without time zone not null,
+        expires_at timestamp without time zone not null,
+        done boolean default false
+      );
+    `);
+
+    await client.query('alter table if exists users add column if not exists hum_id bigint');
+    await client.query('alter table if exists users add column if not exists merged_via_proof boolean default false');
+    await client.query('alter table if exists events add column if not exists hum_id bigint');
+    await client.query('alter table if exists events add column if not exists amount bigint');
+    await client.query("alter table if exists events add column if not exists meta jsonb default '{}'::jsonb");
+    await client.query('update users set hum_id = id where hum_id is null');
   
 
 // --- Linking tables ---

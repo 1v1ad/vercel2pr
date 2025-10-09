@@ -93,63 +93,63 @@ router.get('/users', async (req,res)=>{
 });
 
 /* ---------- TOPUP (пополнение конкретного user_id) ---------- */
-// POST /api/admin/users/:id/topup   body: { amount: number }
+// POST /api/admin/users/:id/topup   body: { amount: number, comment: string }
 router.post('/users/:id/topup', async (req, res) => {
   try {
-    const id = parseInt(req.params.id, 10);
-    const amount = Number(req.body?.amount);
+    const userId = Number(req.params.id || 0);
+    const rawAmount = Number(req.body?.amount);
+    const amount = Number.isFinite(rawAmount) ? Math.trunc(rawAmount) : NaN;
+    const comment = String(req.body?.comment || '').trim();
 
-    if (!id || !Number.isFinite(amount)) {
-      return res.status(400).json({ ok:false, error:'bad_args' });
-    }
-    if (amount === 0) {
-      return res.json({ ok:true, updated:0, new_balance: null });
+    if (!userId || !Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ ok: false, error: 'bad_args' });
     }
 
-    // Обновляем баланс КОНКРЕТНОГО user_id
-    const upd = await db.query(
-      `update users set balance = coalesce(balance,0) + $1 where id = $2 returning balance`,
-      [amount, id]
+    const normalized = comment.toLowerCase();
+    const banned = ['111', '222', '123', 'test', 'тест'];
+    if (
+      comment.length < 3 ||
+      banned.includes(normalized) ||
+      /^\d+$/.test(comment)
+    ) {
+      return res.status(400).json({ ok: false, error: 'comment_required' });
+    }
+
+    const updateResult = await db.query(
+      'update users set balance = coalesce(balance, 0) + $1 where id = $2 returning balance',
+      [amount, userId]
     );
-    if ((upd.rowCount||0) === 0) {
-      return res.status(404).json({ ok:false, error:'user_not_found' });
+    if (!(updateResult.rowCount || 0)) {
+      return res.status(404).json({ ok: false, error: 'user_not_found' });
     }
-    const newBalance = Number(upd.rows?.[0]?.balance ?? 0);
+    const newBalance = Number(updateResult.rows?.[0]?.balance ?? 0);
 
-    // Пишем событие, если таблица events существует
-    try {
-      const reg = await db.query(`select to_regclass('public.events') as r`);
-      if (reg.rows?.[0]?.r) {
-        const colsQ = await db.query(`
-          select column_name from information_schema.columns
-          where table_schema='public' and table_name='events'
-        `);
-        const cols = new Set((colsQ.rows||[]).map(x=>x.column_name));
+    const humResult = await db.query(
+      'select coalesce(hum_id, id) as hum_id from users where id = $1',
+      [userId]
+    );
+    const humId = humResult.rows?.[0]?.hum_id || userId;
 
-        const fields = [];
-        const params = [];
-        const values = [];
-        let n = 1;
+    const meta = { comment };
+    const adminId = req.get('X-Admin-Id') || req.body?.admin_id || req.query?.admin_id;
+    if (adminId) meta.admin_id = adminId;
 
-        if (cols.has('user_id'))    { fields.push('user_id');    values.push(`$${n++}`); params.push(id); }
-        if (cols.has('event_type')) { fields.push('event_type'); values.push(`$${n++}`); params.push('topup_admin'); }
-        // если есть поле amount — тоже сохраним
-        if (cols.has('amount'))     { fields.push('amount');     values.push(`$${n++}`); params.push(amount); }
-        if (cols.has('ip'))         { fields.push('ip');         values.push(`$${n++}`); params.push(''); }
-        if (cols.has('ua'))         { fields.push('ua');         values.push(`$${n++}`); params.push(''); }
-        // created_at пусть ставит БД по умолчанию
+    await db.query(
+      `insert into events (user_id, hum_id, event_type, ip, ua, created_at, amount, meta)
+       values ($1, $2, 'admin_topup', $3, $4, now(), $5, $6::jsonb)`,
+      [
+        userId,
+        humId,
+        req.ip || null,
+        req.get('user-agent') || null,
+        amount,
+        JSON.stringify(meta),
+      ]
+    );
 
-        if (fields.length) {
-          await db.query(`insert into events (${fields.join(',')}) values (${values.join(',')})`, params);
-        }
-      }
-    } catch(_e) {
-      // логирование не считаем фатальным
-    }
-
-    return res.json({ ok:true, updated: upd.rowCount || 0, new_balance: newBalance });
+    return res.json({ ok: true, hum_id: humId, new_balance: newBalance });
   } catch (e) {
-    return res.status(500).json({ ok:false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
