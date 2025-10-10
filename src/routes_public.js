@@ -1,28 +1,30 @@
-// Public (non-admin) routes for GGRoom
+// Public routes
 import { Router } from 'express';
 import { db } from './db.js';
 
 const router = Router();
 
-// GET /api/user/:id — return safe profile for exact user id (used to show provider-specific balance on lobby)
 router.get('/user/:id', async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok:false, error:'bad_id' });
   try {
-    const u = await db.user.findUnique({
-      where: { id },
-      select: { id:true, provider:true, first_name:true, last_name:true, balance:true, created_at:true }
-    });
-    if (!u) return res.status(404).json({ ok:false, error:'not_found' });
-    // normalize output
+    const row = await db.query(
+      `select id, vk_id, first_name, last_name, avatar, provider, balance, created_at
+       from users where id = $1 limit 1`, [id]
+    );
+    if (!row.rows?.length) return res.status(404).json({ ok:false, error:'not_found' });
+    const u = row.rows[0];
     res.json({
       ok: true,
-      user_id: u.id,
-      provider: u.provider,
-      first_name: u.first_name || null,
-      last_name: u.last_name || null,
-      balance: Number(u.balance || 0),
-      created_at: u.created_at
+      user: {
+        user_id: u.id,
+        provider: u.provider || (String(u.vk_id||'').startsWith('tg:')?'tg':'vk'),
+        first_name: u.first_name || null,
+        last_name: u.last_name || null,
+        avatar: u.avatar || null,
+        balance: Number(u.balance || 0),
+        created_at: u.created_at
+      }
     });
   } catch (e) {
     console.error('GET /api/user/:id failed', e);
