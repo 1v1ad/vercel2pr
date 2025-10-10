@@ -10,6 +10,7 @@ import authRouter from './src/routes_auth.js';
 import linkRouter from './src/routes_link.js';
 import tgRouter from './src/routes_tg.js';
 import profileLinkRoutes from './src/routes_profile_link.js';
+import publicRouter from './src/routes_public.js'; // <-- новый публичный роутер (GET /api/user/:id)
 
 dotenv.config();
 
@@ -74,6 +75,9 @@ app.get('/api/me', async (req, res) => {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
+// --- новый публичный роутер (например, GET /api/user/:id для точного баланса TG/VK) ---
+app.use('/api', publicRouter);
 
 app.use('/api/admin', adminRoutes);
 app.use('/api/profile/link', profileLinkRoutes);
