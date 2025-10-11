@@ -26,13 +26,13 @@
 ## Список событий
 
 ### Аутентификация
-- `login_request` — начало авторизации (провайдер, редирект, state)
+- `auth_start` — начало авторизации (provider, state если есть)
 - `login_success` — успешный логин (hum_id, provider, pid)
 - `login_error` — ошибка логина (comment: текст/код)
 
 ### Линковка аккаунтов (жёсткая, proof)
-- `link_request` — пользователь нажал «Связать …»; сохраняем `hum_id`, `provider`, `nonce` в cookie  
-  - поля: `hum_id`, `provider`, `ip`, `ua`, `payload.state`
+- `link_request` — пользователь нажал «Связать …»; сохраняем `provider`, `nonce` в cookie  
+  - поля: `hum_id` (если уже есть сессия), `provider`, `ip`, `ua`, `payload.state?`
 - `link_success` — провайдер успешно привязан к `hum_id`  
   - поля: `hum_id`, `provider`, `pid`, `ip`, `ua`
 - `link_conflict` — попытка привязать `pid`, уже принадлежащий другому `hum_id`  
@@ -49,7 +49,7 @@
 ### Пополнение админом
 - `admin_topup` — ручное изменение баланса админом
   - **нормализация полей:**
-    - `amount` — итоговое дельта-значение (может быть `< 0`)
+    - `amount` — итоговый дельта-значение (может быть `< 0`)
     - `comment` — комментарий оператора
     - `hum_id`/`user_id` — кому применили
     - `ip`, `ua` — откуда операция
@@ -91,3 +91,19 @@
   "ua": "Mozilla/5.0 ...",
   "created_at": "2025-10-11T13:30:43Z"
 }
+```
+
+### Пример `admin_topup`
+```json
+{
+  "event_type": "admin_topup",
+  "type": "admin_topup",
+  "hum_id": 97,
+  "user_id": 97,
+  "amount": 100,
+  "comment": "Проверка",
+  "ip": "194.87.115.218",
+  "ua": "Mozilla/5.0 ...",
+  "created_at": "2025-10-11T13:40:12Z"
+}
+```
