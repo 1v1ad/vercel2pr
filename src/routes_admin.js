@@ -1,6 +1,6 @@
-// src/routes_admin.js — V3.12
-// - admin_topup: допускаем отрицательные суммы, логируем через logEvent
-// - /events: нормализация amount из payload; hum_id из payload/таблицы; безопасные поля
+// src/routes_admin.js — V3.13
+// - FIX: /events нормализует amount/comment/hum_id из payload/joins
+// - Остальные роуты без функциональных изменений
 
 import express from 'express';
 import { db, logEvent } from './db.js';
@@ -26,14 +26,12 @@ const getCols = async (table) => {
   return new Set((r.rows||[]).map(x=>x.column_name));
 };
 
-// tzExprN(placeholderIndex, col, tbl)
 const tzExprN = (n=1, col='created_at', tbl='e') => `
 CASE
   WHEN pg_typeof(${tbl}.${col}) = 'timestamp with time zone'::regtype
     THEN (${tbl}.${col} AT TIME ZONE $${n})
   ELSE ((${tbl}.${col} AT TIME ZONE 'UTC') AT TIME ZONE $${n})
-END
-`;
+END`;
 
 /* -------------------- users list -------------------- */
 router.get('/users', async (req,res)=>{
@@ -57,15 +55,15 @@ router.get('/users', async (req,res)=>{
     const sql=`
       with base as (
         select
-          coalesce(u.hum_id, u.id) as hum_id,
-          u.id                      as user_id,
-          u.vk_id                   as vk_id,
-          coalesce(u.first_name,'') as first_name,
-          coalesce(u.last_name,'')  as last_name,
-          coalesce(u.balance,0)     as balance_raw,
-          coalesce(u.country_code,'') as country_code,
-          coalesce(u.country_name,'') as country_name,
-          coalesce(u.created_at, now()) as created_at,
+          coalesce(u.hum_id, u.id)       as hum_id,
+          u.id                            as user_id,
+          u.vk_id                         as vk_id,
+          coalesce(u.first_name,'')       as first_name,
+          coalesce(u.last_name,'')        as last_name,
+          coalesce(u.balance,0)           as balance_raw,
+          coalesce(u.country_code,'')     as country_code,
+          coalesce(u.country_name,'')     as country_name,
+          coalesce(u.created_at, now())   as created_at,
           array_remove(array[
             case when u.vk_id is not null and u.vk_id::text !~ '^tg:' then 'vk' end,
             case when u.vk_id::text ilike 'tg:%' then 'tg' end
@@ -94,7 +92,7 @@ router.get('/users', async (req,res)=>{
 });
 
 /* -------------------- admin_topup -------------------- */
-// POST /api/admin/users/:id/topup   body: { amount (≠0, sign allowed), comment }
+// POST /api/admin/users/:id/topup  body: { amount(≠0), comment }  — знак суммы допускается
 router.post('/users/:id/topup', async (req, res) => {
   try {
     const userId = Number(req.params.id || 0);
@@ -110,19 +108,16 @@ router.post('/users/:id/topup', async (req, res) => {
     if (!comment) return res.status(400).json({ ok:false, error:'comment_required' });
 
     const ru = await db.query(
-      'select id, coalesce(hum_id, id) hum_id from users where id = $1 limit 1',
-      [userId]
+      'select id, coalesce(hum_id, id) hum_id from users where id = $1 limit 1',[userId]
     );
     if (!ru.rows?.length) return res.status(404).json({ ok:false, error:'user_not_found' });
     const humId = Number(ru.rows[0].hum_id);
 
-    // меняем баланс всей HUM-группы
     await db.query(
       'update users set balance = coalesce(balance,0) + $2 where coalesce(hum_id,id) = $1',
       [humId, amount]
     );
 
-    // лог события
     const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
     const ip = ipHeader.split(',')[0].trim();
     const ua = (req.headers['user-agent'] || '').slice(0,256);
@@ -134,7 +129,6 @@ router.post('/users/:id/topup', async (req, res) => {
       ip, ua, country_code: null
     });
 
-    // отдаём свежий суммарный баланс HUM
     const total = await db.query(
       'select sum(coalesce(balance,0))::bigint as hum_balance from users where coalesce(hum_id,id) = $1',
       [humId]
@@ -185,7 +179,7 @@ router.get('/events', async (req,res)=>{
         )`
       : '0::bigint';
 
-    // comment из meta/payload
+    // comment из payload/meta
     const commentExpr = has('meta')
       ? "coalesce(e.meta->>'comment', e.meta->>'note', e.meta->>'reason', e.meta->>'description')"
       : has('payload')
@@ -199,8 +193,7 @@ router.get('/events', async (req,res)=>{
         ${has('payload') ? "NULLIF((e.payload->>'hum_id'),'')::bigint" : 'NULL'},
         ${uidCol ? 'u.hum_id' : 'NULL'},
         ${uidCol ? 'u.id'     : 'NULL'}
-      )
-    `;
+      )`;
 
     const p=[]; const cond=[];
     const et = (req.query.type || req.query.event_type || '').toString().trim();
@@ -271,36 +264,20 @@ router.get('/summary', async (req,res)=>{
         select (now() at time zone $1)::date as today,
                ((now() at time zone $1)::date - interval '7 days') as since
       ),
-      ev as (
-        select e.user_id,
-               ${tzExprN(1,'created_at','e')} as ts_msk,
-               ${typeExpr} as et
-          from events e
-      ),
+      ev as (select e.user_id, ${tzExprN(1,'created_at','e')} as ts_msk, ${typeExpr} as et from events e),
       login as (select user_id, ts_msk from ev where et ilike '%login%success%'),
       auth  as (select user_id, ts_msk from ev where et ilike '%auth%success%'),
       auth_orphan as (
         select a.user_id, a.ts_msk
-          from auth a
-          left join login l
-            on l.user_id = a.user_id
-           and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
+          from auth a left join login l
+            on l.user_id = a.user_id and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
          where l.user_id is null
       ),
-      canon as (
-        select * from login
-        union all
-        select * from auth_orphan
-      )
+      canon as (select * from login union all select * from auth_orphan)
       select
-        (select count(*)::int
-           from canon c
-          where c.ts_msk::date >= (select since from b)
-        ) as auth7_total,
-        (select count(distinct coalesce(u.hum_id,u.id))::int
-           from canon c join users u on u.id=c.user_id
-          where c.ts_msk::date >= (select since from b)
-        ) as auth7
+        (select count(*)::int from canon c where c.ts_msk::date >= (select since from b)) as auth7_total,
+        (select count(distinct coalesce(u.hum_id,u.id))::int from canon c join users u on u.id=c.user_id
+          where c.ts_msk::date >= (select since from b)) as auth7
     `;
     const r = await db.query(sql, [tz]);
     const x = r.rows?.[0] || {};
@@ -341,9 +318,7 @@ async function daily(req,res){
       ),
       d(day) as (select generate_series((select since from b),(select today from b), interval '1 day')),
       ev as (
-        select e.user_id,
-               ${tzExprN(1,'created_at','e')} as ts_msk,
-               ${typeExpr} as et
+        select e.user_id, ${tzExprN(1,'created_at','e')} as ts_msk, ${typeExpr} as et
           from events e
          where (${tzExprN(1,'created_at','e')})::date >= (select since from b)
       ),
@@ -351,17 +326,11 @@ async function daily(req,res){
       auth  as (select user_id, ts_msk from ev where et ilike '%auth%success%'),
       auth_orphan as (
         select a.user_id, a.ts_msk
-          from auth a
-          left join login l
-            on l.user_id = a.user_id
-           and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
+          from auth a left join login l
+            on l.user_id = a.user_id and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
          where l.user_id is null
       ),
-      canon as (
-        select * from login
-        union all
-        select * from auth_orphan
-      ),
+      canon as (select * from login union all select * from auth_orphan),
       totals as ( select c.ts_msk::date d, count(*) c from canon c group by 1 ),
       uniq   as ( select c.ts_msk::date d, count(distinct coalesce(u.hum_id,u.id)) c
                   from canon c join users u on u.id=c.user_id group by 1 )
