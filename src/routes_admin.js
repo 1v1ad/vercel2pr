@@ -1,6 +1,6 @@
-// src/routes_admin.js — V3.10 (safe typeExpr, MSK, canonical logins, robust events, topup)
+// src/routes_admin.js — V3.11 (topup fix: import logEvent; allow negatives; better events)
 import express from 'express';
-import { db } from './db.js';
+import { db, logEvent } from './db.js';
 
 const router = express.Router();
 
@@ -92,8 +92,8 @@ router.get('/users', async (req,res)=>{
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
 
-/* ---------- TOPUP (пополнение конкретного user_id) ---------- */
-// POST /api/admin/users/:id/topup   body: { amount: number, comment: string }
+/* ---------- TOPUP (пополнение/списание HUM-группы) ---------- */
+// POST /api/admin/users/:id/topup   body: { amount: number (≠0), comment: string }
 /**
  * FEAT: admin_topup
  * WHY:  ручное изменение баланса HUM-группы; лог через logEvent(payload)
@@ -101,28 +101,33 @@ router.get('/users', async (req,res)=>{
  */
 router.post('/users/:id/topup', async (req, res) => {
   try {
-    const adminPwd = (req.get('X-Admin-Password') || req.query.admin_password || '').trim();
-    if (!adminPwd || adminPwd !== (process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD)) {
-      return res.status(401).json({ ok:false, error:'unauthorized' });
-    }
-
     const userId = Number(req.params.id || 0);
-    const amount = Math.trunc(Number(req.body.amount ?? req.body.value ?? req.body.sum ?? req.body.delta) || 0);
-    const comment = String(req.body.comment ?? req.body.note ?? req.body.reason ?? req.body.description ?? '').trim();
+    const amount = Math.trunc(Number(
+      req.body.amount ?? req.body.value ?? req.body.sum ?? req.body.delta
+    ) || 0);
+    const comment = String(
+      req.body.comment ?? req.body.note ?? req.body.reason ?? req.body.description ?? ''
+    ).trim();
 
     if (!userId) return res.status(400).json({ ok:false, error:'user_required' });
-    if (!amount)  return res.status(400).json({ ok:false, error:'amount_required' });
+    if (!amount)  return res.status(400).json({ ok:false, error:'amount_required' }); // ноль запрещён
     if (!comment) return res.status(400).json({ ok:false, error:'comment_required' });
 
     // найдём HUM-группу
-    const ru = await db.query('select id, coalesce(hum_id, id) hum_id from users where id = $1 limit 1', [userId]);
+    const ru = await db.query(
+      'select id, coalesce(hum_id, id) hum_id from users where id = $1 limit 1',
+      [userId]
+    );
     if (!ru.rows?.length) return res.status(404).json({ ok:false, error:'user_not_found' });
     const humId = Number(ru.rows[0].hum_id);
 
     // изменяем баланс всей HUM-группы (положительный или отрицательный delta)
-    await db.query('update users set balance = coalesce(balance,0) + $2 where coalesce(hum_id,id) = $1', [humId, amount]);
+    await db.query(
+      'update users set balance = coalesce(balance,0) + $2 where coalesce(hum_id,id) = $1',
+      [humId, amount]
+    );
 
-    // логируя через существующую функцию (таблица events без лишних колонок)
+    // лог
     const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
     const ip = ipHeader.split(',')[0].trim();
     const ua = (req.headers['user-agent'] || '').slice(0,256);
@@ -134,7 +139,7 @@ router.post('/users/:id/topup', async (req, res) => {
       ip, ua, country_code: null
     });
 
-    // отдадим свежую сумму HUM-группы
+    // отдаём свежую сумму HUM-группы
     const total = await db.query(
       'select sum(coalesce(balance,0))::bigint as hum_balance from users where coalesce(hum_id,id) = $1',
       [humId]
@@ -147,7 +152,7 @@ router.post('/users/:id/topup', async (req, res) => {
 });
 
 
-// /api/admin/events — теперь с amount и comment
+/* ---------- /events (нормализация amount/comment) ---------- */
 router.get('/events', async (req,res)=>{
   try{
     const cols = await getCols('events');
@@ -174,9 +179,11 @@ router.get('/events', async (req,res)=>{
                   : has('time')       ? 'e.time'
                   : 'now()';
     const amountCol = has('amount') ? 'e.amount' : 'NULL::bigint';
-    const commentCol = has('meta') ? "(coalesce(e.meta->>'comment', e.meta->>'note', e.meta->>'reason'))"
-                     : has('payload') ? "(coalesce(e.payload->>'comment', e.payload->>'note', e.payload->>'reason'))"
-                     : "NULL";
+    const commentCol = has('meta')
+        ? "coalesce(e.meta->>'comment', e.meta->>'note', e.meta->>'reason')"
+        : has('payload')
+        ? "coalesce(e.payload->>'comment', e.payload->>'note', e.payload->>'reason')"
+        : "NULL";
 
     const p=[]; const cond=[];
     const et = (req.query.type || req.query.event_type || '').toString().trim();
