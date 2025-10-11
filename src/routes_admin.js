@@ -1,13 +1,14 @@
-// src/routes_admin.js — V3.11 (topup fix: import logEvent; allow negatives; better events)
+// src/routes_admin.js — V3.12
+// - admin_topup: допускаем отрицательные суммы, логируем через logEvent
+// - /events: нормализация amount из payload; hum_id из payload/таблицы; безопасные поля
+
 import express from 'express';
 import { db, logEvent } from './db.js';
 
 const router = express.Router();
-
-// гарантировано парсим JSON для POST
 router.use(express.json());
 
-/* ---------- auth ---------- */
+/* -------------------- admin auth -------------------- */
 router.use((req,res,next)=>{
   const need = String(process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD || '');
   const got  = String(req.get('X-Admin-Password') || req.body?.pwd || req.query?.pwd || '');
@@ -16,7 +17,7 @@ router.use((req,res,next)=>{
   next();
 });
 
-/* ---------- helpers ---------- */
+/* -------------------- helpers -------------------- */
 const getCols = async (table) => {
   const r = await db.query(`
     select column_name from information_schema.columns
@@ -34,7 +35,7 @@ CASE
 END
 `;
 
-/* ---------- USERS ---------- */
+/* -------------------- users list -------------------- */
 router.get('/users', async (req,res)=>{
   try{
     const take = Math.max(1,Math.min(500,parseInt(req.query.take||'50',10)));
@@ -92,13 +93,8 @@ router.get('/users', async (req,res)=>{
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
 
-/* ---------- TOPUP (пополнение/списание HUM-группы) ---------- */
-// POST /api/admin/users/:id/topup   body: { amount: number (≠0), comment: string }
-/**
- * FEAT: admin_topup
- * WHY:  ручное изменение баланса HUM-группы; лог через logEvent(payload)
- * DATE: 2025-10-11
- */
+/* -------------------- admin_topup -------------------- */
+// POST /api/admin/users/:id/topup   body: { amount (≠0, sign allowed), comment }
 router.post('/users/:id/topup', async (req, res) => {
   try {
     const userId = Number(req.params.id || 0);
@@ -113,7 +109,6 @@ router.post('/users/:id/topup', async (req, res) => {
     if (!amount)  return res.status(400).json({ ok:false, error:'amount_required' }); // ноль запрещён
     if (!comment) return res.status(400).json({ ok:false, error:'comment_required' });
 
-    // найдём HUM-группу
     const ru = await db.query(
       'select id, coalesce(hum_id, id) hum_id from users where id = $1 limit 1',
       [userId]
@@ -121,13 +116,13 @@ router.post('/users/:id/topup', async (req, res) => {
     if (!ru.rows?.length) return res.status(404).json({ ok:false, error:'user_not_found' });
     const humId = Number(ru.rows[0].hum_id);
 
-    // изменяем баланс всей HUM-группы (положительный или отрицательный delta)
+    // меняем баланс всей HUM-группы
     await db.query(
       'update users set balance = coalesce(balance,0) + $2 where coalesce(hum_id,id) = $1',
       [humId, amount]
     );
 
-    // лог
+    // лог события
     const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
     const ip = ipHeader.split(',')[0].trim();
     const ua = (req.headers['user-agent'] || '').slice(0,256);
@@ -139,7 +134,7 @@ router.post('/users/:id/topup', async (req, res) => {
       ip, ua, country_code: null
     });
 
-    // отдаём свежую сумму HUM-группы
+    // отдаём свежий суммарный баланс HUM
     const total = await db.query(
       'select sum(coalesce(balance,0))::bigint as hum_balance from users where coalesce(hum_id,id) = $1',
       [humId]
@@ -151,8 +146,7 @@ router.post('/users/:id/topup', async (req, res) => {
   }
 });
 
-
-/* ---------- /events (нормализация amount/comment) ---------- */
+/* -------------------- events (нормализация) -------------------- */
 router.get('/events', async (req,res)=>{
   try{
     const cols = await getCols('events');
@@ -178,12 +172,35 @@ router.get('/events', async (req,res)=>{
                   : has('ts')         ? 'e.ts'
                   : has('time')       ? 'e.time'
                   : 'now()';
-    const amountCol = has('amount') ? 'e.amount' : 'NULL::bigint';
-    const commentCol = has('meta')
-        ? "coalesce(e.meta->>'comment', e.meta->>'note', e.meta->>'reason')"
-        : has('payload')
-        ? "coalesce(e.payload->>'comment', e.payload->>'note', e.payload->>'reason')"
-        : "NULL";
+
+    // amount из payload (amount/value/sum/delta) или из столбца
+    const amountExpr = has('amount') ? 'e.amount::bigint'
+      : has('payload') ? `
+        COALESCE(
+          NULLIF((e.payload->>'amount'),'')::bigint,
+          NULLIF((e.payload->>'value'),'')::bigint,
+          NULLIF((e.payload->>'sum'),'')::bigint,
+          NULLIF((e.payload->>'delta'),'')::bigint,
+          0
+        )`
+      : '0::bigint';
+
+    // comment из meta/payload
+    const commentExpr = has('meta')
+      ? "coalesce(e.meta->>'comment', e.meta->>'note', e.meta->>'reason', e.meta->>'description')"
+      : has('payload')
+      ? "coalesce(e.payload->>'comment', e.payload->>'note', e.payload->>'reason', e.payload->>'description')"
+      : "NULL";
+
+    // hum_id из колонки, payload, либо из users join
+    const humExpr = `
+      COALESCE(
+        ${has('hum_id') ? 'e.hum_id' : 'NULL'},
+        ${has('payload') ? "NULLIF((e.payload->>'hum_id'),'')::bigint" : 'NULL'},
+        ${uidCol ? 'u.hum_id' : 'NULL'},
+        ${uidCol ? 'u.id'     : 'NULL'}
+      )
+    `;
 
     const p=[]; const cond=[];
     const et = (req.query.type || req.query.event_type || '').toString().trim();
@@ -200,34 +217,35 @@ router.get('/events', async (req,res)=>{
     const sql = `
       select
         ${idCol}  as event_id,
-        ${uidCol ? 'coalesce(e.hum_id, u.hum_id, u.id)' : 'coalesce(e.hum_id, NULL)'} as hum_id,
-        ${uidCol ? uidCol : 'NULL'} as user_id,
+        ${uidCol ? uidCol : (has('payload') ? "NULLIF((e.payload->>'user_id'),'')::bigint" : 'NULL')} as user_id,
         ${typeExpr} as event_type,
         ${ipCol}   as ip,
         ${uaCol}   as ua,
         ${tsCol}   as created_at,
-        ${amountCol} as amount,
-        ${commentCol} as comment
+        ${amountExpr} as amount,
+        ${commentExpr} as comment,
+        ${humExpr} as hum_id
       from events e
       ${joinUsers ? `left join users u on u.id = ${uidCol}` : ''}
       ${where}
-      order by ${cols.has('id') ? 'e.id' : '1'} desc
+      order by ${cols.has('id') ? 'e.id' : 'created_at'} desc
       limit $${p.length-1} offset $${p.length};
     `;
     const r=await db.query(sql,p);
     const rows=(r.rows||[]).map(e=>({
-      id:e.event_id, HUMid:e.hum_id, user_id:e.user_id,
+      id:e.event_id,
+      user_id:e.user_id!=null ? Number(e.user_id) : null,
+      HUMid:e.hum_id!=null ? Number(e.hum_id) : null,
       event_type:e.event_type, type:e.event_type,
       ip:e.ip, ua:e.ua, created_at:e.created_at,
-      amount: e.amount!=null ? Number(e.amount) : null,
+      amount: e.amount!=null ? Number(e.amount) : 0,
       comment: e.comment || null
     }));
     res.json({ ok:true, events:rows, rows });
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
 
-
-/* ---------- SUMMARY (MSK + канон. логины, безопасный typeExpr) ---------- */
+/* -------------------- summary -------------------- */
 router.get('/summary', async (req,res)=>{
   try{
     const tz = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
@@ -305,7 +323,7 @@ router.get('/summary', async (req,res)=>{
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
 
-/* ---------- DAILY (MSK + канон. логины, безопасный typeExpr) ---------- */
+/* -------------------- daily -------------------- */
 async function daily(req,res){
   try{
     const days = Math.max(1,Math.min(31,parseInt(req.query.days||'7',10)));
