@@ -1,28 +1,93 @@
-# GGRoom — события (канон)
+# GGRoom — Canonical Events
 
-## Таблица `events`
-Колонки:
-- `id serial primary key`
-- `user_id integer` — внутренний id пользователя (может быть NULL, если нет связи)
-- `hum_id bigint` — HUM-группа (coalesce(hum_id, id))
-- `event_type varchar(64)` — **каноничное имя события**
-- `payload jsonb` — доп. данные (старые записи)
-- `amount bigint` — числовое значение (для пополнений/списаний)
-- `meta jsonb` — метаданные (`{ comment, admin_id, source, ... }`)
-- `ip text`, `ua text`, `created_at timestamp`
+Единый словарь названий событий и обязательных полей.  
+Нейминг: `snake_case`. В БД — `events(event_type, …)`. Дата/время — UTC.
 
-Индексы: `events(event_type)`, `events(user_id)`, `events(created_at)`.
+## Общие поля события
 
-## Каноничные события
-- `login_success` — успешный логин (любой провайдер)
-- `auth_success` — успешная авторизация/рефреш
-- `profile_link_start` / `profile_link_done`
-- `admin_topup` — **ручное пополнение админом**
-- `balance_adjust` — любые сервисные корректировки баланса
-- `user_created` — регистрация
+- `id` — PK (serial/bigserial)
+- `event_type` — строка (`login_success`, `admin_topup`, …)
+- `type` — дублирование `event_type` для совместимости (может совпадать)
+- `hum_id` — основной идентификатор HUM (int) — **обязательно, если известен**
+- `user_id` — алиас `hum_id` (для старых путей) — можно копировать `hum_id`
+- `provider` — `vk` | `tg` | `web` | `system` (если применимо)
+- `pid` — id в провайдере (например, `provider_user_id`) — если применимо
+- `ip` — строка IP (если применимо)
+- `ua` — User-Agent (если применимо)
+- `amount` — число (для финансовых событий; положительное/отрицательное)
+- `comment` — текстовое пояснение/примечание
+- `payload` — `jsonb` (произвольная структура)
+- `created_at` — `timestamptz` (UTC, default now())
 
-## `admin_topup`
-- Пишется в `events` строчка:
-  ```sql
-  insert into events (user_id, hum_id, event_type, ip, ua, created_at, amount, meta)
-  values ($user_id, $hum_id, 'admin_topup', $ip, $ua, now(), $amount, jsonb_build_object('comment',$comment,'admin_id',$admin_id));
+> **Правило:** если добавляем новое событие — сначала дополняем этот файл.
+
+---
+
+## Список событий
+
+### Аутентификация
+- `login_request` — начало авторизации (провайдер, редирект, state)
+- `login_success` — успешный логин (hum_id, provider, pid)
+- `login_error` — ошибка логина (comment: текст/код)
+
+### Линковка аккаунтов (жёсткая, proof)
+- `link_request` — пользователь нажал «Связать …»; сохраняем `hum_id`, `provider`, `nonce` в cookie  
+  - поля: `hum_id`, `provider`, `ip`, `ua`, `payload.state`
+- `link_success` — провайдер успешно привязан к `hum_id`  
+  - поля: `hum_id`, `provider`, `pid`, `ip`, `ua`
+- `link_conflict` — попытка привязать `pid`, уже принадлежащий другому `hum_id`  
+  - поля: `hum_id` (к кому хотели привязать), `provider`, `pid`, `ip`, `ua`
+- `link_error` — сбой/исключение при линковке  
+  - поля: `comment` (текст ошибки), `ip`, `ua`, опционально `payload`
+
+### Линковка (мягкая, по устройству)
+- `link_soft_candidate` — нашли кандидатов по `device_id`  
+  - поля: `payload.device_id`, `payload.matches=[hum_id,…]`
+- `link_soft_merged` — выполнено мягкое объединение  
+  - поля: `hum_id`, `payload.details`
+
+### Пополнение админом
+- `admin_topup` — ручное изменение баланса админом
+  - **нормализация полей:**
+    - `amount` — итоговое дельта-значение (может быть `< 0`)
+    - `comment` — комментарий оператора
+    - `hum_id`/`user_id` — кому применили
+    - `ip`, `ua` — откуда операция
+  - **совместимость:** входящий `payload` может содержать дубли (`value`, `sum`, `delta`, `note`, `reason`, `description`). На чтении фронт выбирает:
+    - amount: `amount ?? value ?? sum ?? delta ?? 0`
+    - comment: `comment ?? note ?? reason ?? description ?? ''`
+
+### Прочее
+- `profile_update` — изменение публичного профиля
+- `room_create` / `room_join` / `room_leave` — действия в лобби/комнатах (резерв)
+- `payment_init` / `payment_success` / `payment_error` — интеграция платёжки
+
+---
+
+## Хранение IP/UA
+Для `admin_topup`, `link_*`, `login_*` **обязательно** сохраняем `ip` и `ua`.
+
+---
+
+## Пагинация и выборка
+- стандарт: `GET /api/admin/events?take=50&skip=0&event_type=...`
+- по умолчанию `take=50`, максимум `take=200`
+- сортировка по `created_at desc`
+
+---
+
+## Примеры
+
+### Пример `link_success`
+```json
+{
+  "event_type": "link_success",
+  "type": "link_success",
+  "hum_id": 97,
+  "user_id": 97,
+  "provider": "tg",
+  "pid": "1650011165",
+  "ip": "194.87.115.218",
+  "ua": "Mozilla/5.0 ...",
+  "created_at": "2025-10-11T13:30:43Z"
+}
