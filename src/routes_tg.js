@@ -1,4 +1,4 @@
-// src/routes_tg.js — TG callback + link-mode + device-session (без verifySession из jwt.js)
+// src/routes_tg.js — TG callback + proof-merge + device-session
 import { Router } from 'express';
 import jwt from 'jsonwebtoken';
 import { db, getUserById, logEvent } from './db.js';
@@ -16,20 +16,14 @@ function getDeviceId(req){
   return safe(req.query?.device_id || req.cookies?.device_id || '');
 }
 
-// Мягко декодируем uid из cookie sid.
-// Сначала пробуем верификацию через jsonwebtoken.verify(JWT_SECRET),
-// если не получилось — делаем «best effort» base64url-декод без проверки подписи.
+// мягкое извлечение uid из sid (с проверкой и без)
 function getSessionUid(req){
   const token = (req.cookies?.sid || '').toString();
   if (!token) return null;
-
-  // 1) Верная проверка
   try{
     const data = jwt.verify(token, process.env.JWT_SECRET);
     if (data && data.uid) return Number(data.uid);
   }catch(_){}
-
-  // 2) Фолбэк: читаем payload без верификации
   try{
     const parts = token.split('.');
     if (parts.length >= 2){
@@ -39,7 +33,6 @@ function getSessionUid(req){
       if (json && json.uid) return Number(json.uid);
     }
   }catch(_){}
-
   return null;
 }
 
@@ -60,7 +53,7 @@ router.all('/callback', async (req, res) => {
     const tgId = safe(data.id || '');
     const mode = safe(data.mode || 'login'); // 'login' | 'link'
 
-    // Определяем primary пользователя для привязки
+    // определяем primary пользователя
     let primaryUid = getSessionUid(req);
 
     if (!primaryUid && deviceId) {
@@ -73,13 +66,59 @@ router.all('/callback', async (req, res) => {
       } catch {}
     }
 
-    // Разрешим явную передачу primary_uid с фронта (последний шанс)
+    // fallback: явный primary_uid из фронта (в режиме link)
     if (!primaryUid && mode === 'link') {
       const q = Number(safe(data.primary_uid));
       if (Number.isFinite(q) && q > 0) primaryUid = q;
     }
 
-    // upsert TG auth_account; если знаем primaryUid — сразу проставим user_id
+    // --- PROOF LINK: жёсткая привязка TG к primary + HUM-склейка ---
+    let oldUid = null;
+    if (mode === 'link' && tgId && primaryUid) {
+      // чей был TG ранее?
+      try {
+        const r0 = await db.query(
+          "select user_id from auth_accounts where provider='tg' and provider_user_id=$1 limit 1",
+          [tgId]
+        );
+        if (r0.rows.length && r0.rows[0].user_id) oldUid = Number(r0.rows[0].user_id);
+      } catch {}
+
+      // 1) перевязываем TG-аккаунт на primaryUid (жёстко)
+      try {
+        await db.query(
+          "update auth_accounts set user_id=$1, meta = jsonb_strip_nulls(coalesce(meta,'{}') || $3::jsonb), updated_at=now() where provider='tg' and provider_user_id=$2",
+          [primaryUid, tgId, JSON.stringify({ device_id: deviceId || null })]
+        );
+      } catch (e) {
+        console.error('link: rebind tg -> primary failed', e?.message);
+      }
+
+      // 2) если TG имел свой отдельный user_id — задаём ему hum_id=primary
+      if (oldUid && oldUid !== primaryUid) {
+        try {
+          await db.query(
+            "update users set hum_id=$1 where id=$2 and (hum_id is null or hum_id<>$1)",
+            [primaryUid, oldUid]
+          );
+        } catch (e) {
+          console.warn('link: set hum_id failed', e?.message);
+        }
+      }
+
+      // 3) лог для аудита: proof merge
+      try {
+        await logEvent({
+          user_id: primaryUid,
+          event_type: 'merge_proof',
+          payload: { provider:'tg', tg_id: tgId || null, from_user_id: oldUid, to_user_id: primaryUid, method:'proof' },
+          ip:firstIp(req),
+          ua:(req.headers['user-agent']||'').slice(0,256)
+        });
+      } catch {}
+    }
+
+    // обычный upsert TG (на случай login / первичного визита)
     if (tgId) {
       try{
         await db.query(`
@@ -101,17 +140,7 @@ router.all('/callback', async (req, res) => {
       }
     }
 
-    // В режиме link дожимаем user_id у TG-аккаунта
-    if (mode === 'link' && tgId && primaryUid) {
-      try {
-        await db.query(
-          "update auth_accounts set user_id = $1, updated_at=now() where provider='tg' and provider_user_id=$2 and (user_id is null or user_id=$1)",
-          [primaryUid, tgId]
-        );
-      } catch {}
-    }
-
-    // Ставим сессию
+    // ставим сессию (на primary)
     try {
       let uidForSession = primaryUid || null;
       if (!uidForSession && tgId) {
@@ -132,10 +161,10 @@ router.all('/callback', async (req, res) => {
       }
     } catch {}
 
-    // Автомерж по device_id (fire-and-forget)
+    // автомерж по device_id — пусть остаётся
     try { if (deviceId) await autoMergeByDevice({ deviceId, tgId }); } catch {}
 
-    // Редирект в лобби
+    // редирект в лобби
     const frontend = process.env.FRONTEND_URL || 'http://localhost:5173';
     const url = new URL('/lobby.html', frontend);
     url.searchParams.set('provider','tg');
@@ -145,7 +174,7 @@ router.all('/callback', async (req, res) => {
     if (data.username) url.searchParams.set('username', safe(data.username));
     if (data.photo_url) url.searchParams.set('photo_url', safe(data.photo_url));
 
-    // Логируем успех
+    // финальный лог (auth/link)
     try {
       let uidToLog = null;
       if (tgId) {
