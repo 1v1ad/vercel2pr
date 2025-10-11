@@ -1,3 +1,4 @@
+import publicRoutes from './src/routes_public.js'; // <-- новый публичный роутер (GET /api/user/:id)
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
@@ -10,7 +11,6 @@ import authRouter from './src/routes_auth.js';
 import linkRouter from './src/routes_link.js';
 import tgRouter from './src/routes_tg.js';
 import profileLinkRoutes from './src/routes_profile_link.js';
-import publicRouter from './src/routes_public.js'; // <-- новый публичный роутер (GET /api/user/:id)
 
 dotenv.config();
 
@@ -76,13 +76,12 @@ app.get('/api/me', async (req, res) => {
   }
 });
 
-// --- новый публичный роутер (например, GET /api/user/:id для точного баланса TG/VK) ---
-app.use('/api', publicRouter);
-
 app.use('/api/admin', adminRoutes);
 app.use('/api/profile/link', profileLinkRoutes);
 app.use('/api/auth/tg', tgRouter);
 app.use('/api/auth', authRouter);
+// --- новый публичный роутер (например, GET /api/user/:id для точного баланса TG/VK) ---
+app.use('/api', publicRoutes);  // <— добавь эту строку ДО app.use('/api', linkRouter)
 app.use('/api', linkRouter);
 
 app.post('/api/events', async (req, res) => {
