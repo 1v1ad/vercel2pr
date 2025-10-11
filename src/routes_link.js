@@ -1,55 +1,57 @@
-// src/routes_link.js — link flow: persist device_id + start OAuth linking + optional status
-// REMARK: soft-link по device_id + автосклейка; кнопки в лобби ведут на /api/profile/link/start?vk=1|tg=1
-
+// src/routes_link.js — persist device_id + PROOF linking entrypoint
 import { Router } from 'express';
+import crypto from 'crypto';
+import { db, logEvent } from './db.js';           // logEvent уже есть в проекте
+import { decodeSid } from './routes_auth.js';     // decodeSid есть в routes_auth.js
 import { autoMergeByDevice, ensureMetaColumns } from './merge.js';
-import { db } from './db.js';
 
 const router = Router();
 
-// ───────────────────────────────────────────────────────────────────────────────
-// GET /api/profile/link/start?vk=1|tg=1&redirect=/lobby.html
-// Делает редирект на существующий OAuth-старт, помечая намерение "link".
-// Нужен для кликабельных кнопок в лобби.
+// ----- helpers for link state cookie -----
+function readLinkState(req) {
+  try {
+    const raw = req.cookies?.link_state;
+    if (!raw) return null;
+    const s = JSON.parse(raw);
+    if (!s?.nonce || !s?.target) return null;
+    return s;
+  } catch { return null; }
+}
+function clearLinkState(res) {
+  res.clearCookie('link_state', { path: '/', sameSite: 'lax', secure: true });
+}
+
+// NEW: hard link flow entry
 router.get('/link/start', async (req, res) => {
   try {
-    // provider из query: vk=1 | tg=1 | provider=tg|vk
-    const q = req.query || {};
-    const provider =
-      q.provider?.toString().trim().toLowerCase() ||
-      (q.vk ? 'vk' : '') ||
-      (q.tg ? 'tg' : '');
+    const target = req.query.vk ? 'vk' : (req.query.tg ? 'tg' : null);
+    if (!target) return res.status(400).json({ ok:false, error:'target_required' });
 
-    if (provider !== 'vk' && provider !== 'tg') {
-      return res.status(400).json({ ok: false, error: 'bad_provider' });
+    const userId = decodeSid(req); // текущий HUM из сессии
+    if (!userId) {
+      await logEvent(req, 'link_error', { reason:'no_session', target });
+      return res.redirect('/index.html?link=need_login');
     }
 
-    // куда вернуть после линка (дефолт — в лобби)
-    const redirectTo =
-      (q.redirect && q.redirect.toString()) ||
-      '/lobby.html';
+    const nonce = crypto.randomBytes(12).toString('hex');
+    const ret = (req.query.return || req.get('referer') || '/lobby.html');
 
-    // Сохраним намерение линка в cookie (прочтёшь на стороне /auth/*/complete при желании)
-    res.cookie('link_intent', JSON.stringify({ provider, redirectTo }), {
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: !!(process.env.COOKIE_SECURE || process.env.NODE_ENV === 'production'),
-      maxAge: 10 * 60 * 1000, // 10 минут
-      path: '/',
+    // сохраняем короткий state в httpOnly cookie
+    res.cookie('link_state', JSON.stringify({ target, nonce, return: ret }), {
+      httpOnly: true, sameSite: 'lax', secure: true, path: '/', maxAge: 5 * 60 * 1000,
     });
 
-    // Проксируем на существующие эндпоинты авторизации
-    // Прим.: в проекте уже есть /api/auth/vk/start и /api/auth/tg/start
-    const url = `/api/auth/${provider}/start?link=1`;
-    return res.redirect(url);
+    await logEvent(req, 'link_request', { target, user_id: userId });
+
+    // уходим в старт нужного провайдера (обычные ваши маршруты)
+    return res.redirect(`/api/auth/${target}/start`);
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    await logEvent(req, 'link_error', { error: String(e && e.message || e) });
+    return res.status(500).json({ ok:false, error:'server_error' });
   }
 });
 
-// ───────────────────────────────────────────────────────────────────────────────
-// POST /api/profile/link/background
-// Сохраняем device_id в meta аккаунта и сразу пытаемся автосклеить учётки.
+// оставляем ваш фоновый soft-link по device_id как есть
 router.post('/link/background', async (req, res) => {
   try {
     const body = (req && req.body) || {};
@@ -60,7 +62,6 @@ router.post('/link/background', async (req, res) => {
 
     await ensureMetaColumns();
 
-    // 1) meta.device_id для уже существующей записи
     let updated = 0;
     try {
       const upd = await db.query(
@@ -70,7 +71,6 @@ router.post('/link/background', async (req, res) => {
       updated = upd.rowCount || 0;
     } catch {}
 
-    // 2) Если записи нет — создаём «мягко» (без user_id)
     if (!updated && provider && provider_user_id) {
       try {
         await db.query(
@@ -80,40 +80,12 @@ router.post('/link/background', async (req, res) => {
       } catch {}
     }
 
-    // 3) Пытаемся автосклеить по device_id
-    const merged = await autoMergeByDevice({
-      deviceId: device_id || null,
-      tgId: provider === 'tg' ? provider_user_id : null
-    });
-
-    res.json({ ok: true, merged });
+    const merged = await autoMergeByDevice({ deviceId: device_id || null, tgId: provider === 'tg' ? provider_user_id : null });
+    res.json({ ok:true, merged });
   } catch (e) {
-    res.json({ ok: false, error: String(e && e.message || e) });
-  }
-});
-
-// ───────────────────────────────────────────────────────────────────────────────
-// GET /api/profile/link/status?provider=tg&provider_user_id=1650011165
-// Вспомогательный эндпоинт для отладки: посмотреть, что хранится по аккаунту.
-router.get('/link/status', async (req, res) => {
-  try {
-    const q = req.query || {};
-    const provider = (q.provider || '').toString().trim().toLowerCase();
-    const provider_user_id = (q.provider_user_id || '').toString().trim();
-    if (!provider || !provider_user_id) {
-      return res.status(400).json({ ok: false, error: 'bad_params' });
-    }
-    const r = await db.query(
-      `select id, user_id, hum_id, provider, provider_user_id, username, meta, created_at, updated_at
-       from auth_accounts
-       where provider=$1 and provider_user_id=$2
-       limit 1`,
-      [provider, provider_user_id]
-    );
-    return res.json({ ok: true, account: r.rows?.[0] || null });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    res.json({ ok:false, error: String(e && e.message || e) });
   }
 });
 
 export default router;
+export { readLinkState, clearLinkState };
