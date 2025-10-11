@@ -77,8 +77,23 @@ const resolveUserId = (req) => {
 };
 
 // профиль текущего пользователя с HUM-балансом и флагами linked
+// исправляю /api/me (убираю неоднозначный id) и оставляю флаги linked
 app.get('/api/me', async (req, res) => {
   try {
+    const headerUid = Number(req.get('X-User-Id') || req.query.user_id || 0);
+    const resolveUserId = (req) => {
+      if (Number.isFinite(headerUid) && headerUid > 0) return headerUid;
+      const token = req.cookies?.sid;
+      if (!token) return null;
+      const parts = token.split('.');
+      if (parts.length < 2) return null;
+      try {
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+        const uid = Number(payload?.uid || 0);
+        return Number.isFinite(uid) && uid > 0 ? uid : null;
+      } catch { return null; }
+    };
+
     const uid = resolveUserId(req);
     if (!uid) return res.json({ ok: false, error: 'no_user' });
 
@@ -88,13 +103,17 @@ app.get('/api/me', async (req, res) => {
         from users where id = $1
       ),
       cluster as (
-        select id from users u join me on coalesce(u.hum_id,u.id)=me.hum_id
+        -- ВАЖНО: берём именно u.id, иначе "id" неоднозначен (u.id и me.id)
+        select u.id as id
+        from users u
+        join me on coalesce(u.hum_id,u.id)=me.hum_id
       ),
       links as (
         select
           bool_or(provider='vk') as has_vk,
           bool_or(provider='tg') as has_tg
-        from auth_accounts where user_id in (select id from cluster)
+        from auth_accounts
+        where user_id in (select id from cluster)
       ),
       agg as (
         select sum(coalesce(balance, 0))::bigint as hum_balance
@@ -113,12 +132,20 @@ app.get('/api/me', async (req, res) => {
 
     const user = result.rows[0];
     const provider = String(user.vk_id || '').startsWith('tg:') ? 'tg' : 'vk';
-    res.json({ ok: true, user: { ...user, provider, linked: { vk: !!user.has_vk, tg: !!user.has_tg } } });
+    res.json({
+      ok: true,
+      user: {
+        ...user,
+        provider,
+        linked: { vk: !!user.has_vk, tg: !!user.has_tg }
+      }
+    });
   } catch (e) {
     console.error('me error', e);
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
 
 // маршруты
 app.use('/api/admin', adminRoutes);
