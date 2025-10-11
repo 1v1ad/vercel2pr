@@ -199,7 +199,7 @@ router.get('/events', async (req,res)=>{
     const sql = `
       select
         ${idCol}  as event_id,
-        ${uidCol ? 'coalesce(u.hum_id, u.id)' : 'NULL'} as hum_id,
+        ${uidCol ? 'coalesce(e.hum_id, u.hum_id, u.id)' : 'coalesce(e.hum_id, NULL)'} as hum_id,
         ${uidCol ? uidCol : 'NULL'} as user_id,
         ${typeExpr} as event_type,
         ${ipCol}   as ip,
@@ -224,6 +224,7 @@ router.get('/events', async (req,res)=>{
     res.json({ ok:true, events:rows, rows });
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
+
 
 
 /* ---------- SUMMARY (MSK + канон. логины, безопасный typeExpr) ---------- */
