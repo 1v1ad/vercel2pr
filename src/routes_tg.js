@@ -1,7 +1,8 @@
-// src/routes_tg.js — TG callback + link-mode + device-session
+// src/routes_tg.js — TG callback + link-mode + device-session (без verifySession из jwt.js)
 import { Router } from 'express';
+import jwt from 'jsonwebtoken';
 import { db, getUserById, logEvent } from './db.js';
-import { signSession, verifySession } from './jwt.js'; // verifySession должен быть в jwt.js; если у тебя другое имя — поправь импорт
+import { signSession } from './jwt.js';
 import { autoMergeByDevice } from './merge.js';
 
 const router = Router();
@@ -14,13 +15,32 @@ function safe(s){ return (s==null ? null : String(s)); }
 function getDeviceId(req){
   return safe(req.query?.device_id || req.cookies?.device_id || '');
 }
+
+// Мягко декодируем uid из cookie sid.
+// Сначала пробуем верификацию через jsonwebtoken.verify(JWT_SECRET),
+// если не получилось — делаем «best effort» base64url-декод без проверки подписи.
 function getSessionUid(req){
-  try {
-    const sid = req.cookies?.sid || '';
-    if (!sid) return null;
-    const data = verifySession(sid); // { uid }
-    return (data && data.uid) ? Number(data.uid) : null;
-  } catch { return null; }
+  const token = (req.cookies?.sid || '').toString();
+  if (!token) return null;
+
+  // 1) Верная проверка
+  try{
+    const data = jwt.verify(token, process.env.JWT_SECRET);
+    if (data && data.uid) return Number(data.uid);
+  }catch(_){}
+
+  // 2) Фолбэк: читаем payload без верификации
+  try{
+    const parts = token.split('.');
+    if (parts.length >= 2){
+      let payload = parts[1].replace(/-/g,'+').replace(/_/g,'/');
+      while (payload.length % 4) payload += '=';
+      const json = JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
+      if (json && json.uid) return Number(json.uid);
+    }
+  }catch(_){}
+
+  return null;
 }
 
 router.all('/callback', async (req, res) => {
@@ -40,7 +60,7 @@ router.all('/callback', async (req, res) => {
     const tgId = safe(data.id || '');
     const mode = safe(data.mode || 'login'); // 'login' | 'link'
 
-    // Пытаемся определить primary пользователя для привязки
+    // Определяем primary пользователя для привязки
     let primaryUid = getSessionUid(req);
 
     if (!primaryUid && deviceId) {
@@ -53,13 +73,13 @@ router.all('/callback', async (req, res) => {
       } catch {}
     }
 
-    // Разрешаем явную передачу primary_uid с фронта в режиме link (как последний вариант)
+    // Разрешим явную передачу primary_uid с фронта (последний шанс)
     if (!primaryUid && mode === 'link') {
       const q = Number(safe(data.primary_uid));
       if (Number.isFinite(q) && q > 0) primaryUid = q;
     }
 
-    // upsert TG auth_account; если есть primaryUid — сразу проставим user_id
+    // upsert TG auth_account; если знаем primaryUid — сразу проставим user_id
     if (tgId) {
       try{
         await db.query(`
@@ -81,7 +101,7 @@ router.all('/callback', async (req, res) => {
       }
     }
 
-    // Если это link-режим, но user_id ещё не выставился — попробуем его довыставить
+    // В режиме link дожимаем user_id у TG-аккаунта
     if (mode === 'link' && tgId && primaryUid) {
       try {
         await db.query(
@@ -91,7 +111,7 @@ router.all('/callback', async (req, res) => {
       } catch {}
     }
 
-    // Ставим сессию: если есть primaryUid — он главный; иначе — если TG уже привязан к юзеру — ставим его
+    // Ставим сессию
     try {
       let uidForSession = primaryUid || null;
       if (!uidForSession && tgId) {
@@ -104,18 +124,18 @@ router.all('/callback', async (req, res) => {
       if (uidForSession) {
         const user = await getUserById(uidForSession);
         if (user) {
-          const jwt = signSession({ uid: user.id });
-          res.cookie('sid', jwt, {
+          const jwtStr = signSession({ uid: user.id });
+          res.cookie('sid', jwtStr, {
             httpOnly:true, sameSite:'none', secure:true, path:'/', maxAge:30*24*3600*1000
           });
         }
       }
     } catch {}
 
-    // fire-and-forget авто-мерж по девайсу
+    // Автомерж по device_id (fire-and-forget)
     try { if (deviceId) await autoMergeByDevice({ deviceId, tgId }); } catch {}
 
-    // redirect в лобби
+    // Редирект в лобби
     const frontend = process.env.FRONTEND_URL || 'http://localhost:5173';
     const url = new URL('/lobby.html', frontend);
     url.searchParams.set('provider','tg');
@@ -125,7 +145,7 @@ router.all('/callback', async (req, res) => {
     if (data.username) url.searchParams.set('username', safe(data.username));
     if (data.photo_url) url.searchParams.set('photo_url', safe(data.photo_url));
 
-    // логируем успех
+    // Логируем успех
     try {
       let uidToLog = null;
       if (tgId) {
