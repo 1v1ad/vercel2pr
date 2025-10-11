@@ -1,135 +1,102 @@
 import express from 'express';
 import { randomBytes } from 'crypto';
-
 import { db } from './db.js';
 
 const router = express.Router();
 
-const generateToken = () => randomBytes(24).toString('hex') + Date.now().toString(36);
+// local helper: parse JWT-ish cookie "sid" -> { uid }
+function decodeSidCookie(req) {
+  try {
+    const token = req.cookies?.sid;
+    if (!token) return null;
+    const parts = token.split('.');
+    if (parts.length < 2) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    const uid = Number(payload?.uid || 0);
+    return Number.isFinite(uid) && uid > 0 ? uid : null;
+  } catch { return null; }
+}
 
+async function ensureLinkTable() {
+  await db.query(`
+    create table if not exists link_tokens (
+      token text primary key,
+      user_id bigint not null,
+      target text not null,            -- 'vk' | 'tg'
+      return_url text,
+      created_at timestamptz default now(),
+      expires_at timestamptz not null,
+      done boolean default false
+    );
+    create index if not exists link_tokens_expires_idx on link_tokens(expires_at);
+  `);
+}
+
+function genToken(){ return randomBytes(24).toString('hex') + Date.now().toString(36); }
+
+// Back-compat: POST /start returns a URL to open
 router.post('/start', async (req, res) => {
   try {
-    const uid = Number(req.get('X-User-Id') || req.body?.user_id || 0);
+    const uid = Number(req.get('X-User-Id') || req.body?.user_id || decodeSidCookie(req) || 0);
     const target = String(req.body?.target || '').trim();
-    if (!uid || !['vk', 'tg'].includes(target)) {
-      return res.status(400).json({ ok: false, error: 'bad_args' });
-    }
+    const returnUrl = String(req.body?.return || req.query?.return || '');
+    if (!uid || !['vk','tg'].includes(target)) return res.status(400).json({ ok:false, error:'bad_args' });
 
-    const token = generateToken();
-    const params = [token, uid, target];
-    const insertSql = `
-      insert into link_tokens(token, user_id, target, created_at, expires_at)
-      values ($1, $2, $3, now(), now() + interval '15 minutes')
-    `;
-    try {
-      await db.query(insertSql, params);
-    } catch (err) {
-      await db.query(`
-        create table if not exists link_tokens (
-          token text primary key,
-          user_id bigint not null,
-          target text not null,
-          created_at timestamp without time zone not null,
-          expires_at timestamp without time zone not null,
-          done boolean default false
-        )
-      `);
-      await db.query(insertSql, params);
-    }
-
-    const url = `/link/confirm?token=${encodeURIComponent(token)}`;
-    res.json({ ok: true, token, url, ttl_minutes: 15 });
-  } catch (e) {
-    console.error('link start error', e);
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    await ensureLinkTable();
+    const ttlMinutes = 15;
+    const token = genToken();
+    const expires = new Date(Date.now() + ttlMinutes*60*1000);
+    await db.query(
+      `insert into link_tokens(token,user_id,target,return_url,expires_at) values($1,$2,$3,$4,$5)`,
+      [token, uid, target, returnUrl || null, expires]
+    );
+    const url = `/api/profile/link/start?target=${encodeURIComponent(target)}&state=${encodeURIComponent(token)}${ returnUrl ? `&return=${encodeURIComponent(returnUrl)}` : '' }`;
+    res.json({ ok:true, url, token, ttl_minutes: ttlMinutes });
+  } catch(e){
+    console.error('link start(post) error', e);
+    res.status(500).json({ ok:false, error:String(e?.message || e) });
   }
 });
 
-router.get('/status', async (req, res) => {
+// Primary: GET /start -> 302 to /api/auth/{vk|tg}/start?mode=link&state=token
+router.get('/start', async (req, res) => {
   try {
-    const token = String(req.query.token || '');
-    if (!token) return res.status(400).json({ ok: false, error: 'bad_args' });
+    const uid = Number(req.get('X-User-Id') || req.query?.user_id || decodeSidCookie(req) || 0);
+    const target = (req.query?.target || (req.query?.vk ? 'vk' : (req.query?.tg ? 'tg' : ''))).toString();
+    const returnUrl = String(req.query?.return || '');
+    if (!uid || !['vk','tg'].includes(target)) return res.status(400).send('bad_args');
 
-    const result = await db.query(
-      'select done, now() > expires_at as expired from link_tokens where token = $1',
-      [token]
+    await ensureLinkTable();
+    const ttlMinutes = 15;
+    const token = String(req.query?.state || '') || genToken();
+    const expires = new Date(Date.now() + ttlMinutes*60*1000);
+
+    // upsert token row (fresh token each time)
+    await db.query(
+      `insert into link_tokens(token,user_id,target,return_url,expires_at)
+       values($1,$2,$3,$4,$5)
+       on conflict (token) do update set user_id=excluded.user_id, target=excluded.target, return_url=excluded.return_url, expires_at=excluded.expires_at, done=false`,
+      [token, uid, target, returnUrl || null, expires]
     );
-    if (!result.rows?.length) return res.json({ ok: false, error: 'not_found' });
 
-    const row = result.rows[0];
-    res.json({ ok: true, done: !!row.done, expired: !!row.expired });
-  } catch (e) {
-    console.error('link status error', e);
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    const location = `/api/auth/${target}/start?mode=link&state=${encodeURIComponent(token)}${ returnUrl ? `&return=${encodeURIComponent(returnUrl)}` : '' }`;
+    res.redirect(302, location);
+  } catch(e){
+    console.error('link start(get) error', e);
+    res.status(500).send('server_error');
   }
 });
 
-router.post('/finish', async (req, res) => {
+// Check status (optional for polling UIs)
+router.get('/status', async (req,res) => {
   try {
-    const token = String(req.body?.token || '').trim();
-    const providerUserId = String(req.body?.provider_user_id || '').trim();
-    if (!token || !providerUserId) {
-      return res.status(400).json({ ok: false, error: 'bad_args' });
-    }
-
-    const tokenResult = await db.query(
-      'select user_id, target, expires_at, done from link_tokens where token = $1',
-      [token]
-    );
-    if (!tokenResult.rows?.length) return res.status(404).json({ ok: false, error: 'not_found' });
-
-    const tokenRow = tokenResult.rows[0];
-    if (tokenRow.done || new Date(tokenRow.expires_at) < new Date()) {
-      return res.json({ ok: false, error: 'expired' });
-    }
-
-    const ownerHumResult = await db.query(
-      'select coalesce(hum_id, id) as hum_id from users where id = $1',
-      [tokenRow.user_id]
-    );
-    const ownerHum = ownerHumResult.rows?.[0]?.hum_id || tokenRow.user_id;
-
-    const linkedUserResult = await db.query(
-      'select id, coalesce(hum_id, id) as hum_id from users where vk_id = $1',
-      [providerUserId]
-    );
-    if (!linkedUserResult.rows?.length) {
-      return res.json({ ok: false, error: 'provider_user_not_found' });
-    }
-
-    const linkedId = linkedUserResult.rows[0].id;
-
-    await db.query(
-      `update users
-         set hum_id = $1,
-             merged_via_proof = true
-       where coalesce(hum_id, id) = (
-         select coalesce(hum_id, id) from users where id = $2
-       )`,
-      [ownerHum, linkedId]
-    );
-
-    await db.query(
-      'update users set merged_via_proof = true where coalesce(hum_id, id) = $1',
-      [ownerHum]
-    );
-
-    await db.query('update link_tokens set done = true where token = $1', [token]);
-
-    await db.query(
-      `insert into events (user_id, hum_id, event_type, created_at, meta)
-       values ($1, $2, 'hum_merge_proof', now(), $3::jsonb)`,
-      [
-        tokenRow.user_id,
-        ownerHum,
-        JSON.stringify({ provider_user_id: providerUserId, token, target: tokenRow.target }),
-      ]
-    );
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('link finish error', e);
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    const token = String(req.query?.token || '');
+    if (!token) return res.status(400).json({ ok:false, error:'bad_args' });
+    const r = await db.query(`select done, now()>expires_at as expired from link_tokens where token=$1`, [token]);
+    if (!r.rows?.length) return res.json({ ok:false, error:'not_found' });
+    res.json({ ok:true, done: !!r.rows[0].done, expired: !!r.rows[0].expired });
+  } catch(e){
+    res.status(500).json({ ok:false, error:String(e?.message || e) });
   }
 });
 
