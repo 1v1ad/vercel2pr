@@ -1,6 +1,4 @@
-// src/routes_auth.js
-// VK-авторизация + режим привязки (proof-link)
-
+// src/routes_auth.js — VK-авторизация + proof-link по HUM (без перевешивания уже привязанного VK)
 import express from 'express';
 import axios from 'axios';
 import crypto from 'crypto';
@@ -172,13 +170,11 @@ async function vkCallbackHandler(req, res) {
 
     const vk_id = String(tokenData?.user_id || tokenData?.user?.id || 'unknown');
 
-    // ===== PROOF LINK MODE ===================================================
+    // ===== PROOF LINK MODE (HUM, без перевешивания существующего VK) =====
     try {
-      // 1) пытаемся прочитать cookie link_state
+      // 1) читаем cookie link_state или запись из link_tokens
       let link = readLinkStateCookie(req);
       let linkTokenRow = null;
-
-      // 2) если cookie нет — читаем link_tokens по state
       if ((!link || link.target !== 'vk') && req.query?.state) {
         linkTokenRow = await readLinkTokenFromDB(String(req.query.state), 'vk');
         if (linkTokenRow) {
@@ -187,7 +183,7 @@ async function vkCallbackHandler(req, res) {
       }
 
       if (link && link.target === 'vk') {
-        // userId берём либо из sid, либо из link_tokens
+        // master (кому всё привязываем) — из sid или link_tokens
         let humId = decodeUidFromSid(req);
         if (!humId && linkTokenRow) humId = Number(linkTokenRow.user_id) || null;
         if (!humId) {
@@ -197,26 +193,62 @@ async function vkCallbackHandler(req, res) {
           return res.redirect((link.return || `${frontendUrl}/lobby.html`) + '?link=error');
         }
 
-        // конфликт?
-        const chk = await db.query(
-          "select user_id from auth_accounts where provider='vk' and provider_user_id=$1 and user_id is not null limit 1",
-          [vk_id]
-        );
-        if (chk.rows?.length && Number(chk.rows[0].user_id) !== Number(humId)) {
-          await logEvent({ user_id:humId, event_type:'link_conflict',
-            payload:{ provider:'vk', pid: vk_id, other: chk.rows[0].user_id }, ip:firstIp(req), ua:userAgent(req) });
-          res.clearCookie('link_state', { path:'/' });
-          return res.redirect((link.return || `${frontendUrl}/lobby.html`) + '?link=conflict');
-        }
+        // актёр: к кому уже привязан этот VK
+        let actorUid = null;
+        try {
+          const r = await db.query("select user_id from auth_accounts where provider='vk' and provider_user_id=$1 limit 1", [vk_id]);
+          if (r.rows.length && r.rows[0].user_id) actorUid = Number(r.rows[0].user_id);
+        } catch {}
 
-        // апсерт привязки
-        await db.query(
-          `insert into auth_accounts (user_id, provider, provider_user_id, meta)
-           values ($1,'vk',$2, jsonb_build_object('linked_at',now(),'ip',$3,'ua',$4))
-           on conflict (provider, provider_user_id)
-           do update set user_id=excluded.user_id, meta = coalesce(auth_accounts.meta,'{}') || jsonb_build_object('linked_at',now(),'ip',$3,'ua',$4), updated_at=now()`,
-          [humId, vk_id, firstIp(req), userAgent(req)]
-        );
+        // masterHum
+        let masterHum = humId;
+        try {
+          const r = await db.query("select coalesce(hum_id,id) as hum_id from users where id=$1", [humId]);
+          if (r.rows.length) masterHum = Number(r.rows[0].hum_id);
+        } catch {}
+
+        if (actorUid) {
+          // VK уже чей-то — склеиваем того пользователя в HUM masterHum
+          if (actorUid !== masterHum) {
+            try {
+              await db.query("update users set hum_id=$1 where id=$2 and (hum_id is null or hum_id<>$1)", [masterHum, actorUid]);
+            } catch(e){ console.warn('vk link: set hum_id failed', e?.message); }
+
+            try {
+              await logEvent({
+                user_id: humId,
+                event_type: 'merge_proof',
+                payload: { provider:'vk', vk_id, from_user_id: actorUid, to_hum_id: masterHum, method:'proof' },
+                ip:firstIp(req), ua:userAgent(req)
+              });
+            } catch {}
+          }
+
+          // мета и отметка о линке (user_id не трогаем!)
+          try {
+            await db.query(
+              `update auth_accounts
+                  set meta = jsonb_strip_nulls(coalesce(meta,'{}') || jsonb_build_object('linked_at',now(),'ip',$2,'ua',$3)),
+                      updated_at = now()
+                where provider='vk' and provider_user_id=$1`,
+              [vk_id, firstIp(req), userAgent(req)]
+            );
+          } catch {}
+        } else {
+          // VK ещё ни к кому не привязан — первая привязка к master (это ок)
+          try {
+            await db.query(
+              `insert into auth_accounts (user_id, provider, provider_user_id, meta)
+               values ($1,'vk',$2, jsonb_build_object('linked_at',now(),'ip',$3,'ua',$4))
+               on conflict (provider, provider_user_id)
+               do update set
+                 user_id = coalesce(auth_accounts.user_id, excluded.user_id),
+                 meta    = jsonb_strip_nulls(coalesce(auth_accounts.meta,'{}') || excluded.meta),
+                 updated_at=now()`,
+              [humId, vk_id, firstIp(req), userAgent(req)]
+            );
+          } catch(e){ console.warn('vk link: initial bind failed', e?.message); }
+        }
 
         await logEvent({ user_id:humId, event_type:'link_success',
           payload:{ provider:'vk', pid: vk_id }, ip:firstIp(req), ua:userAgent(req) });
@@ -230,9 +262,9 @@ async function vkCallbackHandler(req, res) {
       try {
         await logEvent({ event_type:'link_error', payload:{ provider:'vk', error:String(e?.message||e) }, ip:firstIp(req), ua:userAgent(req) });
       } catch {}
-      // пойдём дальше как обычный логин
+      // дальше идём как обычный логин
     }
-    // ===== /PROOF LINK MODE ==================================================
+    // ===== /PROOF LINK MODE =====
 
     // обычный логин
     const user = await upsertUser({ vk_id, first_name, last_name, avatar });
