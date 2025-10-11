@@ -94,50 +94,58 @@ router.get('/users', async (req,res)=>{
 
 /* ---------- TOPUP (пополнение конкретного user_id) ---------- */
 // POST /api/admin/users/:id/topup   body: { amount: number, comment: string }
+/**
+ * FEAT: admin_topup
+ * WHY:  ручное изменение баланса HUM-группы; лог через logEvent(payload)
+ * DATE: 2025-10-11
+ */
 router.post('/users/:id/topup', async (req, res) => {
   try {
-    const pwd = (req.get('X-Admin-Password') || req.query.admin_password || '').trim();
-    if (!pwd || pwd !== (process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD)) {
+    const adminPwd = (req.get('X-Admin-Password') || req.query.admin_password || '').trim();
+    if (!adminPwd || adminPwd !== (process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD)) {
       return res.status(401).json({ ok:false, error:'unauthorized' });
     }
 
-    const user_id = parseInt(req.params.id, 10) || 0;
-    const amount  = Math.trunc(Number(req.body.amount ?? req.body.value ?? req.body.sum ?? req.body.delta) || 0);
+    const userId = Number(req.params.id || 0);
+    const amount = Math.trunc(Number(req.body.amount ?? req.body.value ?? req.body.sum ?? req.body.delta) || 0);
     const comment = String(req.body.comment ?? req.body.note ?? req.body.reason ?? req.body.description ?? '').trim();
 
-    if (!user_id) return res.status(400).json({ ok:false, error:'user_required' });
+    if (!userId) return res.status(400).json({ ok:false, error:'user_required' });
     if (!amount)  return res.status(400).json({ ok:false, error:'amount_required' });
     if (!comment) return res.status(400).json({ ok:false, error:'comment_required' });
 
-    const u = await db.query(
-      'select id, coalesce(hum_id, id) hum_id from users where id=$1 limit 1',
-      [user_id]
-    );
-    if (!u.rows?.length) return res.status(404).json({ ok:false, error:'user_not_found' });
-    const hum_id = Number(u.rows[0].hum_id);
+    // найдём HUM-группу
+    const ru = await db.query('select id, coalesce(hum_id, id) hum_id from users where id = $1 limit 1', [userId]);
+    if (!ru.rows?.length) return res.status(404).json({ ok:false, error:'user_not_found' });
+    const humId = Number(ru.rows[0].hum_id);
 
-    // меняем баланс всей HUM-группы
-    await db.query(
-      'update users set balance = coalesce(balance,0) + $2 where coalesce(hum_id,id)=$1',
-      [hum_id, amount]
-    );
+    // изменяем баланс всей HUM-группы (положительный или отрицательный delta)
+    await db.query('update users set balance = coalesce(balance,0) + $2 where coalesce(hum_id,id) = $1', [humId, amount]);
 
-    await db.query(
-      `insert into events (user_id, hum_id, event_type, amount, meta, ip, ua, created_at)
-       values ($1,$2,'admin_topup',$3, jsonb_build_object('comment',$4), $5, $6, now() at time zone 'utc')`,
-      [user_id, hum_id, amount, comment, (req.headers['x-forwarded-for']||req.ip||'').toString().split(',')[0].trim(), (req.headers['user-agent']||'').slice(0,256)]
-    );
+    // логируя через существующую функцию (таблица events без лишних колонок)
+    const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
+    const ip = ipHeader.split(',')[0].trim();
+    const ua = (req.headers['user-agent'] || '').slice(0,256);
 
-    const sum = await db.query(
-      'select sum(coalesce(balance,0))::bigint as total from users where coalesce(hum_id,id)=$1',
-      [hum_id]
+    await logEvent({
+      user_id: userId,
+      event_type: 'admin_topup',
+      payload: { user_id: userId, hum_id: humId, amount, comment },
+      ip, ua, country_code: null
+    });
+
+    // отдадим свежую сумму HUM-группы
+    const total = await db.query(
+      'select sum(coalesce(balance,0))::bigint as hum_balance from users where coalesce(hum_id,id) = $1',
+      [humId]
     );
-    res.json({ ok:true, hum_id, new_balance: Number(sum.rows[0].total) });
+    res.json({ ok:true, hum_id: humId, new_balance: Number(total.rows?.[0]?.hum_balance || 0) });
   } catch (e) {
     console.error('admin topup error', e);
     res.status(500).json({ ok:false, error:'server_error' });
   }
 });
+
 
 // /api/admin/events — теперь с amount и comment
 router.get('/events', async (req,res)=>{
