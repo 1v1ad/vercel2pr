@@ -96,60 +96,46 @@ router.get('/users', async (req,res)=>{
 // POST /api/admin/users/:id/topup   body: { amount: number, comment: string }
 router.post('/users/:id/topup', async (req, res) => {
   try {
-    const userId = Number(req.params.id || 0);
-    const rawAmount = Number(req.body?.amount);
-    const amount = Number.isFinite(rawAmount) ? Math.trunc(rawAmount) : NaN;
-    const comment = String(req.body?.comment || '').trim();
-
-    if (!userId || !Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({ ok: false, error: 'bad_args' });
+    const pwd = (req.get('X-Admin-Password') || req.query.admin_password || '').trim();
+    if (!pwd || pwd !== (process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD)) {
+      return res.status(401).json({ ok:false, error:'unauthorized' });
     }
 
-    const normalized = comment.toLowerCase();
-    const banned = ['111', '222', '123', 'test', 'тест'];
-    if (
-      comment.length < 3 ||
-      banned.includes(normalized) ||
-      /^\d+$/.test(comment)
-    ) {
-      return res.status(400).json({ ok: false, error: 'comment_required' });
-    }
+    const user_id = parseInt(req.params.id, 10) || 0;
+    const amount  = Math.trunc(Number(req.body.amount ?? req.body.value ?? req.body.sum ?? req.body.delta) || 0);
+    const comment = String(req.body.comment ?? req.body.note ?? req.body.reason ?? req.body.description ?? '').trim();
 
-    const updateResult = await db.query(
-      'update users set balance = coalesce(balance, 0) + $1 where id = $2 returning balance',
-      [amount, userId]
+    if (!user_id) return res.status(400).json({ ok:false, error:'user_required' });
+    if (!amount)  return res.status(400).json({ ok:false, error:'amount_required' });
+    if (!comment) return res.status(400).json({ ok:false, error:'comment_required' });
+
+    const u = await db.query(
+      'select id, coalesce(hum_id, id) hum_id from users where id=$1 limit 1',
+      [user_id]
     );
-    if (!(updateResult.rowCount || 0)) {
-      return res.status(404).json({ ok: false, error: 'user_not_found' });
-    }
-    const newBalance = Number(updateResult.rows?.[0]?.balance ?? 0);
+    if (!u.rows?.length) return res.status(404).json({ ok:false, error:'user_not_found' });
+    const hum_id = Number(u.rows[0].hum_id);
 
-    const humResult = await db.query(
-      'select coalesce(hum_id, id) as hum_id from users where id = $1',
-      [userId]
+    // меняем баланс всей HUM-группы
+    await db.query(
+      'update users set balance = coalesce(balance,0) + $2 where coalesce(hum_id,id)=$1',
+      [hum_id, amount]
     );
-    const humId = humResult.rows?.[0]?.hum_id || userId;
-
-    const meta = { comment };
-    const adminId = req.get('X-Admin-Id') || req.body?.admin_id || req.query?.admin_id;
-    if (adminId) meta.admin_id = adminId;
 
     await db.query(
-      `insert into events (user_id, hum_id, event_type, ip, ua, created_at, amount, meta)
-       values ($1, $2, 'admin_topup', $3, $4, now(), $5, $6::jsonb)`,
-      [
-        userId,
-        humId,
-        req.ip || null,
-        req.get('user-agent') || null,
-        amount,
-        JSON.stringify(meta),
-      ]
+      `insert into events (user_id, hum_id, event_type, amount, meta, ip, ua, created_at)
+       values ($1,$2,'admin_topup',$3, jsonb_build_object('comment',$4), $5, $6, now() at time zone 'utc')`,
+      [user_id, hum_id, amount, comment, (req.headers['x-forwarded-for']||req.ip||'').toString().split(',')[0].trim(), (req.headers['user-agent']||'').slice(0,256)]
     );
 
-    return res.json({ ok: true, hum_id: humId, new_balance: newBalance });
+    const sum = await db.query(
+      'select sum(coalesce(balance,0))::bigint as total from users where coalesce(hum_id,id)=$1',
+      [hum_id]
+    );
+    res.json({ ok:true, hum_id, new_balance: Number(sum.rows[0].total) });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    console.error('admin topup error', e);
+    res.status(500).json({ ok:false, error:'server_error' });
   }
 });
 
@@ -224,7 +210,6 @@ router.get('/events', async (req,res)=>{
     res.json({ ok:true, events:rows, rows });
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
-
 
 
 /* ---------- SUMMARY (MSK + канон. логины, безопасный typeExpr) ---------- */
