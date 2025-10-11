@@ -153,7 +153,7 @@ router.post('/users/:id/topup', async (req, res) => {
   }
 });
 
-/* ---------- EVENTS (устойчиво к разной схеме) ---------- */
+// /api/admin/events — теперь с amount и comment
 router.get('/events', async (req,res)=>{
   try{
     const cols = await getCols('events');
@@ -179,6 +179,10 @@ router.get('/events', async (req,res)=>{
                   : has('ts')         ? 'e.ts'
                   : has('time')       ? 'e.time'
                   : 'now()';
+    const amountCol = has('amount') ? 'e.amount' : 'NULL::bigint';
+    const commentCol = has('meta') ? "(coalesce(e.meta->>'comment', e.meta->>'note', e.meta->>'reason'))"
+                     : has('payload') ? "(coalesce(e.payload->>'comment', e.payload->>'note', e.payload->>'reason'))"
+                     : "NULL";
 
     const p=[]; const cond=[];
     const et = (req.query.type || req.query.event_type || '').toString().trim();
@@ -200,7 +204,9 @@ router.get('/events', async (req,res)=>{
         ${typeExpr} as event_type,
         ${ipCol}   as ip,
         ${uaCol}   as ua,
-        ${tsCol}   as created_at
+        ${tsCol}   as created_at,
+        ${amountCol} as amount,
+        ${commentCol} as comment
       from events e
       ${joinUsers ? `left join users u on u.id = ${uidCol}` : ''}
       ${where}
@@ -211,11 +217,14 @@ router.get('/events', async (req,res)=>{
     const rows=(r.rows||[]).map(e=>({
       id:e.event_id, HUMid:e.hum_id, user_id:e.user_id,
       event_type:e.event_type, type:e.event_type,
-      ip:e.ip, ua:e.ua, created_at:e.created_at
+      ip:e.ip, ua:e.ua, created_at:e.created_at,
+      amount: e.amount!=null ? Number(e.amount) : null,
+      comment: e.comment || null
     }));
     res.json({ ok:true, events:rows, rows });
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
+
 
 /* ---------- SUMMARY (MSK + канон. логины, безопасный typeExpr) ---------- */
 router.get('/summary', async (req,res)=>{
