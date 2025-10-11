@@ -1,316 +1,170 @@
 // src/routes_admin.js
-// GGRoom — admin API router (rollback+fix)
-// Совместим со старым фронтом: /daily, /summary, /users, /events, /users/:id/topup, /topup.
-// Правила: пароль в X-Admin-Password ИЛИ ?admin_password=…
-// История нормализует amount/comment из плоских полей ИЛИ из payload JSON.
-
 import express from 'express';
-import { db } from './db.js';
+import { db, logEvent } from './db.js';
 
 const router = express.Router();
 
-// ------------------------ helpers ------------------------
+// ---- helpers ---------------------------------------------------------------
 
-function getAdminPwd(req) {
+function getAdminPassword(req) {
   return (req.get('X-Admin-Password') || req.query.admin_password || '').trim();
 }
-function assertAdmin(req, res) {
-  const ok = getAdminPwd(req) && process.env.ADMIN_PASSWORD
-    && getAdminPwd(req) === process.env.ADMIN_PASSWORD;
-  if (!ok) {
-    res.status(401).json({ ok: false, error: 'unauthorized' });
-    return false;
+
+function requireAdmin(req, res, next) {
+  const incoming = getAdminPassword(req);
+  const expected = String(process.env.ADMIN_PASSWORD || '').trim();
+  if (!expected) {
+    // Если пароль в ENV не задан, считаем любой непустой валидным — для девопса
+    if (!incoming) return res.status(401).json({ ok: false, error: 'unauthorized' });
+    return next();
   }
-  return true;
+  if (incoming !== expected) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  return next();
 }
-function num(v, d = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : d;
-}
-function pickAmount(obj, d = 0) {
-  // Порядок приоритета: плоское поле -> payload.amount -> payload.sum/value/delta
-  const p = obj?.payload || {};
-  return num(
-    obj?.amount ??
-    p?.amount ??
-    p?.sum ??
-    p?.value ??
-    p?.delta, d
+
+async function getHumId(userId) {
+  const r = await db.query(
+    `select coalesce(hum_id, id) as hum_id from users where id = $1`,
+    [userId]
   );
-}
-function pickComment(obj) {
-  const p = obj?.payload || {};
-  const c = obj?.comment ?? p?.comment ?? p?.note ?? p?.reason ?? p?.description ?? '';
-  return (c ?? '').toString();
-}
-function pickHumIdRow(row) {
-  return num(row?.hum_id ?? row?.HUMid ?? row?.humId ?? row?.hum ?? row?.id ?? 0);
+  return r.rows?.[0]?.hum_id ?? null;
 }
 
-// ------------------------ USERS --------------------------
+async function calcHumBalance(humId) {
+  const r = await db.query(
+    `select coalesce(sum(coalesce(balance,0)),0)::bigint as hum_balance
+     from users
+     where coalesce(hum_id,id) = $1`,
+    [humId]
+  );
+  return Number(r.rows?.[0]?.hum_balance ?? 0);
+}
 
-// GET /api/admin/users?take=25&skip=0&search=...
-router.get('/users', async (req, res) => {
-  if (!assertAdmin(req, res)) return;
-  try {
-    const take = Math.max(1, Math.min(200, num(req.query.take, 25)));
-    const skip = Math.max(0, num(req.query.skip, 0));
-    const search = (req.query.search || '').trim();
+// ---- routes ----------------------------------------------------------------
 
-    // Простая выдача, без тяжёлых JOIN'ов.
-    const params = [];
-    let where = '1=1';
-    if (search) {
-      params.push(`%${search}%`);
-      where = `(CAST(u.id AS TEXT) ILIKE $${params.length} OR CAST(u.vk_id AS TEXT) ILIKE $${params.length} OR COALESCE(u.first_name,\'\') || \' \' || COALESCE(u.last_name,\'\') ILIKE $${params.length})`;
-    }
-
-    params.push(take, skip);
-    const q = `
-      SELECT
-        u.id,
-        COALESCE(u.hum_id, u.id) AS hum_id,
-        u.vk_id,
-        u.first_name,
-        u.last_name,
-        u.avatar,
-        COALESCE(u.balance, 0)::bigint AS balance,
-        COALESCE(u.country_code, '') AS country_code,
-        u.created_at
-      FROM users u
-      WHERE ${where}
-      ORDER BY u.id
-      LIMIT $${params.length-1} OFFSET $${params.length}
-    `;
-    const r = await db.query(q, params);
-    res.json({ ok: true, users: r.rows || [] });
-  } catch (e) {
-    console.error('admin/users error', e);
-    res.status(500).json({ ok: false, error: 'server_error' });
-  }
-});
-
-// ------------------------ DAILY (для графика) ------------
-
-// GET /api/admin/daily?days=7&tz=Europe/Moscow
-router.get('/daily', async (req, res) => {
-  if (!assertAdmin(req, res)) return;
-  try {
-    const days = Math.max(1, Math.min(31, num(req.query.days, 7)));
-    // считаем по событиям авторизации: auth_success / login / auth
-    const q = `
-      WITH src AS (
-        SELECT
-          (created_at AT TIME ZONE 'UTC')::date AS d_utc,
-          COALESCE(hum_id, user_id, 0) AS hum
-        FROM events
-        WHERE event_type IN ('auth_success','login','auth')
-          AND created_at >= NOW() AT TIME ZONE 'UTC' - INTERVAL '${days-1} day'
-      ),
-      agg AS (
-        SELECT d_utc AS date_utc,
-               COUNT(*)::int AS auth_total,
-               COUNT(DISTINCT hum)::int AS auth_unique
-        FROM src
-        GROUP BY d_utc
-      )
-      SELECT
-        to_char(date_utc, 'YYYY-MM-DD') AS date,
-        auth_total,
-        auth_unique
-      FROM agg
-      ORDER BY date_utc;
-    `;
-    const r = await db.query(q);
-    const daysArr = (r.rows || []).map(x => ({
-      date: x.date, auth_total: num(x.auth_total, 0), auth_unique: num(x.auth_unique, 0),
-    }));
-    res.json({ ok: true, days: daysArr, daily: daysArr });
-  } catch (e) {
-    console.error('admin/daily error', e);
-    res.status(500).json({ ok: false, error: 'server_error' });
-  }
-});
-
-// ------------------------ SUMMARY (карточки) --------------
-
-// GET /api/admin/summary?tz=Europe/Moscow
-router.get('/summary', async (req, res) => {
-  if (!assertAdmin(req, res)) return;
-  try {
-    const r1 = await db.query(`SELECT COUNT(*)::int AS users FROM users`);
-    const r2 = await db.query(`
-      SELECT COUNT(*)::int AS auths7
-      FROM events
-      WHERE event_type IN ('auth_success','login','auth')
-        AND created_at >= NOW() AT TIME ZONE 'UTC' - INTERVAL '7 day'
-    `);
-    res.json({
-      ok: true,
-      users_total: num(r1.rows?.[0]?.users, 0),
-      auths_7d: num(r2.rows?.[0]?.auths7, 0),
-    });
-  } catch (e) {
-    console.error('admin/summary error', e);
-    res.status(500).json({ ok: false, error: 'server_error' });
-  }
-});
-
-// ------------------------ EVENTS (история) ----------------
-
+// Список событий админки
 // GET /api/admin/events?type=admin_topup&take=100&skip=0
-router.get('/events', async (req, res) => {
-  if (!assertAdmin(req, res)) return;
+router.get('/events', requireAdmin, async (req, res) => {
   try {
-    const take = Math.max(1, Math.min(200, num(req.query.take, 50)));
-    const skip = Math.max(0, num(req.query.skip, 0));
-    const type = (req.query.type || req.query.search || '').trim();
+    const type = String(req.query.type || req.query.event_type || '').trim();
+    const search = String(req.query.search || '').trim();
+    const take = Math.min(Math.max(parseInt(String(req.query.take || 50), 10) || 50, 1), 200);
+    const skip = Math.max(parseInt(String(req.query.skip || 0), 10) || 0, 0);
 
-    const params = [take, skip];
-    let where = '1=1';
+    const where = [];
+    const vals = [];
+
     if (type) {
-      params.push(type);
-      where = `(event_type = $3 OR (payload->>'type') = $3)`;
+      vals.push(type);
+      where.push(`event_type = $${vals.length}`);
+    }
+    if (search) {
+      vals.push(`%${search}%`);
+      where.push(`(event_type ilike $${vals.length} or coalesce(comment,'') ilike $${vals.length})`);
     }
 
-    const q = `
-      SELECT
-        e.id,
-        e.user_id,
-        COALESCE(e.hum_id, e.user_id) AS hum_id,
-        e.event_type,
-        e.ip, e.ua,
-        e.created_at,
-        e.amount,
-        e.comment,
-        e.payload
-      FROM events e
-      WHERE ${where}
-      ORDER BY e.created_at DESC
-      LIMIT $1 OFFSET $2
+    const sql = `
+      select
+        id,
+        user_id,
+        hum_id,
+        event_type,
+        created_at,
+        ip,
+        ua,
+        -- важное место: amount/comment могут быть как в колонках, так и в payload
+        coalesce(amount, nullif(payload->>'amount','')::bigint, 0)           as amount,
+        coalesce(comment, nullif(payload->>'comment',''))                    as comment
+      from events
+      ${where.length ? `where ${where.join(' and ')}` : ''}
+      order by created_at desc, id desc
+      limit ${take} offset ${skip}
     `;
-    const r = await db.query(q, params);
-    const list = (r.rows || []).map(row => ({
-      id: row.id,
-      user_id: num(row.user_id, 0),
-      hum_id: pickHumIdRow(row),
-      event_type: row.event_type,
-      ip: row.ip || null,
-      ua: row.ua || null,
-      created_at: row.created_at,
-      amount: pickAmount(row, 0),
-      comment: pickComment(row),
-    }));
-    res.json({ ok: true, events: list, rows: list, list });
+
+    const r = await db.query(sql, vals);
+    return res.json({ ok: true, events: r.rows, rows: r.rows });
   } catch (e) {
     console.error('admin/events error', e);
-    res.status(500).json({ ok: false, error: 'server_error' });
+    return res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
 
-// ------------------------ TOPUP ---------------------------
+// Ручное пополнение
+// POST /api/admin/users/:id/topup  body: { amount:number, comment?:string }
+router.post('/users/:id/topup', requireAdmin, async (req, res) => {
+  const userId = Number(req.params.id);
+  const amount = Number(req.body?.amount ?? req.body?.value ?? req.body?.sum ?? req.body?.delta);
+  const comment = String(
+    req.body?.comment ?? req.body?.note ?? req.body?.reason ?? req.body?.description ?? ''
+  ).slice(0, 500);
 
-async function applyTopup({ userId, amount, comment, ip, ua }) {
-  // Топап по HUM-группе
+  if (!Number.isFinite(userId) || userId <= 0) {
+    return res.status(400).json({ ok: false, error: 'bad_user_id' });
+  }
+  if (!Number.isFinite(amount) || amount === 0) {
+    return res.status(400).json({ ok: false, error: 'bad_amount' });
+  }
+
   const client = await db.connect();
   try {
     await client.query('BEGIN');
-    const r0 = await client.query(`SELECT id, COALESCE(hum_id, id) AS hum_id FROM users WHERE id = $1 LIMIT 1`, [userId]);
-    if (!r0.rows?.length) {
-      await client.query('ROLLBACK');
-      return { ok: false, code: 404, error: 'user_not_found' };
-    }
-    const humId = num(r0.rows[0].hum_id, userId);
 
+    // 1) Проверим, что пользователь существует и возьмём HUM
+    const humId = await (async () => {
+      const r = await client.query(
+        `select id, coalesce(hum_id,id) as hum_id from users where id = $1 for update`,
+        [userId]
+      );
+      if (!r.rows?.length) throw new Error('user_not_found');
+      return Number(r.rows[0].hum_id);
+    })();
+
+    // 2) Пополним баланс конкретного user_id (чтобы сохранялась история по аккаунту)
     await client.query(
-      `UPDATE users
-         SET balance = COALESCE(balance, 0) + $2
-       WHERE COALESCE(hum_id, id) = $1`,
-      [humId, amount]
+      `update users
+         set balance = coalesce(balance,0) + $2
+       where id = $1`,
+      [userId, amount]
     );
 
-    const r2 = await client.query(
-      `SELECT SUM(COALESCE(balance,0))::bigint AS hum_balance
-       FROM users WHERE COALESCE(hum_id, id) = $1`,
-      [humId]
-    );
-    const humBalance = num(r2.rows?.[0]?.hum_balance, 0);
-
-    // лог в events: и в плоские, и в payload
-    const payload = {
-      amount, comment, hum_id: humId, user_id: userId, type: 'admin_topup',
-    };
+    // 3) Лог события (дублируем и в колонки, и в payload для обратной совместимости)
+    const payload = { amount, comment, user_id: userId, hum_id: humId };
     await client.query(
-      `INSERT INTO events (event_type, user_id, hum_id, amount, comment, payload, ip, ua)
-       VALUES ('admin_topup', $1, $2, $3, $4, $5::jsonb, $6, $7)`,
-      [userId, humId, amount, comment || null, JSON.stringify(payload), ip || null, ua || null]
+      `insert into events (user_id, hum_id, event_type, amount, comment, payload, ip, ua)
+       values ($1, $2, 'admin_topup', $3, $4, $5, $6, $7)`,
+      [
+        userId,
+        humId,
+        amount,
+        comment || null,
+        payload,
+        (req.headers['x-forwarded-for'] || req.ip || '').toString().split(',')[0].trim() || null,
+        (req.headers['user-agent'] || '').slice(0, 256) || null
+      ]
     );
+
+    // 4) Посчитаем новый HUM-баланс
+    const newHumBalance = await (async () => {
+      const r = await client.query(
+        `select coalesce(sum(coalesce(balance,0)),0)::bigint as hum_balance
+           from users
+          where coalesce(hum_id,id) = $1`,
+        [humId]
+      );
+      return Number(r.rows?.[0]?.hum_balance ?? 0);
+    })();
 
     await client.query('COMMIT');
-    return { ok: true, hum_id: humId, new_balance: humBalance };
+    return res.json({ ok: true, hum_id: humId, new_balance: newHumBalance });
   } catch (e) {
-    await client.query('ROLLBACK');
-    console.error('applyTopup error', e);
-    return { ok: false, code: 500, error: 'server_error' };
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('admin topup error', e);
+    return res.status(500).json({ ok: false, error: 'server_error' });
   } finally {
     client.release();
   }
-}
-
-// POST /api/admin/users/:id/topup
-router.post('/users/:id/topup', async (req, res) => {
-  if (!assertAdmin(req, res)) return;
-  try {
-    const userId = num(req.params.id, 0);
-    const body = req.body || {};
-    // принимаем любые синонимы
-    const amount = num(body.amount ?? body.delta ?? body.sum ?? body.value, NaN);
-    const comment = (body.comment ?? body.note ?? body.reason ?? body.description ?? '').toString().trim();
-
-    if (!Number.isFinite(amount) || amount === 0) {
-      return res.status(400).json({ ok: false, error: 'amount_required' });
-    }
-    if (!userId) {
-      return res.status(400).json({ ok: false, error: 'user_id_required' });
-    }
-    const { ok, code, error, hum_id, new_balance } = await applyTopup({
-      userId, amount, comment,
-      ip: (req.headers['x-forwarded-for'] || req.ip || '').toString().split(',')[0].trim(),
-      ua: (req.headers['user-agent'] || '').slice(0, 256),
-    });
-    if (!ok) return res.status(code || 500).json({ ok, error });
-    res.json({ ok: true, hum_id, new_balance });
-  } catch (e) {
-    console.error('admin users/:id/topup error', e);
-    res.status(500).json({ ok: false, error: 'server_error' });
-  }
 });
-
-// POST /api/admin/topup  (fallback для старых форм)
-router.post('/topup', async (req, res) => {
-  if (!assertAdmin(req, res)) return;
-  try {
-    const body = req.body || {};
-    const userId = num(body.user_id ?? body.userId, 0);
-    const amount = num(body.amount ?? body.delta ?? body.sum ?? body.value, NaN);
-    const comment = (body.comment ?? body.note ?? body.reason ?? body.description ?? '').toString().trim();
-    if (!userId) return res.status(400).json({ ok: false, error: 'user_id_required' });
-    if (!Number.isFinite(amount) || amount === 0) return res.status(400).json({ ok: false, error: 'amount_required' });
-
-    const { ok, code, error, hum_id, new_balance } = await applyTopup({
-      userId, amount, comment,
-      ip: (req.headers['x-forwarded-for'] || req.ip || '').toString().split(',')[0].trim(),
-      ua: (req.headers['user-agent'] || '').slice(0, 256),
-    });
-    if (!ok) return res.status(code || 500).json({ ok, error });
-    res.json({ ok: true, hum_id, new_balance });
-  } catch (e) {
-    console.error('admin/topup error', e);
-    res.status(500).json({ ok: false, error: 'server_error' });
-  }
-});
-
-// ------------------------ HEALTH -------------------------
-router.get('/health', (req, res) => res.json({ ok: true }));
 
 export default router;
