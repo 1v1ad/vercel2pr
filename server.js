@@ -23,30 +23,40 @@ app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
 // === NEW: баланс по провайдеру ===
+// === NEW: баланс по провайдеру с HUM-агрегацией ===
 app.get('/api/balance/by-provider', async (req, res) => {
   try {
     const provider = String(req.query.provider || '').trim();   // 'tg' | 'vk'
-    const pid = String(req.query.provider_user_id || '').trim(); // например, '1650011165'
+    const pid = String(req.query.provider_user_id || '').trim();
     if (!provider || !pid) {
       return res.status(400).json({ ok:false, error:'bad_params' });
     }
 
     const q = `
-      select u.id, u.balance, u.first_name, u.last_name, u.avatar
-      from users u
-      join auth_accounts a on a.user_id = u.id
-      where a.provider = $1 and a.provider_user_id = $2
+      with acc as (
+        select user_id from auth_accounts where provider=$1 and provider_user_id=$2 limit 1
+      ),
+      me as (
+        select id, coalesce(hum_id,id) as hum_id from users where id = (select user_id from acc)
+      ),
+      agg as (
+        select sum(coalesce(balance,0))::bigint as hum_balance
+        from users u join me on coalesce(u.hum_id,u.id)=me.hum_id
+      )
+      select u.id, u.first_name, u.last_name, u.avatar,
+             (select hum_balance from agg) as balance
+      from users u join me on u.id=me.id
       limit 1
     `;
     const r = await db.query(q, [provider, pid]);
     if (!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' });
-
     return res.json({ ok:true, user: r.rows[0] });
   } catch (e) {
     console.error('by-provider error', e);
     return res.status(500).json({ ok:false, error:'server_error' });
   }
 });
+
 
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 app.get('/api/admin/health', (_req, res) => res.json({ ok: true }));
