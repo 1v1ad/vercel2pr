@@ -1,6 +1,7 @@
-// src/routes_admin.js — V3.13
-// - FIX: /events нормализует amount/comment/hum_id из payload/joins
-// - Остальные роуты без функциональных изменений
+// src/routes_admin.js — V3.14 (events normalization fix)
+// - COALESCE: amount/comment теперь берутся из колонки ИЛИ из payload/meta
+// - Остальные ручки восстановлены: /users, /events, /summary, /daily
+// - Лог админ-пополнения пишет ip/ua
 
 import express from 'express';
 import { db, logEvent } from './db.js';
@@ -92,7 +93,7 @@ router.get('/users', async (req,res)=>{
 });
 
 /* -------------------- admin_topup -------------------- */
-// POST /api/admin/users/:id/topup  body: { amount(≠0), comment }  — знак суммы допускается
+// POST /api/admin/users/:id/topup  body: { amount(≠0), comment } — знак суммы допускается
 router.post('/users/:id/topup', async (req, res) => {
   try {
     const userId = Number(req.params.id || 0);
@@ -167,26 +168,32 @@ router.get('/events', async (req,res)=>{
                   : has('time')       ? 'e.time'
                   : 'now()';
 
-    // amount из payload (amount/value/sum/delta) или из столбца
-    const amountExpr = has('amount') ? 'e.amount::bigint'
-      : has('payload') ? `
-        COALESCE(
-          NULLIF((e.payload->>'amount'),'')::bigint,
-          NULLIF((e.payload->>'value'),'')::bigint,
-          NULLIF((e.payload->>'sum'),'')::bigint,
-          NULLIF((e.payload->>'delta'),'')::bigint,
-          0
-        )`
-      : '0::bigint';
+    // NEW: amount = COALESCE(column, payload…)
+    const amountExpr = `
+      COALESCE(
+        ${has('amount') ? 'e.amount::bigint' : 'NULL'},
+        ${has('payload') ? "NULLIF((e.payload->>'amount'),'')::bigint" : 'NULL'},
+        ${has('payload') ? "NULLIF((e.payload->>'value'),'')::bigint"  : 'NULL'},
+        ${has('payload') ? "NULLIF((e.payload->>'sum'),'')::bigint"    : 'NULL'},
+        ${has('payload') ? "NULLIF((e.payload->>'delta'),'')::bigint"  : 'NULL'},
+        0::bigint
+      )`;
 
-    // comment из payload/meta
-    const commentExpr = has('meta')
-      ? "coalesce(e.meta->>'comment', e.meta->>'note', e.meta->>'reason', e.meta->>'description')"
-      : has('payload')
-      ? "coalesce(e.payload->>'comment', e.payload->>'note', e.payload->>'reason', e.payload->>'description')"
-      : "NULL";
+    // NEW: comment = COALESCE(top-level column, meta, payload)
+    const commentExpr = `
+      COALESCE(
+        ${has('comment') ? 'NULLIF(e.comment, \'\')' : 'NULL'},
+        ${has('meta') ? "NULLIF(e.meta->>'comment','')" : 'NULL'},
+        ${has('meta') ? "NULLIF(e.meta->>'note','')"     : 'NULL'},
+        ${has('meta') ? "NULLIF(e.meta->>'reason','')"   : 'NULL'},
+        ${has('meta') ? "NULLIF(e.meta->>'description','')" : 'NULL'},
+        ${has('payload') ? "NULLIF(e.payload->>'comment','')" : 'NULL'},
+        ${has('payload') ? "NULLIF(e.payload->>'note','')"     : 'NULL'},
+        ${has('payload') ? "NULLIF(e.payload->>'reason','')"   : 'NULL'},
+        ${has('payload') ? "NULLIF(e.payload->>'description','')" : 'NULL'}
+      )`;
 
-    // hum_id из колонки, payload, либо из users join
+    // hum_id: из колонки/ payload / join users
     const humExpr = `
       COALESCE(
         ${has('hum_id') ? 'e.hum_id' : 'NULL'},
