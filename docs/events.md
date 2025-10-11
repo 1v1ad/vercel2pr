@@ -107,3 +107,23 @@
   "created_at": "2025-10-11T13:40:12Z"
 }
 ```
+### link_request
+- producer: backend
+- when: пользователь нажал «Связать …», создано состояние линковки
+- payload: { target: "vk"|"tg", hum_id }
+- notes: пишется в /api/profile/link/start
+
+### link_success
+- producer: backend
+- when: провайдер подтвердил линковку и мы сохранили связь
+- payload: { provider: "vk"|"tg", pid: "<provider_user_id>" }
+
+### link_conflict
+- producer: backend
+- when: обнаружили, что provider_user_id уже привязан к другому HUM
+- payload: { provider, pid, conflict_hum }
+
+### link_error
+- producer: backend
+- when: сбой/невалидное состояние/ошибка колбэка
+- payload: { provider, reason }
