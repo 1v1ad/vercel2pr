@@ -108,12 +108,13 @@ router.all('/callback', async (req, res) => {
       }
     }
 
-    // после upsert может появиться привязка — перечитаем актёра
-    if (!actorUid) actorUid = await getActorUidForTg(tgId);
+    // после upsert обязательно перечитываем актёра
+    let actorUidFinal = null;
+    try { actorUidFinal = await getActorUidForTg(tgId); } catch {}
 
-    // ставим сессию: если есть primary — его; иначе актёра; иначе никак
+    // ставим сессию: ПРИОРИТЕТ актёру TG (чтобы события/ME отражали провайдера входа)
     try {
-      let uidForSession = primaryUid || actorUid || null;
+      let uidForSession = actorUidFinal || actorUid || primaryUid || null;
       if (uidForSession) {
         const user = await getUserById(uidForSession);
         if (user) {
@@ -136,12 +137,12 @@ router.all('/callback', async (req, res) => {
     if (data.username) url.searchParams.set('username', safe(data.username));
     if (data.photo_url) url.searchParams.set('photo_url', safe(data.photo_url));
 
-    // ЛОГИ: auth_success — от лица актёра (user_id = реальный TG-user), HUM можно вывести в админке
+    // ЛОГИ: auth_success — от лица актёра (user_id = реальный TG-user)
     try {
       await logEvent({
-        user_id: actorUid || primaryUid || null,
+        user_id: (actorUidFinal ?? actorUid ?? primaryUid ?? null),
         event_type: (mode === 'link' ? 'link_success' : 'auth_success'),
-        payload:{ provider:'tg', tg_id: tgId || null, mode, actor_user_id: actorUid, primary_uid: primaryUid },
+        payload:{ provider:'tg', tg_id: tgId || null, mode, actor_user_id: actorUidFinal ?? actorUid, primary_uid: primaryUid },
         ip:firstIp(req),
         ua:(req.headers['user-agent']||'').slice(0,256)
       });
