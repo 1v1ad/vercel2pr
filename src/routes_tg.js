@@ -1,4 +1,7 @@
-// src/routes_tg.js — TG callback + proof-merge (HUM) + гарантированный актёр (user_id TG) + корректный лог
+// src/routes_tg.js — TG callback: актёр = users.vk_id = 'tg:<id>' (нативный TG-user),
+// HUM-merge по proof, сессию и auth_success пишем от лица TG-актёра.
+// auth_accounts.user_id НЕ перевешиваем (только проставляем, если NULL).
+
 import { Router } from 'express';
 import jwt from 'jsonwebtoken';
 import { db, getUserById, logEvent } from './db.js';
@@ -7,14 +10,10 @@ import { autoMergeByDevice } from './merge.js';
 
 const router = Router();
 
-function firstIp(req) {
-  const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
-  return ipHeader.split(',')[0].trim();
-}
-function safe(s){ return (s==null ? null : String(s)); }
-function getDeviceId(req){
-  return safe(req.query?.device_id || req.cookies?.device_id || '');
-}
+const firstIp = (req) => (String(req.headers['x-forwarded-for'] || req.ip || '')).split(',')[0].trim();
+const safe = (s) => (s==null ? null : String(s));
+const getDeviceId = (req) => safe(req.query?.device_id || req.cookies?.device_id || '');
+
 function getSessionUid(req){
   const token = (req.cookies?.sid || '').toString();
   if (!token) return null;
@@ -34,87 +33,65 @@ function getSessionUid(req){
   return null;
 }
 
-// текущий актёр для tg_id (если уже привязан)
-async function getActorUidForTg(tgId){
+// --- Актёр TG = native user (users.vk_id = 'tg:<id>') ---
+async function getNativeTgUserId(tgId){
   if (!tgId) return null;
+  const tgVkId = 'tg:' + tgId;
   try{
-    const r = await db.query(
-      "select user_id from auth_accounts where provider='tg' and provider_user_id=$1 limit 1",
-      [tgId]
+    const r = await db.query("select id from users where vk_id=$1 limit 1", [tgVkId]);
+    return r.rows.length ? Number(r.rows[0].id) : null;
+  }catch{ return null; }
+}
+async function ensureNativeTgUser(tgId, profile = {}){
+  const existing = await getNativeTgUserId(tgId);
+  if (existing) return existing;
+  const fn = safe(profile.first_name) || '';
+  const ln = safe(profile.last_name)  || '';
+  const av = safe(profile.photo_url)  || '';
+  const tgVkId = 'tg:' + tgId;
+  try{
+    const ins = await db.query(
+      "insert into users (vk_id, first_name, last_name, avatar) values ($1,$2,$3,$4) returning id",
+      [tgVkId, fn, ln, av]
     );
-    return (r.rows.length && r.rows[0].user_id) ? Number(r.rows[0].user_id) : null;
-  }catch(_){ return null; }
+    const id = Number(ins.rows[0].id);
+    try { await logEvent({ user_id:id, event_type:'user_create', payload:{ provider:'tg', tg_id: tgId }, ip:null, ua:null }); } catch {}
+    return id;
+  }catch(e){
+    console.error('ensureNativeTgUser: insert failed', e?.message);
+    return null;
+  }
 }
 
-/**
- * ensureActorForTg(tgId, profile)
- * Гарантирует, что у данного tgId есть свой users.id (актёр) и он проставлен в auth_accounts.user_id.
- * 1) Если в auth_accounts уже стоит user_id — возвращаем его.
- * 2) Иначе ищем users.vk_id='tg:<tgId>'; если нет, создаём.
- * 3) Проставляем auth_accounts.user_id там, где он NULL (не перевешиваем чужое!).
- * Возвращаем актёра (users.id) или null.
- */
-async function ensureActorForTg(tgId, profile = {}){
-  if (!tgId) return null;
-
-  // уже привязан?
-  const existing = await getActorUidForTg(tgId);
-  if (existing) return existing;
-
-  const tgVkId = 'tg:' + tgId;
-
-  // ищем/создаём TG-пользователя
-  let userId = null;
-  try {
-    const r0 = await db.query("select id from users where vk_id=$1 limit 1", [tgVkId]);
-    if (r0.rows.length) userId = Number(r0.rows[0].id);
-  } catch {}
-
-  if (!userId) {
-    const fn = safe(profile.first_name) || '';
-    const ln = safe(profile.last_name)  || '';
-    const av = safe(profile.photo_url)  || '';
-    try {
-      const ins = await db.query(
-        "insert into users (vk_id, first_name, last_name, avatar) values ($1,$2,$3,$4) returning id",
-        [tgVkId, fn, ln, av]
-      );
-      userId = Number(ins.rows[0].id);
-      try {
-        await logEvent({ user_id: userId, event_type:'user_create', payload:{ provider:'tg', tg_id: tgId }, ip:null, ua:null });
-      } catch {}
-    } catch (e) {
-      console.error('ensureActorForTg: user insert failed', e?.message);
-    }
-  }
-
-  // проставляем user_id там, где он NULL (не перевешиваем чужое)
-  try {
+// аккуратно (без ребинда) проставим auth_accounts.user_id, если там NULL
+async function bindAuthAccountIfNullToUser(tgId, userId){
+  if (!tgId || !userId) return;
+  try{
     await db.query(
       "update auth_accounts set user_id=$2, updated_at=now() where provider='tg' and provider_user_id=$1 and user_id is null",
-      [tgId, userId || null]
+      [String(tgId), Number(userId)]
     );
-  } catch (e) {
-    console.warn('ensureActorForTg: bind auth_accounts failed', e?.message);
-  }
-
-  // итоговый актёр
-  const final = await getActorUidForTg(tgId);
-  return final || userId || null;
+  }catch(e){ console.warn('bindAuthAccountIfNullToUser failed', e?.message); }
 }
 
 router.all('/callback', async (req, res) => {
-  try { await logEvent({ user_id:null, event_type:'auth_start', payload:{ provider:'tg' }, ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256) }); } catch {}
+  // лог старта авторизации
+  try {
+    await logEvent({
+      user_id:null, event_type:'auth_start',
+      payload:{ provider:'tg' }, ip:firstIp(req),
+      ua:(req.headers['user-agent']||'').slice(0,256)
+    });
+  } catch {}
 
   try {
     const data = { ...(req.query || {}), ...(req.body || {}) };
     const deviceId = getDeviceId(req);
     const tgId = safe(data.id || '');
     const mode = safe(data.mode || 'login'); // 'login' | 'link'
-
     const primaryUid = getSessionUid(req) || null;
 
-    // upsert auth_account (user_id не трогаем здесь)
+    // 1) upsert auth_account (user_id не трогаем тут)
     if (tgId) {
       try{
         await db.query(`
@@ -134,36 +111,38 @@ router.all('/callback', async (req, res) => {
       }
     }
 
-    // Гарантируем актёра (создаём TG-user при необходимости и ставим user_id в auth_accounts, если он был NULL)
-    const actorUidFinal = await ensureActorForTg(tgId, data);
+    // 2) гарантируем нативного TG-пользователя и считаем его актёром
+    const actorUid = await ensureNativeTgUser(tgId, data);
 
-    // === PROOF LINK (HUM) — склейка TG-пользователя в HUM primary (без перевешивания учёток) ===
-    if (mode === 'link' && tgId && primaryUid && actorUidFinal && actorUidFinal !== primaryUid) {
+    // 3) если в auth_accounts.user_id пусто — аккуратно привяжем к этому пользователю
+    try { await bindAuthAccountIfNullToUser(tgId, actorUid); } catch {}
+
+    // 4) proof-merge: склеиваем актёра в HUM мастера (без перевешивания аккаунтов)
+    if (mode === 'link' && tgId && primaryUid && actorUid && actorUid !== primaryUid) {
       let masterHum = primaryUid;
       try{
         const r = await db.query("select coalesce(hum_id,id) as hum_id from users where id=$1", [primaryUid]);
         if (r.rows.length) masterHum = Number(r.rows[0].hum_id);
-      }catch(_){}
-
+      }catch{}
       try {
-        await db.query("update users set hum_id=$1 where id=$2 and (hum_id is null or hum_id<>$1)", [masterHum, actorUidFinal]);
+        await db.query("update users set hum_id=$1 where id=$2 and (hum_id is null or hum_id<>$1)",
+          [masterHum, actorUid]);
       } catch (e) {
-        console.warn('tg link: set hum_id failed', e?.message);
+        console.warn('tg link hum set failed', e?.message);
       }
       try {
         await logEvent({
           user_id: primaryUid,
           event_type: 'merge_proof',
-          payload: { provider:'tg', tg_id: tgId || null, from_user_id: actorUidFinal, to_hum_id: masterHum, method:'proof' },
-          ip:firstIp(req),
-          ua:(req.headers['user-agent']||'').slice(0,256)
+          payload: { provider:'tg', tg_id: tgId || null, from_user_id: actorUid, to_hum_id: masterHum, method:'proof' },
+          ip:firstIp(req), ua:(req.headers['user-agent']||'').slice(0,256)
         });
       } catch {}
     }
 
-    // Ставим сессию — ПРИОРИТЕТ актёру TG (чтобы /api/me и события отражали провайдера входа)
+    // 5) Ставим сессию от имени актёра TG — чтобы /api/me и события отражали провайдера входа
     try {
-      const uidForSession = actorUidFinal || primaryUid || null;
+      const uidForSession = actorUid || primaryUid || null;
       if (uidForSession) {
         const user = await getUserById(uidForSession);
         if (user) {
@@ -173,10 +152,10 @@ router.all('/callback', async (req, res) => {
       }
     } catch {}
 
-    // Автомерж по device_id — мягкая склейка (если используете)
+    // 6) мягкая склейка по устройству (опционально)
     try { if (deviceId) await autoMergeByDevice({ deviceId, tgId }); } catch {}
 
-    // Редирект в лобби
+    // 7) Редирект в лобби
     const frontend = process.env.FRONTEND_URL || 'http://localhost:5173';
     const url = new URL('/lobby.html', frontend);
     url.searchParams.set('provider','tg');
@@ -186,12 +165,12 @@ router.all('/callback', async (req, res) => {
     if (data.username)   url.searchParams.set('username',   safe(data.username));
     if (data.photo_url)  url.searchParams.set('photo_url',  safe(data.photo_url));
 
-    // ЛОГ: auth_success — строго от лица TG-актёра
+    // 8) ЛОГ: auth_success — строго от лица TG-актёра (users.vk_id='tg:<id>')
     try {
       await logEvent({
-        user_id: actorUidFinal || null,
+        user_id: actorUid || null,
         event_type: (mode === 'link' ? 'link_success' : 'auth_success'),
-        payload:{ provider:'tg', pid: tgId || null, mode, actor_user_id: actorUidFinal, primary_uid: primaryUid },
+        payload:{ provider:'tg', pid: tgId || null, mode, actor_user_id: actorUid, primary_uid: primaryUid },
         ip:firstIp(req),
         ua:(req.headers['user-agent']||'').slice(0,256)
       });
