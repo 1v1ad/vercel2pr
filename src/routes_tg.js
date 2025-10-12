@@ -1,4 +1,4 @@
-// src/routes_tg.js — TG callback + proof-merge (HUM) + корректный лог актёра
+// src/routes_tg.js — TG callback + proof-merge (HUM) + гарантированный актёр (user_id TG) + корректный лог
 import { Router } from 'express';
 import jwt from 'jsonwebtoken';
 import { db, getUserById, logEvent } from './db.js';
@@ -34,13 +34,73 @@ function getSessionUid(req){
   return null;
 }
 
-// helper: получить user_id, к которому сейчас привязан данный TG
+// текущий актёр для tg_id (если уже привязан)
 async function getActorUidForTg(tgId){
   if (!tgId) return null;
   try{
-    const r = await db.query("select user_id from auth_accounts where provider='tg' and provider_user_id=$1 limit 1", [tgId]);
+    const r = await db.query(
+      "select user_id from auth_accounts where provider='tg' and provider_user_id=$1 limit 1",
+      [tgId]
+    );
     return (r.rows.length && r.rows[0].user_id) ? Number(r.rows[0].user_id) : null;
   }catch(_){ return null; }
+}
+
+/**
+ * ensureActorForTg(tgId, profile)
+ * Гарантирует, что у данного tgId есть свой users.id (актёр) и он проставлен в auth_accounts.user_id.
+ * 1) Если в auth_accounts уже стоит user_id — возвращаем его.
+ * 2) Иначе ищем users.vk_id='tg:<tgId>'; если нет, создаём.
+ * 3) Проставляем auth_accounts.user_id там, где он NULL (не перевешиваем чужое!).
+ * Возвращаем актёра (users.id) или null.
+ */
+async function ensureActorForTg(tgId, profile = {}){
+  if (!tgId) return null;
+
+  // уже привязан?
+  const existing = await getActorUidForTg(tgId);
+  if (existing) return existing;
+
+  const tgVkId = 'tg:' + tgId;
+
+  // ищем/создаём TG-пользователя
+  let userId = null;
+  try {
+    const r0 = await db.query("select id from users where vk_id=$1 limit 1", [tgVkId]);
+    if (r0.rows.length) userId = Number(r0.rows[0].id);
+  } catch {}
+
+  if (!userId) {
+    const fn = safe(profile.first_name) || '';
+    const ln = safe(profile.last_name)  || '';
+    const av = safe(profile.photo_url)  || '';
+    try {
+      const ins = await db.query(
+        "insert into users (vk_id, first_name, last_name, avatar) values ($1,$2,$3,$4) returning id",
+        [tgVkId, fn, ln, av]
+      );
+      userId = Number(ins.rows[0].id);
+      try {
+        await logEvent({ user_id: userId, event_type:'user_create', payload:{ provider:'tg', tg_id: tgId }, ip:null, ua:null });
+      } catch {}
+    } catch (e) {
+      console.error('ensureActorForTg: user insert failed', e?.message);
+    }
+  }
+
+  // проставляем user_id там, где он NULL (не перевешиваем чужое)
+  try {
+    await db.query(
+      "update auth_accounts set user_id=$2, updated_at=now() where provider='tg' and provider_user_id=$1 and user_id is null",
+      [tgId, userId || null]
+    );
+  } catch (e) {
+    console.warn('ensureActorForTg: bind auth_accounts failed', e?.message);
+  }
+
+  // итоговый актёр
+  const final = await getActorUidForTg(tgId);
+  return final || userId || null;
 }
 
 router.all('/callback', async (req, res) => {
@@ -52,43 +112,9 @@ router.all('/callback', async (req, res) => {
     const tgId = safe(data.id || '');
     const mode = safe(data.mode || 'login'); // 'login' | 'link'
 
-    // кто сейчас залогинен (primary-кластер)
-    let primaryUid = getSessionUid(req) || null;
+    const primaryUid = getSessionUid(req) || null;
 
-    // актёр = тот user_id, за которым уже закреплён TG
-    let actorUid = await getActorUidForTg(tgId);
-
-    // --- PROOF LINK по HUM (без перевешивания auth_accounts) ---
-    if (mode === 'link' && tgId && primaryUid) {
-      // HUM-ид мастера = hum_id(primary) или сам primary
-      let masterHum = primaryUid;
-      try{
-        const r = await db.query("select coalesce(hum_id,id) as hum_id from users where id=$1", [primaryUid]);
-        if (r.rows.length) masterHum = Number(r.rows[0].hum_id);
-      }catch(_){}
-
-      // если TG-аккаунт привязан к другому user_id — склеиваем его в HUM-кластер мастера
-      if (actorUid && actorUid !== masterHum) {
-        try {
-          await db.query("update users set hum_id=$1 where id=$2 and (hum_id is null or hum_id<>$1)", [masterHum, actorUid]);
-        } catch (e) {
-          console.warn('tg link: set hum_id failed', e?.message);
-        }
-
-        // лог merge_proof
-        try {
-          await logEvent({
-            user_id: primaryUid,
-            event_type: 'merge_proof',
-            payload: { provider:'tg', tg_id: tgId || null, from_user_id: actorUid, to_hum_id: masterHum, method:'proof' },
-            ip:firstIp(req),
-            ua:(req.headers['user-agent']||'').slice(0,256)
-          });
-        } catch {}
-      }
-    }
-
-    // upsert TG auth_account: НЕ трогаем user_id (чтобы актёр сохранялся как есть)
+    // upsert auth_account (user_id не трогаем здесь)
     if (tgId) {
       try{
         await db.query(`
@@ -108,13 +134,36 @@ router.all('/callback', async (req, res) => {
       }
     }
 
-    // после upsert обязательно перечитываем актёра
-    let actorUidFinal = null;
-    try { actorUidFinal = await getActorUidForTg(tgId); } catch {}
+    // Гарантируем актёра (создаём TG-user при необходимости и ставим user_id в auth_accounts, если он был NULL)
+    const actorUidFinal = await ensureActorForTg(tgId, data);
 
-    // ставим сессию: ПРИОРИТЕТ актёру TG (чтобы события/ME отражали провайдера входа)
+    // === PROOF LINK (HUM) — склейка TG-пользователя в HUM primary (без перевешивания учёток) ===
+    if (mode === 'link' && tgId && primaryUid && actorUidFinal && actorUidFinal !== primaryUid) {
+      let masterHum = primaryUid;
+      try{
+        const r = await db.query("select coalesce(hum_id,id) as hum_id from users where id=$1", [primaryUid]);
+        if (r.rows.length) masterHum = Number(r.rows[0].hum_id);
+      }catch(_){}
+
+      try {
+        await db.query("update users set hum_id=$1 where id=$2 and (hum_id is null or hum_id<>$1)", [masterHum, actorUidFinal]);
+      } catch (e) {
+        console.warn('tg link: set hum_id failed', e?.message);
+      }
+      try {
+        await logEvent({
+          user_id: primaryUid,
+          event_type: 'merge_proof',
+          payload: { provider:'tg', tg_id: tgId || null, from_user_id: actorUidFinal, to_hum_id: masterHum, method:'proof' },
+          ip:firstIp(req),
+          ua:(req.headers['user-agent']||'').slice(0,256)
+        });
+      } catch {}
+    }
+
+    // Ставим сессию — ПРИОРИТЕТ актёру TG (чтобы /api/me и события отражали провайдера входа)
     try {
-      let uidForSession = actorUidFinal || actorUid || primaryUid || null;
+      const uidForSession = actorUidFinal || primaryUid || null;
       if (uidForSession) {
         const user = await getUserById(uidForSession);
         if (user) {
@@ -124,7 +173,7 @@ router.all('/callback', async (req, res) => {
       }
     } catch {}
 
-    // автомерж по device_id — можно оставить (работает через HUM)
+    // Автомерж по device_id — мягкая склейка (если используете)
     try { if (deviceId) await autoMergeByDevice({ deviceId, tgId }); } catch {}
 
     // Редирект в лобби
@@ -133,16 +182,16 @@ router.all('/callback', async (req, res) => {
     url.searchParams.set('provider','tg');
     if (tgId) url.searchParams.set('id', tgId);
     if (data.first_name) url.searchParams.set('first_name', safe(data.first_name));
-    if (data.last_name) url.searchParams.set('last_name', safe(data.last_name));
-    if (data.username) url.searchParams.set('username', safe(data.username));
-    if (data.photo_url) url.searchParams.set('photo_url', safe(data.photo_url));
+    if (data.last_name)  url.searchParams.set('last_name',  safe(data.last_name));
+    if (data.username)   url.searchParams.set('username',   safe(data.username));
+    if (data.photo_url)  url.searchParams.set('photo_url',  safe(data.photo_url));
 
-    // ЛОГИ: auth_success — от лица актёра (user_id = реальный TG-user)
+    // ЛОГ: auth_success — строго от лица TG-актёра
     try {
       await logEvent({
-        user_id: (actorUidFinal ?? actorUid ?? primaryUid ?? null),
+        user_id: actorUidFinal || null,
         event_type: (mode === 'link' ? 'link_success' : 'auth_success'),
-        payload:{ provider:'tg', tg_id: tgId || null, mode, actor_user_id: actorUidFinal ?? actorUid, primary_uid: primaryUid },
+        payload:{ provider:'tg', pid: tgId || null, mode, actor_user_id: actorUidFinal, primary_uid: primaryUid },
         ip:firstIp(req),
         ua:(req.headers['user-agent']||'').slice(0,256)
       });
