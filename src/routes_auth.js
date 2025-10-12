@@ -50,17 +50,21 @@ function readLinkStateCookie(req) {
   }
 }
 
-// validate link_tokens by state (fallback к БД)
+// validate link_tokens by state (fallback к БД, безопасно)
 async function readLinkTokenFromDB(state, target) {
-  if (!state) return null;
-  const r = await db.query(
-    `select token, user_id, target, return_url
-       from link_tokens
-      where token = $1 and target = $2 and now() < expires_at and not coalesce(done,false)
-      limit 1`,
-    [String(state), String(target)]
-  );
-  return r.rows?.[0] || null;
+  try {
+    if (!state) return null;
+    const r = await db.query(
+      `select token, user_id, target, return_url
+         from link_tokens
+        where token = $1 and target = $2 and now() < expires_at and not coalesce(done,false)
+        limit 1`,
+      [String(state), String(target)]
+    );
+    return r.rows?.[0] || null;
+  } catch {
+    return null;
+  }
 }
 async function markLinkTokenDone(token) {
   if (!token) return;
@@ -72,11 +76,11 @@ router.get('/vk/start', async (req, res) => {
   try {
     const { clientId, redirectUri } = envVK();
 
-    // если это режим привязки — кладём cookie link_state (чтобы carry return и сверять target)
-    if (req.query.mode === 'link' && req.query.state) {
+    // режим привязки — кладём cookie link_state (не требуем state от фронта)
+    if (req.query.mode === 'link') {
       const st = {
         target: 'vk',
-        nonce: String(req.query.state),
+        nonce: crypto.randomBytes(8).toString('hex'),
         return: req.query.return ? String(req.query.return) : null
       };
       res.cookie('link_state', JSON.stringify(st), { httpOnly:true, sameSite:'lax', secure:true, path:'/', maxAge:15*60*1000 });
@@ -171,6 +175,7 @@ async function vkCallbackHandler(req, res) {
     const vk_id = String(tokenData?.user_id || tokenData?.user?.id || 'unknown');
 
     // ===== PROOF LINK MODE (HUM, без перевешивания существующего VK) =====
+    let linkAttempt = false;
     try {
       // 1) читаем cookie link_state или запись из link_tokens
       let link = readLinkStateCookie(req);
@@ -181,6 +186,7 @@ async function vkCallbackHandler(req, res) {
           link = { target:'vk', nonce:String(linkTokenRow.token), return: linkTokenRow.return_url || null };
         }
       }
+      if (link || linkTokenRow) linkAttempt = true;
 
       if (link && link.target === 'vk') {
         // master (кому всё привязываем) — из sid или link_tokens
@@ -259,9 +265,10 @@ async function vkCallbackHandler(req, res) {
         return res.redirect((link.return || `${frontendUrl}/lobby.html`) + '?linked=vk');
       }
     } catch (e) {
-      try {
-        await logEvent({ event_type:'link_error', payload:{ provider:'vk', error:String(e?.message||e) }, ip:firstIp(req), ua:userAgent(req) });
-      } catch {}
+      // логируем ошибку link только если это был ИМЕННО link-поток
+      if (linkAttempt) {
+        try { await logEvent({ event_type:'link_error', payload:{ provider:'vk', error:String(e?.message||e) }, ip:firstIp(req), ua:userAgent(req) }); } catch {}
+      }
       // дальше идём как обычный логин
     }
     // ===== /PROOF LINK MODE =====
