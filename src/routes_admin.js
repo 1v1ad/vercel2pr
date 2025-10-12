@@ -1,4 +1,4 @@
-// src/routes_admin.js — V3.15 (topup by user_id; optional mode=hum)
+// src/routes_admin.js — V3.16 (topup by user_id; optional mode=hum; + /range)
 import express from 'express';
 import { db, logEvent } from './db.js';
 
@@ -101,7 +101,7 @@ router.post('/users/:id/topup', async (req, res) => {
     const mode = String(req.query.mode || 'user'); // 'user' (default) or 'hum'
 
     if (!userId) return res.status(400).json({ ok:false, error:'user_required' });
-    if (!amount)  return res.status(400).json({ ok:false, error:'amount_required' }); // ноль запрещён
+    if (!amount)  return res.status(400).json({ ok:false, error:'amount_required' });
     if (!comment) return res.status(400).json({ ok:false, error:'comment_required' });
 
     const ru = await db.query(
@@ -111,13 +111,11 @@ router.post('/users/:id/topup', async (req, res) => {
     const humId = Number(ru.rows[0].hum_id);
 
     if (mode === 'hum') {
-      // пополнение всего HUM-кластера (опционально)
       await db.query(
         'update users set balance = coalesce(balance,0) + $2 where coalesce(hum_id,id) = $1',
         [humId, amount]
       );
     } else {
-      // по умолчанию — пополняем ТОЛЬКО конкретного user_id
       await db.query(
         'update users set balance = coalesce(balance,0) + $2 where id = $1',
         [userId, amount]
@@ -147,8 +145,7 @@ router.post('/users/:id/topup', async (req, res) => {
 });
 
 /* -------------------- events / summary / daily -------------------- */
-// остальной код без изменений (как в твоей версии)
-router.get('/events', async (req,res)=>{ /* ... всё как было у тебя ... */ 
+router.get('/events', async (req,res)=>{ 
   try{
     const cols = await getCols('events');
     if (!cols.size) return res.json({ ok:true, events:[], rows:[] });
@@ -249,7 +246,7 @@ router.get('/events', async (req,res)=>{ /* ... всё как было у теб
 });
 
 /* -------------------- summary / daily -------------------- */
-router.get('/summary', async (req,res)=>{ /* как было */ 
+router.get('/summary', async (req,res)=>{ 
   try{
     const tz = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
 
@@ -358,5 +355,93 @@ async function daily(req,res){
 }
 router.get('/daily', daily);
 router.get('/summary/daily', daily);
+
+/* -------------------- NEW: /api/admin/range -------------------- */
+router.get('/range', async (req, res) => {
+  try {
+    const tz = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
+    const fromStr = (req.query.from || '').toString().trim(); // 'YYYY-MM-DD' или ''
+    const toStr   = (req.query.to   || '').toString().trim();
+
+    // Если таблицы events нет — отдаём пусто
+    const haveEvents = await db.query("select to_regclass('public.events') as r");
+    if (!haveEvents.rows?.[0]?.r) {
+      return res.json({ ok:true, from:null, to:null, days:[] });
+    }
+
+    // Вычисляем from/to
+    let fromDate = null;
+    if (fromStr && /^\d{4}-\d{2}-\d{2}$/.test(fromStr)) {
+      fromDate = fromStr;
+    } else {
+      const rMin = await db.query(
+        `select to_char(min((${tzExprN(1,'created_at','e')})::date), 'YYYY-MM-DD') as d from events e`,
+        [tz]
+      );
+      fromDate = rMin.rows?.[0]?.d || new Date().toISOString().slice(0,10);
+    }
+    let toDate = null;
+    if (toStr && /^\d{4}-\d{2}-\d{2}$/.test(toStr)) {
+      toDate = toStr;
+    } else {
+      const rNow = await db.query(`select to_char((now() at time zone $1)::date,'YYYY-MM-DD') as d`, [tz]);
+      toDate = rNow.rows?.[0]?.d || new Date().toISOString().slice(0,10);
+    }
+
+    // Ограничим на всякий случай (<= 3 лет)
+    const rDays = await db.query(
+      `select (to_date($2,'YYYY-MM-DD') - to_date($1,'YYYY-MM-DD'))::int as days`,
+      [fromDate, toDate]
+    );
+    const daysSpan = Math.max(0, Number(rDays.rows?.[0]?.days || 0));
+    if (daysSpan > 1095) return res.status(400).json({ ok:false, error:'range_too_wide' });
+
+    // Тип события — как в daily: login_success или auth_success
+    const cols = await getCols('events');
+    const typeExpr = cols.has('event_type') ? 'e.event_type::text'
+                    : cols.has('type')       ? 'e."type"::text'
+                    : `NULL::text`;
+
+    const sql = `
+      with b as (
+        select to_date($2,'YYYY-MM-DD') as d1,
+               to_date($3,'YYYY-MM-DD') as d2
+      ),
+      d(day) as (select generate_series((select d1 from b),(select d2 from b), interval '1 day')::date),
+      ev as (
+        select e.user_id, ${tzExprN(1,'created_at','e')} as ts_msk, ${typeExpr} as et
+          from events e
+         where (${tzExprN(1,'created_at','e')})::date between (select d1 from b) and (select d2 from b)
+      ),
+      login as (select user_id, ts_msk from ev where et ilike '%login%success%'),
+      auth  as (select user_id, ts_msk from ev where et ilike '%auth%success%'),
+      auth_orphan as (
+        select a.user_id, a.ts_msk
+          from auth a left join login l
+            on l.user_id = a.user_id and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
+         where l.user_id is null
+      ),
+      canon  as (select * from login union all select * from auth_orphan),
+      totals as ( select c.ts_msk::date d, count(*) c from canon c group by 1 ),
+      uniq   as ( select c.ts_msk::date d, count(distinct coalesce(u.hum_id,u.id)) c
+                   from canon c join users u on u.id=c.user_id group by 1 )
+      select to_char(d.day,'YYYY-MM-DD') as day,
+             coalesce(t.c,0)::int as auth_total,
+             coalesce(u.c,0)::int as auth_unique
+        from d
+        left join totals t on t.d=d.day
+        left join uniq   u on u.d=d.day
+       order by d.day asc
+    `;
+    const r = await db.query(sql, [tz, fromDate, toDate]);
+    const rows = (r.rows||[]).map(x => ({
+      day: x.day, auth_total: Number(x.auth_total||0), auth_unique: Number(x.auth_unique||0)
+    }));
+    res.json({ ok:true, from: fromDate, to: toDate, days: rows });
+  } catch (e) {
+    console.error('admin /range error', e);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+});
 
 export default router;
