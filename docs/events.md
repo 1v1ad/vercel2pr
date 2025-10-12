@@ -1,129 +1,268 @@
-# GGRoom — Canonical Events
+GGRoom — Canonical Events (v2, 2025-10-12)
 
-Единый словарь названий событий и обязательных полей.  
-Нейминг: `snake_case`. В БД — `events(event_type, …)`. Дата/время — UTC.
+Единый словарь событий, полей и правил логирования. Цель — чтобы фронт/бек и админка говорили на одном языке, а аналитика была однозначной.
 
-## Общие поля события
+Этот документ заменяет и расширяет прошлую версию словаря событий. В старом файле встречались login_success/login_error; сейчас используем auth_success/auth_start, оставив совместимость в аналитике. 
 
-- `id` — PK (serial/bigserial)
-- `event_type` — строка (`login_success`, `admin_topup`, …)
-- `type` — дублирование `event_type` для совместимости (может совпадать)
-- `hum_id` — основной идентификатор HUM (int) — **обязательно, если известен**
-- `user_id` — алиас `hum_id` (для старых путей) — можно копировать `hum_id`
-- `provider` — `vk` | `tg` | `web` | `system` (если применимо)
-- `pid` — id в провайдере (например, `provider_user_id`) — если применимо
-- `ip` — строка IP (если применимо)
-- `ua` — User-Agent (если применимо)
-- `amount` — число (для финансовых событий; положительное/отрицательное)
-- `comment` — текстовое пояснение/примечание
-- `payload` — `jsonb` (произвольная структура)
-- `created_at` — `timestamptz` (UTC, default now())
+events
 
-> **Правило:** если добавляем новое событие — сначала дополняем этот файл.
+0) Базовые принципы
 
----
+Время: всё в UTC (timestamptz), преобразования в отчётах — через таймзону.
 
-## Список событий
+Актёр vs HUM:
+— user_id в событии — актёр, то есть конкретный users.id, от имени которого произошёл шаг (напр. VK-пользователь при входе через VK, TG-пользователь при входе через TG).
+— Для агрегатов «одна персона» используем HUM-ид: COALESCE(u.hum_id, u.id).
+— Баланс — всегда HUM-баланс (сумма по HUM-кластеру).
 
-### Аутентификация
-- `auth_start` — начало авторизации (provider, state если есть)
-- `login_success` — успешный логин (hum_id, provider, pid)
-- `login_error` — ошибка логина (comment: текст/код)
+Провайдер и идентификатор:
+— provider ∈ {vk,tg,web,system}.
+— pid — строковый ID аккаунта у провайдера (VK user_id / TG id). Дополнительно можно писать vk_id/tg_id в payload, но канонично — pid.
 
-### Линковка аккаунтов (жёсткая, proof)
-- `link_request` — пользователь нажал «Связать …»; сохраняем `provider`, `nonce` в cookie  
-  - поля: `hum_id` (если уже есть сессия), `provider`, `ip`, `ua`, `payload.state?`
-- `link_success` — провайдер успешно привязан к `hum_id`  
-  - поля: `hum_id`, `provider`, `pid`, `ip`, `ua`
-- `link_conflict` — попытка привязать `pid`, уже принадлежащий другому `hum_id`  
-  - поля: `hum_id` (к кому хотели привязать), `provider`, `pid`, `ip`, `ua`
-- `link_error` — сбой/исключение при линковке  
-  - поля: `comment` (текст ошибки), `ip`, `ua`, опционально `payload`
+IP/UA: для auth_*, link_*, merge_*, admin_topup — обязательно логируем ip и ua.
 
-### Линковка (мягкая, по устройству)
-- `link_soft_candidate` — нашли кандидатов по `device_id`  
-  - поля: `payload.device_id`, `payload.matches=[hum_id,…]`
-- `link_soft_merged` — выполнено мягкое объединение  
-  - поля: `hum_id`, `payload.details`
+Payload: jsonb с расширяемыми ключами. Для одинаковых смыслов — одинаковые ключи (см. нормализацию ниже).
 
-### Пополнение админом
-- `admin_topup` — ручное изменение баланса админом
-  - **нормализация полей:**
-    - `amount` — итоговый дельта-значение (может быть `< 0`)
-    - `comment` — комментарий оператора
-    - `hum_id`/`user_id` — кому применили
-    - `ip`, `ua` — откуда операция
-  - **совместимость:** входящий `payload` может содержать дубли (`value`, `sum`, `delta`, `note`, `reason`, `description`). На чтении фронт выбирает:
-    - amount: `amount ?? value ?? sum ?? delta ?? 0`
-    - comment: `comment ?? note ?? reason ?? description ?? ''`
+1) Схема таблицы events
 
-### Прочее
-- `profile_update` — изменение публичного профиля
-- `room_create` / `room_join` / `room_leave` — действия в лобби/комнатах (резерв)
-- `payment_init` / `payment_success` / `payment_error` — интеграция платёжки
+Рекомендуемые поля (минимум):
 
----
+Колонка	Тип	Назначение
+id	bigserial	PK
+event_type	text	Каноническое имя события (snake_case)
+user_id	bigint	Актёр (users.id) — может быть NULL
+payload	jsonb	Данные события (свободная схема)
+ip	text	IP-адрес
+ua	text	User-Agent
+country_code	text	Если известна
+created_at	timestamptz	Время события (UTC, default now())
 
-## Хранение IP/UA
-Для `admin_topup`, `link_*`, `login_*` **обязательно** сохраняем `ip` и `ua`.
+Доп. поле hum_id необязательно. В отчётах HUM восстанавливаем по join users on users.id = events.user_id с COALESCE(u.hum_id,u.id) и/или из payload.hum_id (если событие само его несёт — напр., admin_topup). Наши админ-запросы уже учитывают оба источника.
 
----
+2) Общая нормализация полей payload
 
-## Пагинация и выборка
-- стандарт: `GET /api/admin/events?take=50&skip=0&event_type=...`
-- по умолчанию `take=50`, максимум `take=200`
-- сортировка по `created_at desc`
+Чтобы фронт всегда знал, где искать, придерживаемся таких ключей:
 
----
+Идентификаторы:
 
-## Примеры
+provider: "vk"|"tg"|"web"|"system".
 
-### Пример `link_success`
-```json
+pid: строковый ID в провайдере ("1234567" или "1650011165").
+
+hum_id: конечный HUM, если у события есть «адресат» (например, результат склейки или топапа).
+
+actor_user_id: когда важно явно указать актёра (мы всё равно дублируем актёра в топ-уровневом events.user_id).
+
+Merge/Link:
+
+method: "proof" (ручная подтверждённая склейка) или "soft" (эвристика по устройству).
+
+from_user_id, to_hum_id: источник склейки и HUM-кластер назначения.
+
+Деньги:
+
+amount: итоговая дельта (int), можно <0.
+
+comment: строка-комментарий.
+
+Совместимость при чтении: amount ?? value ?? sum ?? delta, comment ?? note ?? reason ?? description.
+
+Техн. поля:
+
+можно класть device_id, mode ("login"|"link"), return, error.
+
+3) Список событий (канон)
+3.1 Аутентификация
+
+auth_start
+Когда: начинается поток авторизации у провайдера.
+user_id: NULL.
+payload: { provider, maybe: device_id }.
+
+auth_success
+Когда: успешный вход (VK/TG).
+user_id: актёр (конкретный users.id провайдера — VK или TG).
+payload: { provider, pid, actor_user_id? }.
+Заметка: в старых логах встречался login_success. Аналитика должна учитывать оба (мы это уже делаем в админке). 
+
+events
+
+auth_error (редко используем)
+Когда: фатальный сбой авторизации.
+user_id: NULL или актёр, если он уже определён.
+payload: { provider, error }.
+
+3.2 Привязка аккаунтов (Proof-merge, ручная, «скрепляем HUM»)
+
+link_success
+Когда: провайдер успешно привязан к HUM-кластеру.
+user_id: мастер-пользователь (тот, кто инициировал привязку — обычно текущая сессия / primary).
+payload: { provider, pid }.
+
+link_error
+Когда: ошибка в процессе привязки.
+user_id: NULL или мастер, если он известен.
+payload: { provider, reason|error }.
+Важно: логируем только когда реально шёл линк-поток; при обычном логине — не пишем.
+
+merge_proof
+Когда: фактическая склейка аккаунтов по подтверждённому действию.
+user_id: мастер (инициатор).
+payload: { provider, pid|vk_id|tg_id, from_user_id, to_hum_id, method:"proof" }.
+Семантика: не перевешиваем auth_accounts.user_id, а задаём users.hum_id у «второго» на HUM мастера.
+
+3.3 Мягкая склейка (эвристика, по устройству)
+
+link_soft_candidate
+Когда: по device_id нашли кандидатов на объединение.
+user_id: мастер (если есть) или NULL.
+payload: { device_id, matches:[hum_id,…] }.
+
+link_soft_merged
+Когда: кластер объединён «мягко» (без показа общего баланса, если так решено продуктом).
+user_id: мастер (если есть).
+payload: { device_id, details }.
+Семантика: такие склейки не обязаны немедленно менять интерфейс, но HUM в БД уже общий.
+
+3.4 Админ-операции
+
+admin_topup
+Когда: оператор изменяет баланс.
+user_id: тот конкретный пользователь, на счёт которого начисляем/списываем.
+payload: { user_id, hum_id, amount, comment, mode:"user"|"hum" }.
+Правило денег:
+— по умолчанию (mode=user) изменяем баланс только у указанного user_id; HUM-итог рассчитываем для ответа;
+— mode=hum — изменяем баланс всему кластеру (редкий админ-случай «приз человеку»).
+
+3.5 Прочее (на будущее)
+
+profile_update — изменены публичные поля профиля.
+
+payment_init / payment_success / payment_error — события платёжного провайдера.
+
+room_create / room_join / room_leave — игровые комнаты (резерв).
+
+4) Примеры JSON-событий
+4.1 TG-вход (после правок актёр — TG user)
+{
+  "event_type": "auth_success",
+  "user_id": 97,
+  "payload": {
+    "provider": "tg",
+    "pid": "1650011165",
+    "actor_user_id": 97
+  },
+  "ip": "203.0.113.42",
+  "ua": "Mozilla/5.0 ...",
+  "created_at": "2025-10-12T11:05:23Z"
+}
+
+4.2 VK-вход
+{
+  "event_type": "auth_success",
+  "user_id": 1,
+  "payload": {
+    "provider": "vk",
+    "pid": "612345678"
+  },
+  "ip": "203.0.113.42",
+  "ua": "Mozilla/5.0 ...",
+  "created_at": "2025-10-12T11:06:44Z"
+}
+
+4.3 Proof-склейка TG→HUM(1)
+{
+  "event_type": "merge_proof",
+  "user_id": 1,
+  "payload": {
+    "provider": "tg",
+    "tg_id": "1650011165",
+    "from_user_id": 97,
+    "to_hum_id": 1,
+    "method": "proof"
+  },
+  "ip": "203.0.113.42",
+  "ua": "Mozilla/5.0 ...",
+  "created_at": "2025-10-12T11:07:01Z"
+}
+
+4.4 Привязка VK (первичная или к уже общему HUM)
 {
   "event_type": "link_success",
-  "type": "link_success",
-  "hum_id": 97,
-  "user_id": 97,
-  "provider": "tg",
-  "pid": "1650011165",
-  "ip": "194.87.115.218",
+  "user_id": 1,
+  "payload": {
+    "provider": "vk",
+    "pid": "612345678"
+  },
+  "ip": "203.0.113.42",
   "ua": "Mozilla/5.0 ...",
-  "created_at": "2025-10-11T13:30:43Z"
+  "created_at": "2025-10-12T11:07:03Z"
 }
-```
 
-### Пример `admin_topup`
-```json
+4.5 Ручное пополнение user_id=97 (+50)
 {
   "event_type": "admin_topup",
-  "type": "admin_topup",
-  "hum_id": 97,
   "user_id": 97,
-  "amount": 100,
-  "comment": "Проверка",
-  "ip": "194.87.115.218",
+  "payload": {
+    "user_id": 97,
+    "hum_id": 1,
+    "amount": 50,
+    "comment": "Проверка пополнения",
+    "mode": "user"
+  },
+  "ip": "203.0.113.42",
   "ua": "Mozilla/5.0 ...",
-  "created_at": "2025-10-11T13:40:12Z"
+  "created_at": "2025-10-12T11:10:43Z"
 }
-```
-### link_request
-- producer: backend
-- when: пользователь нажал «Связать …», создано состояние линковки
-- payload: { target: "vk"|"tg", hum_id }
-- notes: пишется в /api/profile/link/start
 
-### link_success
-- producer: backend
-- when: провайдер подтвердил линковку и мы сохранили связь
-- payload: { provider: "vk"|"tg", pid: "<provider_user_id>" }
+5) Кулинарная книга SQL (админка)
+5.1 Восстановление HUM в выборках событий
+-- hum того же пользователя (если в events.hum_id нет)
+SELECT
+  e.*,
+  COALESCE(
+    e.hum_id,                                -- если колонка есть
+    NULLIF(e.payload->>'hum_id','')::bigint, -- или из payload
+    u.hum_id,                                -- или join с users
+    u.id
+  ) AS hum_id_canon
+FROM events e
+LEFT JOIN users u ON u.id = e.user_id;
 
-### link_conflict
-- producer: backend
-- when: обнаружили, что provider_user_id уже привязан к другому HUM
-- payload: { provider, pid, conflict_hum }
+5.2 Уникальные авторизации за 7 дней по HUM
+WITH canon AS (
+  SELECT e.user_id, e.created_at, 
+         (CASE WHEN e.event_type ILIKE '%auth%success%' OR e.event_type ILIKE '%login%success%'
+               THEN 1 END) AS ok
+  FROM events e
+)
+SELECT COUNT(DISTINCT COALESCE(u.hum_id,u.id)) AS auth_unique_7d
+FROM canon c 
+JOIN users u ON u.id=c.user_id
+WHERE c.ok = 1
+  AND c.created_at >= now() - interval '7 days';
 
-### link_error
-- producer: backend
-- when: сбой/невалидное состояние/ошибка колбэка
-- payload: { provider, reason }
+5.3 Дневные срезы (тотал/уники)
+
+См. текущую реализацию /api/admin/daily — там уже учтены login_success и auth_success, а уникальность считается по COALESCE(u.hum_id,u.id).
+
+5.4 Баланс HUM
+SELECT SUM(COALESCE(balance,0)) AS hum_balance
+FROM users
+WHERE COALESCE(hum_id,id) = $1;
+
+6) Проверочный чек-лист при добавлении нового события
+
+Имя события в snake_case.
+
+Определи актёра (user_id) и, если уместно, положи hum_id в payload.
+
+Всегда укажи provider/pid, если событие относится к VK/TG.
+
+Приложи ip и ua для чувствительных действий.
+
+Согласуй ключи payload с этим документом (не плодить синонимов).
+
+Добавь пример в раздел «Примеры», если событие пользовательское.
+
+Обнови отчёты, если событие должно учитываться в метриках.
