@@ -1,8 +1,4 @@
-// src/routes_admin.js — V3.14 (events normalization fix)
-// - COALESCE: amount/comment теперь берутся из колонки ИЛИ из payload/meta
-// - Остальные ручки восстановлены: /users, /events, /summary, /daily
-// - Лог админ-пополнения пишет ip/ua
-
+// src/routes_admin.js — V3.15 (topup by user_id; optional mode=hum)
 import express from 'express';
 import { db, logEvent } from './db.js';
 
@@ -26,7 +22,6 @@ const getCols = async (table) => {
   `,[table]);
   return new Set((r.rows||[]).map(x=>x.column_name));
 };
-
 const tzExprN = (n=1, col='created_at', tbl='e') => `
 CASE
   WHEN pg_typeof(${tbl}.${col}) = 'timestamp with time zone'::regtype
@@ -35,7 +30,7 @@ CASE
 END`;
 
 /* -------------------- users list -------------------- */
-router.get('/users', async (req,res)=>{
+router.get('/users', async (req,res)=>{ /* (без изменений) */ 
   try{
     const take = Math.max(1,Math.min(500,parseInt(req.query.take||'50',10)));
     const skip = Math.max(0,parseInt(req.query.skip||'0',10));
@@ -93,7 +88,7 @@ router.get('/users', async (req,res)=>{
 });
 
 /* -------------------- admin_topup -------------------- */
-// POST /api/admin/users/:id/topup  body: { amount(≠0), comment } — знак суммы допускается
+// POST /api/admin/users/:id/topup?mode=user|hum  body: { amount(≠0), comment }
 router.post('/users/:id/topup', async (req, res) => {
   try {
     const userId = Number(req.params.id || 0);
@@ -103,6 +98,7 @@ router.post('/users/:id/topup', async (req, res) => {
     const comment = String(
       req.body.comment ?? req.body.note ?? req.body.reason ?? req.body.description ?? ''
     ).trim();
+    const mode = String(req.query.mode || 'user'); // 'user' (default) or 'hum'
 
     if (!userId) return res.status(400).json({ ok:false, error:'user_required' });
     if (!amount)  return res.status(400).json({ ok:false, error:'amount_required' }); // ноль запрещён
@@ -114,10 +110,19 @@ router.post('/users/:id/topup', async (req, res) => {
     if (!ru.rows?.length) return res.status(404).json({ ok:false, error:'user_not_found' });
     const humId = Number(ru.rows[0].hum_id);
 
-    await db.query(
-      'update users set balance = coalesce(balance,0) + $2 where coalesce(hum_id,id) = $1',
-      [humId, amount]
-    );
+    if (mode === 'hum') {
+      // пополнение всего HUM-кластера (опционально)
+      await db.query(
+        'update users set balance = coalesce(balance,0) + $2 where coalesce(hum_id,id) = $1',
+        [humId, amount]
+      );
+    } else {
+      // по умолчанию — пополняем ТОЛЬКО конкретного user_id
+      await db.query(
+        'update users set balance = coalesce(balance,0) + $2 where id = $1',
+        [userId, amount]
+      );
+    }
 
     const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
     const ip = ipHeader.split(',')[0].trim();
@@ -126,7 +131,7 @@ router.post('/users/:id/topup', async (req, res) => {
     await logEvent({
       user_id: userId,
       event_type: 'admin_topup',
-      payload: { user_id: userId, hum_id: humId, amount, comment },
+      payload: { user_id: userId, hum_id: humId, amount, comment, mode },
       ip, ua, country_code: null
     });
 
@@ -141,8 +146,9 @@ router.post('/users/:id/topup', async (req, res) => {
   }
 });
 
-/* -------------------- events (нормализация) -------------------- */
-router.get('/events', async (req,res)=>{
+/* -------------------- events / summary / daily -------------------- */
+// остальной код без изменений (как в твоей версии)
+router.get('/events', async (req,res)=>{ /* ... всё как было у тебя ... */ 
   try{
     const cols = await getCols('events');
     if (!cols.size) return res.json({ ok:true, events:[], rows:[] });
@@ -168,7 +174,6 @@ router.get('/events', async (req,res)=>{
                   : has('time')       ? 'e.time'
                   : 'now()';
 
-    // NEW: amount = COALESCE(column, payload…)
     const amountExpr = `
       COALESCE(
         ${has('amount') ? 'e.amount::bigint' : 'NULL'},
@@ -179,7 +184,6 @@ router.get('/events', async (req,res)=>{
         0::bigint
       )`;
 
-    // NEW: comment = COALESCE(top-level column, meta, payload)
     const commentExpr = `
       COALESCE(
         ${has('comment') ? 'NULLIF(e.comment, \'\')' : 'NULL'},
@@ -193,7 +197,6 @@ router.get('/events', async (req,res)=>{
         ${has('payload') ? "NULLIF(e.payload->>'description','')" : 'NULL'}
       )`;
 
-    // hum_id: из колонки/ payload / join users
     const humExpr = `
       COALESCE(
         ${has('hum_id') ? 'e.hum_id' : 'NULL'},
@@ -213,7 +216,7 @@ router.get('/events', async (req,res)=>{
     const where = cond.length ? ('where ' + cond.join(' and ')) : '';
 
     const joinUsers = !!uidCol;
-    p.push(take, skip);
+    p.push(Math.min(200, Math.max(1, parseInt(req.query.take||'50',10))), Math.max(0, parseInt(req.query.skip||'0',10)));
     const sql = `
       select
         ${idCol}  as event_id,
@@ -245,8 +248,8 @@ router.get('/events', async (req,res)=>{
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
 
-/* -------------------- summary -------------------- */
-router.get('/summary', async (req,res)=>{
+/* -------------------- summary / daily -------------------- */
+router.get('/summary', async (req,res)=>{ /* как было */ 
   try{
     const tz = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
 
@@ -307,7 +310,6 @@ router.get('/summary', async (req,res)=>{
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
 
-/* -------------------- daily -------------------- */
 async function daily(req,res){
   try{
     const days = Math.max(1,Math.min(31,parseInt(req.query.days||'7',10)));
@@ -350,11 +352,7 @@ async function daily(req,res){
        order by d.day asc
     `;
     const r = await db.query(sql, [tz, days]);
-    const rows = (r.rows||[]).map(x=>({
-      date:x.day,
-      auth_total:Number(x.auth_total||0),
-      auth_unique:Number(x.auth_unique||0)
-    }));
+    const rows = (r.rows||[]).map(x=>({ date:x.day, auth_total:Number(x.auth_total||0), auth_unique:Number(x.auth_unique||0) }));
     res.json({ ok:true, days: rows });
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 }
