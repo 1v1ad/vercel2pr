@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Admin API Tester</title>
+  <style>
+    :root { --gap: 12px; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      margin: 0; padding: 0; background: #0b0f14; color: #e6edf3;
+    }
+    header {
+      padding: 20px;
+      border-bottom: 1px solid #1f2a37;
+      background: #0f1621;
+      position: sticky; top: 0; z-index: 5;
+    }
+    h1 { margin: 0 0 6px; font-size: 18px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap); margin-top: var(--gap); }
+    @media (max-width: 840px) { .row { grid-template-columns: 1fr; } }
+    input, select, button {
+      width: 100%; padding: 10px 12px; border-radius: 10px;
+      border: 1px solid #263341; background: #0c141d; color: #e6edf3;
+    }
+    input:focus, select:focus { outline: 2px solid #375a7f; }
+    button { cursor: pointer; background: #1b2533; transition: 120ms ease; }
+    button:hover { background: #213047; }
+    .btns { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--gap); margin-top: var(--gap); }
+    @media (max-width: 840px) { .btns { grid-template-columns: repeat(2, 1fr); } }
+    main { padding: 16px; display: grid; gap: var(--gap); }
+    .card {
+      background: #0f1621; border: 1px solid #1f2a37; border-radius: 14px; padding: 14px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+    }
+    .muted { color: #9fb0c0; font-size: 12px; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap); }
+    @media (max-width: 1000px) { .grid-2 { grid-template-columns: 1fr; } }
+    pre {
+      white-space: pre-wrap; word-break: break-word; margin: 0;
+      background: #0b1119; border: 1px solid #1b2634; border-radius: 12px; padding: 12px;
+      max-height: 60vh; overflow: auto;
+    }
+    .small { font-size: 12px; }
+    .ok { color: #3ddc97; }
+    .bad { color: #ff6b6b; }
+    footer { padding: 14px; text-align: center; color: #9fb0c0; }
+    .inline { display: flex; gap: 8px; align-items: center; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Admin API Tester</h1>
+    <div class="row">
+      <label>
+        <div class="muted small">Backend URL</div>
+        <input id="backendUrl" placeholder="https://your-backend.onrender.com" />
+      </label>
+      <label>
+        <div class="muted small">Admin Password (X-Admin-Password)</div>
+        <input id="adminPwd" type="password" placeholder="••••••••" />
+      </label>
+    </div>
+    <div class="row">
+      <div class="inline">
+        <button id="save">Сохранить</button>
+        <span class="muted small">Сохранится в localStorage.</span>
+      </div>
+      <div class="inline">
+        <button id="clear">Очистить</button>
+        <span class="muted small">Сбросить URL и пароль.</span>
+      </div>
+    </div>
+
+    <div class="btns">
+      <button id="btnHealth">Health</button>
+      <button id="btnSummary">Summary</button>
+      <button id="btnUsers">Users</button>
+      <button id="btnEvents">Events</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="grid-2">
+      <div class="card">
+        <div class="row">
+          <label>
+            <div class="muted small">Users: take</div>
+            <input id="usersTake" type="number" min="1" max="200" value="25" />
+          </label>
+          <label>
+            <div class="muted small">Users: skip</div>
+            <input id="usersSkip" type="number" min="0" value="0" />
+          </label>
+        </div>
+        <label style="margin-top: 12px;">
+          <div class="muted small">Users: search</div>
+          <input id="usersSearch" placeholder="vk_id, first_name или last_name" />
+        </label>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <label>
+            <div class="muted small">Events: take</div>
+            <input id="eventsTake" type="number" min="1" max="200" value="50" />
+          </label>
+          <label>
+            <div class="muted small">Events: skip</div>
+            <input id="eventsSkip" type="number" min="0" value="0" />
+          </label>
+        </div>
+        <div class="row" style="margin-top: 12px;">
+          <label>
+            <div class="muted small">Events: type</div>
+            <input id="eventsType" placeholder="login | action | ..." />
+          </label>
+          <label>
+            <div class="muted small">Events: user_id</div>
+            <input id="eventsUserId" type="number" min="1" placeholder="число" />
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="muted small">Результат</div>
+      <pre id="out">Нажми кнопку выше…</pre>
+    </div>
+  </main>
+
+  <footer class="small muted">
+    Работает через fetch() к /api/admin/* (нужен CORS на бэкенде). Данные URL/пароля хранятся в localStorage вашего браузера.
+  </footer>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+
+  // EDIT HERE if you want a default URL baked-in:
+  const DEFAULT_BACKEND = ""; // e.g. "https://vercel2pr.onrender.com"
+
+  const state = {
+    backend: localStorage.getItem('admin.backend') || DEFAULT_BACKEND,
+    pwd: localStorage.getItem('admin.pwd') || ''
+  };
+
+  function load() {
+    $('backendUrl').value = state.backend;
+    $('adminPwd').value = state.pwd;
+  }
+
+  function save() {
+    state.backend = $('backendUrl').value.trim();
+    state.pwd = $('adminPwd').value;
+    localStorage.setItem('admin.backend', state.backend);
+    localStorage.setItem('admin.pwd', state.pwd);
+  }
+
+  function clearSaved() {
+    localStorage.removeItem('admin.backend');
+    localStorage.removeItem('admin.pwd');
+    state.backend = DEFAULT_BACKEND;
+    state.pwd = '';
+    load();
+  }
+
+  async function call(path) {
+    const base = $('backendUrl').value.trim();
+    const pwd = $('adminPwd').value;
+    if (!base) { return print({ error: 'Укажи Backend URL' }, true); }
+    if (!pwd)  { return print({ error: 'Укажи Admin Password' }, true); }
+
+    try {
+      const r = await fetch(base.replace(/\/$/, '') + path, {
+        headers: { 'X-Admin-Password': pwd }
+      });
+      const text = await r.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch { /* keep text */ }
+      print({ status: r.status, ok: r.ok, data: data ?? text });
+    } catch (e) {
+      print({ error: String(e) }, true);
+    }
+  }
+
+  function print(obj, isErr=false) {
+    $('out').textContent = JSON.stringify(obj, null, 2);
+    $('out').style.borderColor = isErr ? '#5a1f1f' : '#1b2634';
+  }
+
+  $('save').addEventListener('click', save);
+  $('clear').addEventListener('click', clearSaved);
+  $('btnHealth').addEventListener('click', () => call('/api/admin/health'));
+  $('btnSummary').addEventListener('click', () => call('/api/admin/summary'));
+  $('btnUsers').addEventListener('click', () => {
+    const t = $('usersTake').value || 25;
+    const s = $('usersSkip').value || 0;
+    const q = new URLSearchParams({ take: t, skip: s });
+    const search = $('usersSearch').value.trim();
+    if (search) q.set('search', search);
+    call('/api/admin/users?' + q.toString());
+  });
+  $('btnEvents').addEventListener('click', () => {
+    const t = $('eventsTake').value || 50;
+    const s = $('eventsSkip').value || 0;
+    const q = new URLSearchParams({ take: t, skip: s });
+    const type = $('eventsType').value.trim();
+    const uid = $('eventsUserId').value.trim();
+    if (type) q.set('type', type);
+    if (uid) q.set('user_id', uid);
+    call('/api/admin/events?' + q.toString());
+  });
+
+  load();
+})();
+</script>
+</body>
+</html>

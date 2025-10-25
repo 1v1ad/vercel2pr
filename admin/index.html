@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>GGRoom — Admin</title>
+
+  <!-- Встроенный фавикон (без запроса favicon.ico) -->
+  <link rel="icon" type="image/svg+xml"
+      href='data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="%230a84ff"/><stop offset="1" stop-color="%234ed1a9"/></linearGradient></defs><rect rx="12" width="64" height="64" fill="%23101825"/><path d="M14 44l8-24h6l8 24h-6l-1.6-5H21.6L20 44h-6zm10-10h7l-3.5-11-3.5 11z" fill="url(%23g)"/></svg>'>
+
+  <!-- Стили -->
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="styles.patch.css" />
+  <!-- emojis.css удалён: флаги теперь рисует flags.js -->
+
+  <style>
+    /* лёгкие дефолты на случай, если нет своих стилей */
+    body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,"Noto Sans",sans-serif; background:#0b0f14; color:#d7dee9; }
+    .wrap { max-width:1200px; margin:0 auto; padding:16px; }
+    .toolbar { display:flex; gap:8px; align-items:center; }
+    .toolbar input[type="text"], .toolbar input[type="password"] { background:#111923; color:#d7dee9; border:1px solid #1f2a36; border-radius:8px; padding:10px 12px; width:340px; }
+    .toolbar button { background:#1e293b; color:#e5f0ff; border:1px solid #2a3a4f; border-radius:8px; padding:10px 14px; cursor:pointer; }
+    .grid { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin:16px 0; }
+    .card { background:#111923; border:1px solid #1f2a36; border-radius:12px; padding:16px; min-height:92px; }
+    .card h3 { margin:0 0 8px 0; font-weight:600; color:#9fb4d9; font-size:14px; letter-spacing:.02em; }
+    .num { font-size:28px; font-weight:700; }
+    .panel { background:#0e141d; border:1px solid #1c2735; border-radius:12px; margin:16px 0; overflow:hidden; }
+    .panel-header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid #1c2735; background:#0b111a; }
+    .panel-header h4 { margin:0; font-size:15px; color:#9fb4d9; }
+    .panel-body { padding:16px; }
+    table { width:100%; border-collapse:collapse; }
+    th, td { text-align:left; padding:9px 8px; border-bottom:1px solid #182432; }
+    th { color:#8fa4c6; font-weight:600; font-size:13px; }
+    td { color:#d7dee9; font-size:14px; }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; }
+    .muted { color:#8fa4c6; opacity:.8; font-size:12px; }
+    .right { text-align:right; }
+    .badge { display:inline-block; background:#182432; border:1px solid #25405b; color:#a5c4f1; border-radius:999px; padding:2px 8px; font-size:12px; }
+    /* ⬇️ фикс превращения флага в "de" */
+    [data-cc] {
+      text-transform: none !important;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, "Noto Sans",
+                   "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+    }
+    /* защита от text-transform у предков */
+    [data-cc] { text-transform: none !important; }
+    .flag-emoji, .cc { text-transform: none !important; }
+    /* ======= Mobile tweaks ======= */
+@media (max-width: 980px) {
+  .grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 720px) {
+  .toolbar { flex-direction: column; align-items: stretch; }
+  .toolbar input[type="text"], .toolbar input[type="password"] { width: 100%; }
+  .panel-body { padding: 12px; }
+  .card { padding: 12px; }
+  .num { font-size: 24px; }
+  /* таблицы прокручиваются по X, чтобы не ломались */
+  .panel-body > table { display: block; overflow-x: auto; white-space: nowrap; }
+  /* скрываем самый длинный столбец (UA) на телефоне */
+  table thead th:nth-child(7), table tbody td:nth-child(7) { display: none; }
+}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="toolbar">
+      <input id="admin-api" type="text" placeholder="https://vercel2pr.onrender.com" />
+      <input id="admin-pwd" type="password" placeholder="Пароль администратора" />
+      <button id="admin-save">Сохранить</button>
+      <button id="admin-check">Проверка</button>
+      <span class="muted">API и пароль сохраняются в localStorage</span>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h3>Пользователи</h3>
+        <div id="summary-users" class="num">—</div>
+      </div>
+      <div class="card">
+        <h3>События</h3>
+        <div id="summary-events" class="num">—</div>
+      </div>
+      <div class="card">
+        <h3>Авторизаций (7д)</h3>
+        <div id="summary-auth" class="num">—</div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h3>Уникальные (7д)</h3>
+        <div id="summary-unique" class="num">—</div>
+      </div>
+      <div class="card">
+        <h3>Склейка: предложения</h3>
+        <div class="actions">
+          <button id="merge-suggest-run">Склеить все</button>
+          <span class="muted">Укажи API и пароль сверху</span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Пополнение</h3>
+        <div class="actions">
+          <input id="topup-user-id" type="text" placeholder="user_id" style="width:120px" />
+          <input id="topup-amount"  type="text" placeholder="сумма" style="width:120px" />
+          <button id="topup-run">Пополнить вручную</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ▼▼▼ НОВАЯ ПАНЕЛЬ: Диапазон ▼▼▼ -->
+<div class="panel">
+  <div class="panel-header">
+    <h4>Аналитика по диапазону</h4>
+    <div class="actions" style="gap:6px;align-items:center;">
+      <label class="muted">c</label>
+      <input id="range-from" type="date" />
+      <label class="muted">по</label>
+      <input id="range-to" type="date" />
+      <button class="badge" data-preset="7">7д</button>
+      <button class="badge" data-preset="30">30д</button>
+      <button class="badge" data-preset="90">90д</button>
+      <button class="badge" data-preset="365">Год</button>
+      <button class="badge" data-preset="all">Всё</button>
+      <button id="range-apply">Показать</button>
+    </div>
+  </div>
+  <div class="panel-body">
+    <svg id="chart-range" width="100%" height="260"></svg>
+    <div class="muted" id="range-note" style="margin-top:6px;"></div>
+  </div>
+</div>
+<!-- ▲▲▲ НОВАЯ ПАНЕЛЬ: Диапазон ▲▲▲ -->
+
+
+    <div class="panel">
+      <div class="panel-header">
+        <h4>Аналитика посещений</h4>
+        <div class="badge">7 дней</div>
+      </div>
+      <div class="panel-body">
+        <svg id="chart" width="100%" height="300"></svg>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <h4>Пользователи</h4>
+        <div class="actions">
+          <input id="users-search" type="text" placeholder="Поиск (vk_id, имя, фамилия)" />
+          <button id="users-refresh">Обновить</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <table>
+          <thead>
+            <tr>
+              <th>HUMid</th>
+              <th>user_id</th>
+              <th>VK/Tg</th>
+              <th>Имя</th>
+              <th>Фамилия</th>
+              <th class="right">Баланс</th>
+              <th>Страна</th>
+              <th>Создан</th>
+              <th>Провайдеры</th>
+            </tr>
+          </thead>
+          <tbody id="users-tbody">
+            <!-- наполняется скриптом -->
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <h4>События</h4>
+        <div class="actions">
+          <input id="events-type" type="text" placeholder="Тип (login, auth_…)" />
+          <input id="events-user" type="text" placeholder="user_id" style="width:120px" />
+          <button id="events-refresh">Обновить</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <table>
+          <thead>
+            <tr>
+              <th>ID события</th>
+              <th>HUMid</th>
+              <th>user_id</th>
+              <th>event_type</th>
+              <th>type</th>
+              <th>IP</th>
+              <th>UA</th>
+              <th>Создано</th>
+            </tr>
+          </thead>
+          <tbody id="events-tbody">
+            <!-- наполняется скриптом -->
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ВАЖНО: ШИМ ДОЛЖЕН ИДТИ ПЕРВЫМ, чтобы подставлять X-Admin-Password -->
+  <script src="admin-auth-headers.js?v=20251008y"></script>
+
+  <!-- flags.js подключаем до app.js, чтобы была доступна decorateFlags -->
+  <script src="flags.js?v=20251008y"></script>
+ 
+  <!-- основной код админки -->
+  <script src="app.js?v=20251008y"></script>
+  <script src="merge-suggest.js?v=20251008y"></script>
+  <script src="topup.js?v=20251008y"></script>
+  <script src="chart.js?v=20251008y"></script>
+  <script src="chart-range.js?v=20251012b"></script>
+
+  <!-- Glue-код страницы: хранение API/пароля, действия, запросы -->
+  <script>
+/* ===== helpers ===== */
+function toMSK(iso){
+  if(!iso) return '';
+  try{
+    const s = String(iso);
+    const d = new Date(s.endsWith('Z') ? s : (s + 'Z')); // treat as UTC
+    const p = new Intl.DateTimeFormat('sv-SE', {
+      timeZone: 'Europe/Moscow', hour12: false,
+      year:'numeric', month:'2-digit', day:'2-digit',
+      hour:'2-digit', minute:'2-digit', second:'2-digit'
+    }).formatToParts(d).reduce((o,part)=> (o[part.type]=part.value,o),{});
+    return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}`;
+  }catch(e){
+    return String(iso).slice(0,19).replace('T',' ');
+  }
+}
+
+(function(){
+  // загрузка/сохранение API/пароля в UI
+  const apiEl = document.getElementById('admin-api');
+  const pwdEl = document.getElementById('admin-pwd');
+  const saveBtn = document.getElementById('admin-save');
+  const checkBtn = document.getElementById('admin-check');
+
+  apiEl.value = localStorage.getItem('ADMIN_API') || (window.API || '');
+  pwdEl.value = localStorage.getItem('ADMIN_PWD') || '';
+
+  saveBtn.addEventListener('click', () => {
+    localStorage.setItem('ADMIN_API', apiEl.value.trim());
+    localStorage.setItem('ADMIN_PWD', pwdEl.value);
+    alert('OK');
+  });
+
+  checkBtn.addEventListener('click', async () => {
+    const API = (localStorage.getItem('ADMIN_API') || '').replace(/\/+$/,'');
+    if (!API) return alert('Укажи API');
+    const r = await fetch(API + '/api/admin/health', { headers: window.adminHeaders ? window.adminHeaders() : {} });
+    const j = await r.json().catch(()=>({}));
+    alert(j && j.ok ? 'OK' : 'Ошибка');
+  });
+
+  // Helpers для перерисовки карточек summary
+  function setText(id, v){ const el = document.getElementById(id); if (el) el.textContent = v; }
+
+  async function refreshSummary(){
+    const API = (localStorage.getItem('ADMIN_API') || '').replace(/\/+$/,'');
+    if (!API) return;
+    // Явно просим МСК
+    const r = await fetch(API + '/api/admin/summary?tz=Europe/Moscow', { headers: window.adminHeaders ? window.adminHeaders() : {}, cache:'no-store' });
+    const j = await r.json().catch(()=>({}));
+    if (!j || !j.ok) return;
+    setText('summary-users',  j.users ?? '—');
+    setText('summary-events', j.events ?? '—');
+    setText('summary-auth',   j.auth7_total ?? '—');
+    setText('summary-unique', j.unique7 ?? '—');
+  }
+
+  // ===== Users =====
+  async function refreshUsers(){
+    const API = (localStorage.getItem('ADMIN_API') || '').replace(/\/+$/,'');
+    if (!API) return;
+    const q = new URLSearchParams({ take:'25', skip:'0', search:(document.getElementById('users-search')?.value || '').trim() });
+    try{
+      const r = await fetch(API + '/api/admin/users?' + q.toString(), { headers: window.adminHeaders ? window.adminHeaders() : {}, cache:'no-store' });
+      const j = await r.json().catch(()=>({}));
+      const rows = Array.isArray(j.users) ? j.users : (Array.isArray(j.rows) ? j.rows : []);
+      const tbody = document.getElementById('users-tbody');
+      if (!tbody) return;
+
+      // 9 колонок строго по thead; VK/Tg — реальный идентификатор (vk_id или tg:…)
+      tbody.innerHTML = rows.map(u => {
+        const HUM = u.hum_id ?? u.HUMid ?? u.id ?? '';
+        const UID = u.user_id ?? u.id ?? '';
+        const vkTgId = (u.vk_id != null && u.vk_id !== '') ? u.vk_id : (Array.isArray(u.providers) ? (u.providers[0]||'') : '');
+        const cc = (u.country || u.country_code || u.country_name || '').toUpperCase();
+        const providers = Array.isArray(u.providers) ? u.providers.join(', ') : '';
+        return `
+          <tr>
+            <td>${HUM}</td>
+            <td>${UID}</td>
+            <td>${vkTgId}</td>
+            <td>${u.first_name ?? ''}</td>
+            <td>${u.last_name ?? ''}</td>
+            <td class="right">${u.balance_raw ?? u.balance ?? 0}</td>
+            <td data-cc="${cc}"></td>
+            <td>${toMSK(u.created_at)}</td>
+            <td>${providers}</td>
+          </tr>
+        `;
+      }).join('');
+
+      // дорисуем флаги
+      if (window.decorateFlags) window.decorateFlags(tbody);
+    }catch(e){
+      console.error(e);
+      const tbody = document.getElementById('users-tbody');
+      if (tbody) tbody.innerHTML = `<tr><td colspan="9" class="muted">Ошибка загрузки</td></tr>`;
+    }
+  }
+
+  // ===== Events =====
+  async function refreshEvents(){
+    const API = (localStorage.getItem('ADMIN_API') || '').replace(/\/+$/,'');
+    if (!API) return;
+    const type = (document.getElementById('events-type')?.value || '').trim();
+    const user = (document.getElementById('events-user')?.value || '').trim();
+    // шлём и type, и event_type — совместимо с любым бэком
+    const qs = new URLSearchParams({ take:'50', skip:'0', type, event_type:type, user_id:user });
+    try{
+      const r = await fetch(API + '/api/admin/events?' + qs.toString(), { headers: window.adminHeaders ? window.adminHeaders() : {}, cache:'no-store' });
+      const j = await r.json().catch(()=>({}));
+      const rows = Array.isArray(j.events) ? j.events : (Array.isArray(j.rows) ? j.rows : []);
+      const tbody = document.getElementById('events-tbody');
+      if (!tbody) return;
+
+      tbody.innerHTML = rows.map(e => `
+        <tr>
+          <td>${e.id ?? e.event_id ?? ''}</td>
+          <td>${e.HUMid ?? e.hum_id ?? ''}</td>
+          <td>${e.user_id ?? ''}</td>
+          <td>${e.event_type ?? ''}</td>
+          <td>${e.type ?? e.event_type ?? ''}</td>
+          <td>${e.ip ?? ''}</td>
+          <td class="muted">${(e.ua || '').slice(0,64)}</td>
+          <td>${toMSK(e.created_at)}</td>
+        </tr>
+      `).join('') || `<tr><td colspan="8" class="muted">Нет событий</td></tr>`;
+    }catch(e){
+      console.error(e);
+      const tbody = document.getElementById('events-tbody');
+      if (tbody) tbody.innerHTML = `<tr><td colspan="8" class="muted">Ошибка загрузки</td></tr>`;
+    }
+  }
+
+  // Wire UI
+  document.getElementById('users-refresh')?.addEventListener('click', refreshUsers);
+  document.getElementById('events-refresh')?.addEventListener('click', refreshEvents);
+  document.getElementById('merge-suggest-run')?.addEventListener('click', async () => {
+    const API = (localStorage.getItem('ADMIN_API') || '').replace(/\/+$/,'');
+    if (!API) return;
+    await fetch(API + '/api/admin/users/merge/suggestions', { headers: window.adminHeaders ? window.adminHeaders() : {}, cache:'no-store' })
+      .then(r=>r.json()).catch(()=>({}));
+    alert('OK');
+  });
+
+  document.getElementById('topup-run')?.addEventListener('click', async () => {
+    const id = document.getElementById('topup-user-id')?.value.trim();
+    const amount = document.getElementById('topup-amount')?.value.trim();
+    const API = (localStorage.getItem('ADMIN_API') || '').replace(/\/+$/,'');
+    if (!API || !id) return;
+    const r = await fetch(API + '/api/admin/users/' + id + '/topup', {
+      method:'POST',
+      headers: Object.assign({'Content-Type':'application/json'}, (window.adminHeaders?window.adminHeaders():{})),
+      body: JSON.stringify({ amount: Number(amount)||0 })
+    });
+    const j = await r.json().catch(()=>({}));
+    alert(j && j.ok ? 'OK' : 'Ошибка');
+    refreshUsers();
+  });
+
+  // Автозагрузка при входе
+  refreshSummary();
+  refreshUsers();
+  refreshEvents();
+})();
+  </script>
+  <script>
+// добавляет ссылку рядом с "Пополнить вручную"
+(function(){
+  function $(s){ return document.querySelector(s); }
+  function inject(){
+    const btn = $('#btnManualTopup') || document.getElementById('btnTopup') || document.querySelector('[data-action="manual-topup"]');
+    if (!btn || btn.dataset._linked) return;
+    const a = document.createElement('a');
+    a.href = '/admin/topup.html';
+    a.target = '_blank';
+    a.textContent = 'Перейти на страницу';
+    a.style.marginLeft = '8px';
+    a.style.background = '#0f1730';
+    a.style.color = '#8ecbff';
+    a.style.padding = '8px 12px';
+    a.style.border = '1px solid #2a3a57';
+    a.style.borderRadius = '10px';
+    a.style.textDecoration = 'none';
+    btn.after(a);
+    btn.dataset._linked = '1';
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', inject); else inject();
+})();
+</script>
+  <script src="/admin/admin-topup-patch.js"></script>
+  <script src="/admin/open-topup-link.js"></script>
+</body>
+</html>

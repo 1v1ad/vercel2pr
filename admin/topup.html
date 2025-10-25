@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="api-base" content="https://vercel2pr.onrender.com"/>
+  <title>Ручное пополнение</title>
+
+  <!-- те же favicons, что и в админке -->
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32.png">
+  <link rel="shortcut icon" href="/assets/favicon.ico">
+  <link rel="apple-touch-icon" sizes="180x180" href="/assets/apple-touch-icon.png">
+  <link rel="manifest" href="/assets/site.webmanifest">
+
+  <style>
+    body{font-family:Inter,system-ui,Arial,sans-serif;background:#0b1024;color:#e8f0ff;margin:0;padding:24px}
+    .wrap{max-width:1040px;margin:0 auto;display:grid;gap:24px}
+    .card{background:#121c2e;border:1px solid #23324a;border-radius:16px;padding:20px}
+    .row{display:flex;gap:12px;margin-bottom:12px}
+    label{width:120px;opacity:.8}
+    input,textarea{flex:1;background:#0c1426;color:#e8f0ff;border:1px solid #2a3a57;border-radius:10px;padding:10px}
+    button{background:#2b79ff;border:0;color:white;padding:10px 16px;border-radius:12px;font-weight:700;cursor:pointer}
+    .btn-flat{background:#1f2a44}
+    .log{margin-top:12px;font-size:13px;opacity:.9;white-space:pre-wrap}
+    table{width:100%;border-collapse:separate;border-spacing:0;border:1px solid #23324a;border-radius:14px;overflow:hidden}
+    th,td{padding:10px 12px;border-bottom:1px solid #1d2a40;font-size:14px}
+    th{background:#0f1730;color:#9fb4d9;text-align:left;cursor:pointer;user-select:none}
+    tr:nth-child(even) td{background:#0b1327}
+    .muted{opacity:.75}
+    .pill{display:inline-block;min-width:54px;text-align:center;padding:2px 10px;border-radius:999px;font-weight:700}
+    .pill.pos{background:#1f8a4c;color:#eafff3}
+    .pill.neg{background:#b83b3b;color:#ffecec}
+    .pill.zero{background:#263248;color:#b9c6e3}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h2>Ручное пополнение</h2>
+      <div class="row"><label>API</label><input id="api" placeholder="https://vercel2pr.onrender.com"></div>
+      <div class="row"><label>Пароль</label><input id="pwd" type="password" placeholder="X-Admin-Password"></div>
+      <div class="row"><label>User ID</label><input id="uid" type="number" placeholder="внутренний id (например, 97)"></div>
+      <div class="row"><label>Сумма</label><input id="amt" type="number" placeholder="рубли"></div>
+      <div class="row"><label>Комментарий</label><textarea id="cmt" rows="3" placeholder="обязательно"></textarea></div>
+      <div class="row" style="justify-content:flex-end;gap:8px">
+        <button id="save" class="btn-flat">Сохранить</button>
+        <button id="go">Пополнить</button>
+        <button id="reload" class="btn-flat">Обновить историю</button>
+      </div>
+      <div class="log" id="log"></div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 12px">История ручных пополнений</h3>
+      <div class="muted" style="margin:-6px 0 10px">Показываем последние 100 событий типа <code>admin_topup</code>. Клик по заголовку сортирует.</div>
+      <table id="tbl">
+        <thead>
+          <tr>
+            <th data-k="created_at">Время</th>
+            <th data-k="admin">Админ</th>
+            <th data-k="user">Кому (user_id / HUMid)</th>
+            <th data-k="amount">Сумма</th>
+            <th data-k="comment">Комментарий</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td colspan="5" class="muted">Загрузка…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+  // ---------- utils
+  const $ = (s)=>document.querySelector(s);
+  const log = (s)=>{ $('#log').textContent = String(s||''); };
+  const fmt = (ts)=>{ try{ return new Date(ts).toLocaleString(); }catch{ return ts||''; } };
+  const pick = (obj, arr, d)=>{ for (const k of arr) if (obj && obj[k]!=null && obj[k]!=='' ) return obj[k]; return d; };
+
+  // ---------- storage
+  function loadDefaults(){
+    try{
+      const api = localStorage.getItem('ADMIN_API') || localStorage.getItem('admin_api');
+      const pwd = localStorage.getItem('ADMIN_PWD') || localStorage.getItem('admin_pwd');
+      if (api) $('#api').value = api;
+      if (pwd) $('#pwd').value = pwd;
+    }catch{}
+    const q = new URLSearchParams(location.search);
+    if (q.get('api')) $('#api').value = q.get('api');
+    if (q.get('pwd')) $('#pwd').value = q.get('pwd');
+    if (q.get('user_id')) $('#uid').value = q.get('user_id');
+  }
+  function saveDefaults(){
+    const api = ($('#api').value||'').trim();
+    const pwd = ($('#pwd').value||'').trim();
+    try{
+      if (api) { localStorage.setItem('ADMIN_API', api); localStorage.setItem('admin_api', api); }
+      if (pwd) { localStorage.setItem('ADMIN_PWD', pwd); localStorage.setItem('admin_pwd', pwd); }
+    }catch{}
+  }
+  loadDefaults();
+
+  function apiBase(){
+    const v = ($('#api')?.value||'').trim();
+    if (v) return v;
+    const mt=document.querySelector('meta[name="api-base"]'); 
+    return (mt&&mt.content) ? mt.content : 'https://vercel2pr.onrender.com';
+  }
+  function adminPwd(){
+    return ($('#pwd')?.value||'').trim();
+  }
+
+  async function post(url, body, pwd){
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type':'application/json', 'X-Admin-Password': pwd },
+      body: JSON.stringify(body||{})
+    });
+    let data={}; try{ data = await r.json(); }catch{}
+    return {r, data};
+  }
+
+  // ---------- actions
+  $('#save').addEventListener('click', ()=>{ saveDefaults(); log('Сохранено.'); });
+
+  $('#go').addEventListener('click', async ()=>{
+    const API = apiBase(), pwd = adminPwd();
+    const uid = Number(($('#uid')?.value||'').trim());
+    const amt = Number(($('#amt')?.value||'').trim());
+    const cmt = ($('#cmt')?.value||'').trim();
+
+    if(!API || !pwd || !uid || !Number.isFinite(amt) || !cmt){
+      log('Заполни API, пароль, user_id, сумму и комментарий.'); return;
+    }
+
+    const payload = {
+      user_id: uid,
+      amount: amt,
+      comment: cmt,
+      // дублируем на случай разных серверов
+      value: amt, sum: amt, delta: amt,
+      note: cmt, reason: cmt, description: cmt
+    };
+
+    // сначала пробуем «новый» эндпоинт
+    let {r, data} = await post(`${API}/api/admin/users/${uid}/topup`, payload, pwd);
+    if (r.status === 404) { // совместимость со старым
+      ({r, data} = await post(`${API}/api/admin/topup`, payload, pwd));
+    }
+
+    if (!r.ok || data?.ok===false) {
+      log(`Ошибка: ${data?.error || r.statusText || ('HTTP '+r.status)}`);
+      return;
+    }
+
+    log('Готово: ' + JSON.stringify(data));
+    try{ $('#amt').value=''; $('#cmt').value=''; }catch{}
+    loadHistory().catch(()=>{});
+  });
+
+  // ---------- history (всегда нормализуем amount/comment/HUMid)
+  async function fetchHistory(){
+    const API = apiBase(), pwd = adminPwd();
+    // оставляем один запрос; пароль только в заголовке
+    const r = await fetch(`${API}/api/admin/events?type=admin_topup&take=100&skip=0`, {
+      headers: { 'X-Admin-Password': pwd }
+    });
+    let data={}; try{ data = await r.json(); }catch{}
+    return {r, data};
+  }
+
+  let sortKey = 'created_at', sortDir = -1;
+  function renderHistory(list){
+    const tbody = $('#tbl tbody');
+    tbody.innerHTML = '';
+    if (!Array.isArray(list) || !list.length){
+      tbody.innerHTML = '<tr><td class="muted" colspan="5">Нет событий…</td></tr>'; return;
+    }
+
+    // нормализация полей
+    const rows = list.map(ev=>{
+      const p = ev.payload || {};
+      const created_at = pick(ev, ['created_at','ts','time'], pick(p, ['created_at','ts','time'], ''));
+      const admin      = pick(ev, ['admin','admin_id','actor'], pick(p, ['admin','admin_id','actor'], '—'));
+      const user_id    = pick(ev, ['user_id'], pick(p, ['user_id'], '—'));
+      const hum_id     = pick(ev, ['HUMid','hum_id'], pick(p, ['HUMid','hum_id'], '—'));
+      const amountRaw  = pick(ev, ['amount'], pick(p, ['amount','value','sum','delta'], 0));
+      const amount     = Number(amountRaw)||0;
+      const comment    = String(pick(ev, ['comment'], pick(p, ['comment','note','reason','description'], ''))||'');
+      return { created_at, admin, user_id, hum_id, amount, comment };
+    });
+
+    rows.sort((a,b)=>{
+      const ak = a[sortKey], bk = b[sortKey];
+      if (sortKey==='created_at') return (new Date(ak)-new Date(bk))*sortDir;
+      if (sortKey==='amount') return (a.amount-b.amount)*sortDir;
+      if (sortKey==='user') return ((a.user_id||0)-(b.user_id||0))*sortDir;
+      return String(ak).localeCompare(String(bk))*sortDir;
+    });
+
+    for (const r of rows){
+      const cls = r.amount>0 ? 'pill pos' : (r.amount<0 ? 'pill neg' : 'pill zero');
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="muted">${fmt(r.created_at)}</td>
+        <td>${r.admin || '—'}</td>
+        <td>${r.user_id} / ${r.hum_id}</td>
+        <td><span class="pill ${cls}">${r.amount>0?'+':''}${r.amount}</span></td>
+        <td>${r.comment ? r.comment.replace(/[<>]/g, s => s==='<'?'&lt;':'&gt;') : '—'}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+  }
+
+  async function loadHistory(){
+    const {r, data} = await fetchHistory();
+    if (r.status===401) { log('401: проверь «Пароль» и нажми «Обновить историю».'); }
+    const list = data?.events || data?.rows || data?.list || [];
+    renderHistory(list);
+  }
+
+  $('#reload').addEventListener('click', ()=> loadHistory().catch(e=>log('Ошибка истории: '+e)));
+
+  // сортировка
+  document.querySelectorAll('#tbl th[data-k]').forEach(th=>{
+    th.addEventListener('click', ()=>{
+      const k = th.getAttribute('data-k');
+      sortDir = (sortKey===k) ? -sortDir : -1;
+      sortKey = (k==='user' ? 'user' : (k==='amount' ? 'amount' : k));
+      loadHistory();
+    });
+  });
+
+  loadHistory().catch(()=>{});
+</script>
+</body>
+</html>

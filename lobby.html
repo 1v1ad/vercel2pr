@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Бэкенд и ID бота -->
+  <meta name="api-base" content="https://vercel2pr.onrender.com">
+  <meta name="tg-bot-id" content="8236271394">
+
+  <title>GG ROOM — Лобби</title>
+
+  <!-- FAVICONS -->
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/assets/favicon-16.png">
+  <link rel="shortcut icon" href="/assets/favicon.ico">
+  <link rel="apple-touch-icon" sizes="180x180" href="/assets/apple-touch-icon.png">
+  <link rel="manifest" href="/assets/site.webmanifest">
+
+  <style>
+    :root{ --bg:#0b0d12; --card:#0f1219; --text:#e8eaf0; --muted:#98a2b3; --gold:#f4d88a; --border:rgba(255,255,255,.08); }
+    *{box-sizing:border-box}
+    body{ margin:0; background:#0b0d12; color:var(--text); font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; }
+
+    .hdr{
+      display:grid; grid-template-columns:auto 1fr auto; grid-template-areas:
+      "back brand cta" "user user user";
+      align-items:center; gap:12px; padding:14px 16px;
+      border-bottom:1px solid var(--border);
+      background:linear-gradient(180deg,#0f131b,#0b0d12);
+    }
+    .hdr .btn{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:8px 12px; border-radius:10px;
+      border:1px solid var(--border);
+      background:#121621; color:#e8eaf0; text-decoration:none; white-space:nowrap;
+      cursor:pointer;
+    }
+    .hdr-back{ grid-area:back; }
+    .hdr-cta{ grid-area:cta; }
+    .hdr .brand{ grid-area:brand; font-weight:800; color:var(--gold); text-align:center; }
+    .hdr .brand .gg{ background:linear-gradient(90deg,#ff3b3b,#23d160); -webkit-background-clip:text; background-clip:text; color:transparent; }
+
+    .hdr-user{ grid-area:user; display:flex; align-items:center; gap:10px; min-height:44px; }
+    .hdr-user img{ width:40px; height:40px; border-radius:50%; object-fit:cover; background:#222; }
+    .hdr-user #user-name{ font-weight:700; }
+    .pill{ display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; background:#121621; border:1px solid var(--border); color:#e8eaf0; font-weight:700 }
+
+    @media (max-width:480px){
+      .hdr{ gap:10px; padding:12px }
+      .hdr .brand{ font-size:clamp(16px,5vw,18px) }
+      .hdr .btn{ padding:6px 10px; font-size:14px }
+      .hdr-user img{ width:36px; height:36px }
+      .pill{ padding:6px 10px; font-size:14px }
+    }
+    @media (max-width:360px){ .hdr .btn .label{ display:none } }
+
+    .wrap{ max-width:980px; margin:0 auto; padding:20px 16px }
+    .card{ background:var(--card); border:1px solid var(--border); border-radius:16px; padding:16px }
+
+    /* бренд-вид кнопок рядом с балансом */
+    .hdr-user .btn.vk { background:#2787F5; border-color:#2787F5; color:#fff; }
+    .hdr-user .btn.tg { background:#229ED9; border-color:#229ED9; color:#fff; }
+    .hdr-user .btn.vk:hover, .hdr-user .btn.tg:hover { filter:brightness(1.05); }
+
+    /* на всякий случай вырубаем старый блок линковок, если где-то остался */
+    #link-actions{ display:none !important; }
+  </style>
+</head>
+<body>
+  <header class="hdr">
+    <a class="btn hdr-back" href="/index.html"><span aria-hidden="true">←</span> <span class="label">На главную</span></a>
+    <div class="brand"><span class="gg">GG</span> ROOM — Лобби</div>
+
+    <a class="btn hdr-cta" href="#" id="topup-btn" title="Пополнить баланс">
+      <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 7h-2V6a2 2 0 0 0-2-2H6a3 3 0 0 0-3 3v10a3 3 0 0 0 3 3h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2Zm-4-1v1H6a1 1 0 0 1 0-2h8a1 1 0 0 1 1 1Zm4 11H6a1 1 0 0 1-1-1V9h15v8a1 1 0 0 1-1 1Zm-3-6.5a1.5 1.5 0 1 0 0 3h2v-3h-2Z"/></svg>
+      <span class="label">Пополнить</span>
+    </a>
+
+    <div class="hdr-user">
+      <img id="user-avatar" src="" alt="Аватар" />
+      <div id="user-name">Гость</div>
+      <span id="user-balance" class="pill">₿ <span class="balance-amount" data-balance>0</span></span>
+
+      <!-- единственные живые кнопки линковки -->
+      <button id="link-tg" class="btn" style="display:none">Связать Telegram</button>
+      <button id="link-vk" class="btn" style="display:none">Связать ВКонтакте</button>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <div class="card">
+  <p>Добро пожаловать в лобби.</p>
+  <p id="provider-note" style="color:var(--muted)"></p>
+</div>
+  </div>
+
+  <!-- Telegram Login (асинхронно) -->
+  <script async src="https://telegram.org/js/telegram-widget.js?22"></script>
+
+  <!-- Весь JS — в одном файле. Он тянет HUM-баланс, делает proof-link и меняет кнопку на «… связан». -->
+  <script src="/js/lobby-balance-fix.js"></script>
+</body>
+</html>

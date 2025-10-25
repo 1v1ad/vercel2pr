@@ -1,30 +1,31 @@
-GGRoom backend (Auth + Admin + Health) — готов к Render
+GG ROOM static bundle
+======================
 
-Файлы:
-- server.js
-- src/routes/auth.js  — VK PKCE S256 (устойчиво к «сну» Render)
-- src/routes/admin.js — summary/users/events
-- src/middleware/admin.js
-- src/routes/health.js
-- package.json
+Куда класть
+-----------
+Файлы предполагают, что Netlify/хостинг отдает корень репозитория как `/`.
+Пути в HTML — **абсолютные** (`/js/app.js`, `/js/vk-logo.svg`, `/js/prize-chest-700w.webp`).
 
-ENV (Render → Environment):
-FRONTEND_URL=https://sweet-twilight-63a9b6.netlify.app
-FEATURE_ADMIN=true
-ADMIN_PASSWORD=<пароль>
-# один из двух точно должен быть (можно оба):
-JWT_SECRET=<длинная строка>
-# COOKIE_SECRET=<необязателен, если есть JWT_SECRET>
-VK_CLIENT_ID=54008517
-VK_CLIENT_SECRET=<из VK>
-VK_REDIRECT_URI=https://vercel2pr.onrender.com/api/auth/vk/callback
-PORT=30014
+Если у тебя Publish directory = `public`, перенеси ВСЁ содержимое архива внутрь `public/`.
+Абсолютные пути продолжат работать.
 
-Build/Start command (Render):
-- Build:  npm ci
-- Start:  node server.js
+Что внутри
+----------
+- index.html — экран входа. VK-кнопка и Telegram-виджет. Скрипт `/js/app.js`.
+- lobby.html — простое лобби, читает пользователя из `localStorage`.
+- js/app.js — логика авторизации:
+  - дергает `${BACKEND_URL}/api/auth/vk/start`
+  - обрабатывает `?vk=ok|error`
+  - `onTelegramAuth(user)` шлет на `${BACKEND_URL}/api/auth/telegram`
+- js/vk-logo.svg — иконка VK
+- js/prize-chest-700w.webp — картинка сундука (заглушка)
 
-Проверка:
-1) GET /api/health → ok:true
-2) GET /api/auth/vk/start → открывается VK без ошибки code_challenge
-3) GET /api/admin/summary c X-Admin-Password → 200 JSON
+Настройки
+---------
+По умолчанию BACKEND_URL выбирается автоматически.
+- Для домена `*.netlify.app` — `https://vercel2pr.onrender.com`
+- Иначе — текущий домен.
+
+Чтобы задать вручную, добавь в `<head>` index.html:
+  <script>window.BACKEND_URL="https://vercel2pr.onrender.com"</script>
+

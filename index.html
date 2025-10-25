@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GG Room</title>
+
+  <!-- FAVICONS -->
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/assets/favicon-16.png">
+  <link rel="shortcut icon" href="/assets/favicon.ico">
+  <link rel="apple-touch-icon" sizes="180x180" href="/assets/apple-touch-icon.png">
+  <link rel="manifest" href="/assets/site.webmanifest">
+
+  <style>
+    :root{
+      --bg:#0b0d12; --bg2:#11151d; --card:#000000; --text:#e8eaf0; --muted:#98a2b3;
+      --vk:#2787F5; --tg:#2AABEE; --gold:#f4d88a; --gold-strong:#ffd76a;
+      --border:rgba(255,255,255,.06); --radius:18px;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;
+      background:radial-gradient(1200px 600px at 50% -10%, #171b24 0%, #0b0d12 55%, #090b10 100%);
+      color:var(--text);
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      display:flex; flex-direction:column;
+    }
+    header{display:flex; justify-content:center; padding:14px 16px; border-bottom:1px solid var(--border)}
+    header b{ font-size: 1.25rem; letter-spacing:.4px; font-weight:800 }
+    header b .gg{ background: linear-gradient(90deg,#ff3b3b,#23d160); -webkit-background-clip:text; background-clip:text; color:transparent; }
+    .wrap{flex:1; display:grid; place-items:center; padding:20px 16px 40px;}
+    .card{ overflow:hidden; width:min(520px,100%); background:var(--card);
+      border-radius:var(--radius); padding:28px 24px;
+      border:1px solid rgba(247,228,164,.35); position:relative;
+      box-shadow:0 10px 40px rgba(0,0,0,.5), inset 0 0 0 1px rgba(255,255,255,.02); }
+    .card::before{
+      content:""; position:absolute; inset:0; border-radius:calc(var(--radius) + 0px);
+      --borderw:1px; padding:var(--borderw);
+      background:linear-gradient(135deg, rgba(247,228,164,.8), rgba(247,228,164,.35) 45%, rgba(247,228,164,.6));
+      -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+      -webkit-mask-composite:xor; mask-composite:exclude; pointer-events:none;
+    }
+    h1{margin:0 0 36px; font-size:26px; line-height:1.2; font-weight:800; color:var(--gold); text-align:center}
+    .auth{ display:flex; flex-direction:column; gap:12px; align-items:center; }
+    .btn{ width:100%; border:0; border-radius:999px; padding:14px 18px; font-size:16px; font-weight:700; cursor:pointer; display:flex; align-items:center; gap:12px; justify-content:flex-start; }
+    .btn__icon{width:24px; height:24px; flex:0 0 24px; display:inline-block}
+    .btn.vk{background:var(--vk); color:#fff; box-shadow:0 8px 24px rgba(39,135,245,.25)}
+    .btn.vk{ height:40px; padding:0 16px; width:auto; margin:0 auto; font-size:14px; line-height:40px; align-items:center; justify-content:center; gap:10px; }
+    .btn.vk .vk-icon{ width:40px; height:40px; display:inline-grid; place-items:center; border-radius:8px; }
+    .btn.vk .vk-icon img{ width:30px; height:30px; filter:brightness(0) invert(1); }
+    .btn.vk .vk-text{white-space:nowrap}
+    .tg-auth{ display:flex; align-items:center; justify-content:center; min-height:52px; width:100%; }
+    .tg-auth iframe{display:block; margin:0 auto !important;}
+    .btn.tg{background:var(--tg); color:#fff; box-shadow:0 8px 24px rgba(42,171,238,.25); display:none; width:auto; margin:0 auto;}
+    .status{margin-top:8px; color:var(--muted); min-height:1.2em; text-align:center}
+    .badges{margin-top:16px; display:flex; gap:10px; flex-wrap:wrap; justify-content:center}
+    .badge{border:1px solid rgba(247,228,164,.35); color:var(--gold); background:rgba(247,228,164,.06); padding:6px 10px; border-radius:999px; font-size:12px}
+    @media (max-width:480px){ h1{font-size:18px} .badge{font-size:11px; padding:6px 8px} }
+    .card-media{ margin:16px -24px -28px; border-bottom-left-radius:var(--radius); border-bottom-right-radius:var(--radius); overflow:hidden }
+    .card-media picture, .card-media img{ display:block; width:100%; height:auto; object-fit:contain; }
+    @media (max-width:480px){ .card::before{ --borderw:2px } .card-media{ margin:14px -16px -24px } }
+  </style>
+<style>
+/* === mask full 2025-10-25_20-17-52: all-sides soft fade + symmetric spacing === */
+  .card .card-media{ margin:20px 0 20px !important; }
+  .card .card-media img.fade-sides{
+    -webkit-mask-image: radial-gradient(ellipse at center, black 82%, rgba(0,0,0,0) 100%);
+    mask-image: radial-gradient(ellipse at center, black 82%, transparent 100%);
+  }
+  @media (max-width:480px){
+    .card .card-media{ margin:16px 0 16px !important; }
+  }
+</style>
+</head>
+<body>
+  <header><b><span class="gg">GG</span> ROOM</b></header>
+
+  <main class="wrap">
+    <section class="card" id="hero-mask">
+  <h1>Авторизация</h1>
+  <div class="auth">
+        <!-- VK -->
+        <button class="btn vk" id="vk-login">
+          <span class="vk-icon"><img src="assets/vk-logo.svg" alt="VK"></span>
+          <span class="vk-text">Войти через VK ID</span>
+        </button>
+
+        <!-- Telegram -->
+        <div id="tg-auth" class="tg-auth"></div>
+  <p class="status" id="status"></p>
+  <div class="badges"><div class="badge">Bitcoin</div><div class="badge">Ethereum</div><div class="badge">Solana</div></div>
+  <div class="card-media">
+    <img class="fade-sides" src="assets/Bitcoin2.webp?v=2025-10-25_20-17-52" alt="Bitcoin" loading="lazy" decoding="async" style="display:block;width:100%;height:auto;object-fit:contain" />
+  </div>
+</section>
+  </main>
+
+  <script>
+    const API = 'https://vercel2pr.onrender.com';
+    const TG_BOT_ID = 8236271394;
+
+    document.getElementById('vk-login').onclick = () => {
+      window.location.href = API + '/api/auth/vk/start';
+    };
+
+    async function warmAndMountTg() {
+      try { await fetch(API + '/health', { cache: 'no-store' }); } catch {}
+      setTimeout(() => {
+        if (document.getElementById('tg-widget')) return;
+        const s = document.createElement('script');
+        s.id = 'tg-widget'; s.async = true;
+        s.src = 'https://telegram.org/js/telegram-widget.js?22';
+        s.setAttribute('data-telegram-login', 'GGR00m_bot');
+        s.setAttribute('data-size', 'large');
+        s.setAttribute('data-userpic', 'false');
+        s.setAttribute('data-request-access', 'write');
+
+        function ensureDeviceId(){
+          try{
+            let id = localStorage.getItem('device_id');
+            if(!id){
+              const a = new Uint8Array(16);
+              (crypto.getRandomValues||crypto.randomFillSync).call(crypto,a);
+              id = Array.from(a).map(x=>x.toString(16).padStart(2,'0')).join('');
+              localStorage.setItem('device_id', id);
+            }
+            document.cookie = 'device_id='+id+'; Path=/; Max-Age='+(60*60*24*365)+'; SameSite=Lax';
+            return id;
+          }catch(e){
+            const id=(Date.now().toString(16)+Math.random().toString(16).slice(2)).slice(0,32);
+            try{localStorage.setItem('device_id', id);}catch{}
+            document.cookie = 'device_id='+id+'; Path=/; Max-Age='+(60*60*24*365)+'; SameSite=Lax';
+            return id;
+          }
+        }
+        const did = ensureDeviceId();
+        s.setAttribute('data-auth-url', API + '/api/auth/tg/callback?device_id=' + encodeURIComponent(did));
+
+        const mount = document.getElementById('tg-auth');
+        if (mount) mount.appendChild(s);
+        setTimeout(() => {
+          const hasIframe = !!mount?.querySelector('iframe');
+          if (!hasIframe) document.getElementById('tg-fallback').style.display = 'flex';
+        }, 1200);
+      }, 200);
+    }
+    warmAndMountTg();
+
+    document.getElementById('tg-fallback').addEventListener('click', (e) => {
+      e.preventDefault();
+      const origin = window.location.origin;
+      const url = 'https://oauth.telegram.org/auth'
+        + '?bot_id=' + TG_BOT_ID
+        + '&origin=' + encodeURIComponent(origin)
+        + '&embed=1'
+        + '&request_access=write'
+        + '&return_to=' + encodeURIComponent(origin + '/');
+      window.open(url, '_blank', 'noopener');
+    });
+
+    (function handleLoggedRedirect(){
+      const params = new URLSearchParams(location.search);
+      if (params.get('logged') === '1') {
+        const st = document.getElementById('status');
+        if (st) st.textContent = 'Готово: авторизован. Переходим в лобби...';
+        setTimeout(() => { window.location.href = '/lobby.html' + location.search; }, 400);
+      }
+    })();
+  </script>
+
+  <!-- фон-склейка (без изменений) и подпитка /api/me — оставляй как у тебя -->
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const h1 = document.querySelector('section.card h1');
+  if (!h1) return;
+  if (h1.textContent && h1.textContent.includes('Войдите и начните выигрывать')) {
+    h1.textContent = 'Авторизация';
+    const badges = document.querySelector('.badges');
+    if (badges) badges.innerHTML = '<div class="badge">Bitcoin</div><div class="badge">Ethereum</div><div class="badge">Solana</div>';
+    const img = document.querySelector('.card-media img');
+    if (img) { img.src = 'assets/Bitcoin2.webp?v=mask1025'; img.classList.add('fade-sides'); }
+  }
+});
+</script>
+</body>
+</html>
