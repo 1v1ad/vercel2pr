@@ -5,6 +5,9 @@ import { db, logEvent } from './db.js';
 const router = express.Router();
 router.use(express.json());
 
+function toIsoDate(d, tz){ return new Date(d).toISOString().slice(0,10); }
+
+
 /* -------------------- admin auth -------------------- */
 router.use((req,res,next)=>{
   const need = String(process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD || '');
@@ -357,16 +360,129 @@ router.get('/daily', daily);
 router.get('/summary/daily', daily);
 
 /* -------------------- NEW: /api/admin/range -------------------- */
-router.get('/range', async (req, res) => {
-  try {
-    const tz = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
-    const fromStr = (req.query.from || '').toString().trim(); // 'YYYY-MM-DD' или ''
-    const toStr   = (req.query.to   || '').toString().trim();
 
-    // Если таблицы events нет — отдаём пусто
-    const haveEvents = await db.query("select to_regclass('public.events') as r");
-    if (!haveEvents.rows?.[0]?.r) {
-      return res.json({ ok:true, from:null, to:null, days:[] });
+router.get('/range', async (req,res) => {
+  try {
+    const tz   = String(req.query?.tz || 'Europe/Moscow');
+    const fromDate = String(req.query?.from || '').slice(0,10) || toIsoDate(new Date(Date.now()-6*864e5), tz);
+    const toDate   = String(req.query?.to   || '').slice(0,10) || toIsoDate(new Date(), tz);
+    const useAnalytics = String(req.query?.analytics || '0') === '1';
+
+    // Base SQL (as before) to get totals + canonical uniques by HUM
+    const sql = `
+      with params as (
+        select $1::text as tz, $2::date as d1, $3::date as d2
+      ),
+      d as (
+        select gs::date as day
+          from params, generate_series((params.d1 - interval '0 day')::timestamp,
+                                       (params.d2)::timestamp,
+                                       interval '1 day') gs
+      ),
+      login as (
+        select date_trunc('hour', (l.created_at at time zone 'UTC') at time zone (select tz from params)) as ts_msk,
+               l.user_id
+          from logins l
+         where l.created_at >= (select d1 from params)
+           and l.created_at <  ((select d2 from params) + interval '1 day')
+      ),
+      auth as (
+        select date_trunc('hour', (a.created_at at time zone 'UTC') at time zone (select tz from params)) as ts_msk,
+               a.user_id
+          from auth a
+         where a.created_at >= (select d1 from params)
+           and a.created_at <  ((select d2 from params) + interval '1 day')
+      ),
+      auth_orphan as (
+        select a.ts_msk, a.user_id
+          from auth a left join login l
+            on l.user_id = a.user_id and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
+         where l.user_id is null
+      ),
+      canon  as (select * from login union all select * from auth_orphan),
+      totals as ( select c.ts_msk::date d, count(*) c from canon c group by 1 ),
+      uniq   as ( select c.ts_msk::date d, count(distinct coalesce(u.hum_id,u.id)) c
+                   from canon c join users u on u.id=c.user_id group by 1 )
+      select to_char(d.day,'YYYY-MM-DD') as day,
+             coalesce(t.c,0)::int as auth_total,
+             coalesce(u.c,0)::int as auth_unique
+        from d
+        left join totals t on t.d=d.day
+        left join uniq   u on u.d=d.day
+       order by d.day asc
+    `;
+    const r = await db.query(sql, [tz, fromDate, toDate]);
+    const baseDays = (r.rows||[]).map(x => ({
+      day: x.day, auth_total: Number(x.auth_total||0), auth_unique: Number(x.auth_unique||0)
+    }));
+
+    if (!useAnalytics) {
+      return res.json({ ok:true, from: fromDate, to: toDate, days: baseDays });
+    }
+
+    // For analytics mode: fetch raw canon rows to recompute uniques with suggestion-based mapping
+    const rawSql = \`
+      with params as (
+        select $1::text as tz, $2::date as d1, $3::date as d2
+      ),
+      login as (
+        select date_trunc('hour', (l.created_at at time zone 'UTC') at time zone (select tz from params)) as ts_msk,
+               l.user_id
+          from logins l
+         where l.created_at >= (select d1 from params)
+           and l.created_at <  ((select d2 from params) + interval '1 day')
+      ),
+      auth as (
+        select date_trunc('hour', (a.created_at at time zone 'UTC') at time zone (select tz from params)) as ts_msk,
+               a.user_id
+          from auth a
+         where a.created_at >= (select d1 from params)
+           and a.created_at <  ((select d2 from params) + interval '1 day')
+      ),
+      auth_orphan as (
+        select a.ts_msk, a.user_id
+          from auth a left join login l
+            on l.user_id = a.user_id and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
+         where l.user_id is null
+      ),
+      canon  as (select * from login union all select * from auth_orphan)
+      select c.ts_msk::date as day, u.id as user_id, coalesce(u.hum_id,u.id) as base_id
+        from canon c join users u on u.id=c.user_id
+    \`;
+    const rr = await db.query(rawSql, [tz, fromDate, toDate]);
+    const rows = rr.rows || [];
+
+    // Build mapping from secondary -> primary using suggestions
+    const suggest = await (await import('./merge.js')).mergeSuggestions(1000);
+    const map = new Map();
+    for (const s of suggest) {
+      const p = Number(s.primary_id||0), d = Number(s.secondary_id||0);
+      if (p>0 && d>0 && p!==d) map.set(d, p);
+    }
+
+    // Aggregate uniques per day using effective_id
+    const uniqByDay = new Map(); // day -> Set(ids)
+    for (const r of rows) {
+      const day = String(r.day);
+      const base = Number(r.base_id||0);
+      const uid  = Number(r.user_id||0);
+      const eff  = map.get(uid) || base;
+      if (!uniqByDay.has(day)) uniqByDay.set(day, new Set());
+      uniqByDay.get(day).add(eff);
+    }
+
+    const daysOut = baseDays.map(d => ({
+      ...d,
+      auth_unique_analytics: (uniqByDay.get(d.day) || new Set()).size
+    }));
+
+    res.json({ ok:true, from: fromDate, to: toDate, days: daysOut });
+  } catch (e) {
+    console.error('admin /range error', e);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+});
+
     }
 
     // Вычисляем from/to
@@ -547,5 +663,19 @@ router.post('/merge_apply', async (req,res) => {
   }
 });
 /* --- END GGROOM UNMERGE PATCH --- */
+
+
+// ---- Aliases for legacy admin UI ----
+router.get('/users/merge/suggestions', async (req,res)=>{
+  // delegate to new endpoint
+  req.url = '/merge_suggestions' + (req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '');
+  return router.handle(req, res);
+});
+router.post('/users/merge', async (req,res)=>{
+  // delegate to new endpoint
+  const { primary_id, secondary_id } = req.body || {};
+  req.url = '/merge_apply';
+  return router.handle(req, res);
+});
 
 export default router;

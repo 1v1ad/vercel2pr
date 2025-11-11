@@ -154,7 +154,7 @@ app.use('/api/profile/link', profileLinkRoutes);
 app.use('/api/auth/tg', tgRouter);
 app.use('/api/auth', authRouter);
 app.use('/api', publicRoutes);
-app.use('/api', linkRouter);
+app.use('/api/link', linkRouter);
 
 // события
 app.post('/api/events', async (req, res) => {
