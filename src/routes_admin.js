@@ -483,7 +483,6 @@ router.get('/range', async (req,res) => {
   }
 });
 
-    }
 
     // Вычисляем from/to
     let fromDate = null;
