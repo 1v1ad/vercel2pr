@@ -444,4 +444,108 @@ router.get('/range', async (req, res) => {
   }
 });
 
+/* --- GGROOM UNMERGE & MERGE SUGGESTIONS --- */
+import { adminMergeUsersTx, mergeSuggestions } from './merge.js';
+
+// GET /api/admin/cluster?hum_id=123  -> composition of HUM cluster
+router.get('/cluster', async (req,res) => {
+  try {
+    const humId = Number(req.query?.hum_id || 0);
+    if (!Number.isFinite(humId) || humId <= 0) return res.status(400).json({ ok:false, error:'bad_hum_id' });
+    const sql = `
+      with a as (
+        select user_id, json_agg(json_build_object(
+          'id', id, 'provider', provider, 'provider_user_id', provider_user_id, 'updated_at', updated_at
+        ) order by id) as accounts
+        from auth_accounts
+        group by 1
+      )
+      select u.id, u.hum_id, u.first_name, u.last_name, u.avatar, u.country_code,
+             coalesce(u.balance,0)::numeric as balance,
+             coalesce(a.accounts, '[]'::json) as accounts
+        from users u
+        left join a on a.user_id = u.id
+       where coalesce(u.hum_id,u.id) = $1
+       order by u.id asc
+    `;
+    const r = await db.query(sql, [humId]);
+    res.json({ ok:true, hum_id: humId, users: r.rows || [] });
+  } catch (e) {
+    console.error('admin /cluster error', e);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+});
+
+// POST /api/admin/unmerge { hum_id, user_ids: [..], reason }
+router.post('/unmerge', async (req,res) => {
+  const humId = Number(req.body?.hum_id || 0);
+  const usersToDetach = Array.isArray(req.body?.user_ids) ? req.body.user_ids.map(Number).filter(x=>Number.isFinite(x) && x>0) : [];
+  const reason = (req.body?.reason || '').toString().slice(0, 200);
+  if (!Number.isFinite(humId) || humId <= 0 || usersToDetach.length === 0) {
+    return res.status(400).json({ ok:false, error:'bad_args' });
+  }
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    // only detach users that currently belong to this HUM
+    const { rows } = await client.query('select id from users where coalesce(hum_id,id)=$1 and id = any($2)', [humId, usersToDetach]);
+    const finalIds = rows.map(r=>Number(r.id));
+    for (const uid of finalIds) {
+      await client.query('update users set hum_id = id, updated_at = now() where id = $1', [uid]);
+      try {
+        await client.query("insert into events(event_type, user_id, hum_id, payload) values('admin_unmerge',$1,$1,$2)", [uid, JSON.stringify({ from_hum: humId, reason })]);
+      } catch(_){}
+    }
+    await client.query('COMMIT');
+    res.json({ ok:true, detached: finalIds });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('admin /unmerge error', e);
+    res.status(500).json({ ok:false, error:'server_error' });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/admin/merge_suggestions?limit=20
+router.get('/merge_suggestions', async (req,res) => {
+  try {
+    const limit = Math.max(1, Math.min(100, Number(req.query?.limit || 20)));
+    const rows = await mergeSuggestions(limit);
+    res.json({ ok:true, suggestions: rows });
+  } catch(e){
+    console.error('admin /merge_suggestions error', e);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+});
+
+// POST /api/admin/merge_apply { primary_id, secondary_id }
+router.post('/merge_apply', async (req,res) => {
+  const primaryId = Number(req.body?.primary_id || 0);
+  const secondaryId = Number(req.body?.secondary_id || 0);
+  if (!Number.isFinite(primaryId) || !Number.isFinite(secondaryId) || primaryId<=0 || secondaryId<=0 || primaryId===secondaryId) {
+    return res.status(400).json({ ok:false, error:'bad_args' });
+  }
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await adminMergeUsersTx(client, primaryId, secondaryId);
+    // align HUM
+    await client.query('update users set hum_id=$1, updated_at=now() where id=$2', [primaryId, secondaryId]);
+    try {
+      await client.query("insert into events(event_type, user_id, hum_id, payload) values('admin_merge',$1,$1,$2)", [primaryId, JSON.stringify({ secondary_id: secondaryId, method:'admin_apply' })]);
+    } catch(_){}
+    await client.query('COMMIT');
+    res.json({ ok:true, merged: { primary_id: primaryId, secondary_id: secondaryId } });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('admin /merge_apply error', e);
+    res.status(500).json({ ok:false, error:'server_error' });
+  } finally {
+    client.release();
+  }
+});
+/* --- END GGROOM UNMERGE PATCH --- */
+
 export default router;
