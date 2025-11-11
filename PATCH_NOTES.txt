@@ -1,1 +1,1 @@
-Fix /api/link/bind mount; add aliases for legacy merge endpoints; enhance /range?analytics=1 to return auth_unique_analytics.
+Hotfix: fix backticks in routes_admin.js: const rawSql uses backticks without escaping; also includes server.js with correct /api/link mount.

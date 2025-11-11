@@ -421,7 +421,7 @@ router.get('/range', async (req,res) => {
     }
 
     // For analytics mode: fetch raw canon rows to recompute uniques with suggestion-based mapping
-    const rawSql = \`
+    const rawSql = `
       with params as (
         select $1::text as tz, $2::date as d1, $3::date as d2
       ),
@@ -448,7 +448,7 @@ router.get('/range', async (req,res) => {
       canon  as (select * from login union all select * from auth_orphan)
       select c.ts_msk::date as day, u.id as user_id, coalesce(u.hum_id,u.id) as base_id
         from canon c join users u on u.id=c.user_id
-    \`;
+    `;
     const rr = await db.query(rawSql, [tz, fromDate, toDate]);
     const rows = rr.rows || [];
 
