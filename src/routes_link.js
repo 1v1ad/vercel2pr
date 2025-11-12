@@ -68,10 +68,10 @@ router.post('/link/background', async (req, res) => {
     }
 
     // 3) Пытаемся автосклеить
-    const merged = await autoMergeByDevice({
+    const merged = false /* autoMerge disabled temporarily */; /* await autoMergeByDevice({
       deviceId: device_id || null,
       tgId: provider === 'tg' ? provider_user_id : null
-    });
+    }); */
 
     res.json({ ok: true, merged });
   } catch (e) {

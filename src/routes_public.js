@@ -3,6 +3,18 @@ import express from 'express';
 import { db } from './db.js';
 
 const router = express.Router();
+// decode sid JWT (very light)
+function decodeSidCookie(req){
+  try{
+    const token = (req.cookies && req.cookies.sid) || '';
+    if (!token) return null;
+    const parts = token.split('.');
+    if (parts.length < 2) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
+    return payload; // { uid, ... }
+  }catch(_){ return null; }
+}
+
 
 // собрать «канонического» пользователя + HUM-баланс по внутреннему id
 async function fetchCanonicalByUserId(userId) {
@@ -81,6 +93,30 @@ router.get('/user/p/:provider/:pid', async (req, res) => {
     if (!data) return res.status(404).json({ ok:false, error:'not_found' });
     res.json(data);
   } catch (e) {
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+});
+
+
+// GET /me — current user + preferred provider account (vk first, then tg)
+router.get('/me', async (req,res) => {
+  try {
+    const sid = decodeSidCookie(req);
+    if (!sid || !sid.uid) return res.status(401).json({ ok:false, error:'no_session' });
+    const uid = Number(sid.uid);
+    const u = await db.query(`select id, coalesce(hum_id,id) as hum_id, first_name, last_name, avatar from users where id=$1`, [uid]);
+    if (!u.rows?.length) return res.status(404).json({ ok:false, error:'not_found' });
+
+    // try to find provider account(s)
+    const aa = await db.query(`select provider, provider_user_id from auth_accounts where user_id=$1 order by (provider='vk') desc`, [uid]);
+    let provider=null, pid=null;
+    if (aa.rows?.length){
+      provider = aa.rows[0].provider;
+      pid = aa.rows[0].provider_user_id;
+    }
+
+    res.json({ ok:true, user:{ id: uid, hum_id: u.rows[0].hum_id, provider, provider_user_id: pid, first_name: u.rows[0].first_name, last_name: u.rows[0].last_name, avatar: u.rows[0].avatar } });
+  } catch(e){
     res.status(500).json({ ok:false, error:'server_error' });
   }
 });
