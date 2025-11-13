@@ -4,15 +4,15 @@ import { db, logEvent } from './db.js';
 
 const router = express.Router();
 router.use(express.json());
+const adminGuard=(req,res,next)=>{const need=String(process.env.ADMIN_PASSWORD||process.env.ADMIN_PWD||'');const got=String(req.get('X-Admin-Password')||req.body?.pwd||req.query?.pwd||'');if(!need) return res.status(401).json({ok:false,error:'admin_password_not_set'});if(got!==need) return res.status(401).json({ok:false,error:'unauthorized'});next();};
 
-/* -------------------- admin auth -------------------- */
-const adminGuard = (req,res,next)=>{
-  const need = String(process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD || '');
-  const got  = String(req.get('X-Admin-Password') || req.body?.pwd || req.query?.pwd || '');
-  if (!need) return res.status(401).json({ ok:false, error:'admin_password_not_set' });
-  if (got !== need) return res.status(401).json({ ok:false, error:'unauthorized' });
-  next();
-};
+// helper: parse include_hum / cluster flags
+function wantHum(req){
+  const v = (req.query.include_hum ?? req.query.cluster ?? req.query.hum ?? '').toString().toLowerCase();
+  if (v === '1' || v === 'true' || v === 'yes') return true;
+  if (v === '0' || v === 'false' || v === 'no') return false;
+  return true; // default: include HUM
+}
 
 
 /* -------------------- admin auth -------------------- */
@@ -40,7 +40,7 @@ CASE
 END`;
 
 /* -------------------- users list -------------------- */
-router.get('/users', async (req,res)=>{ /* (без изменений) */ 
+router.get('/users', adminGuard, async (req,res)=>{ /* (без изменений) */ 
   try{
     const take = Math.max(1,Math.min(500,parseInt(req.query.take||'50',10)));
     const skip = Math.max(0,parseInt(req.query.skip||'0',10));
@@ -99,7 +99,7 @@ router.get('/users', async (req,res)=>{ /* (без изменений) */
 
 /* -------------------- admin_topup -------------------- */
 // POST /api/admin/users/:id/topup?mode=user|hum  body: { amount(≠0), comment }
-router.post('/users/:id/topup', async (req, res) => {
+router.post('/users/:id/topup', adminGuard, async (req, res) => {
   try {
     const userId = Number(req.params.id || 0);
     const amount = Math.trunc(Number(
@@ -155,7 +155,7 @@ router.post('/users/:id/topup', async (req, res) => {
 });
 
 /* -------------------- events / summary / daily -------------------- */
-router.get('/events', async (req,res)=>{ 
+router.get('/events', adminGuard, async (req,res)=>{ 
   try{
     const cols = await getCols('events');
     if (!cols.size) return res.json({ ok:true, events:[], rows:[] });
@@ -256,9 +256,10 @@ router.get('/events', async (req,res)=>{
 });
 
 /* -------------------- summary / daily -------------------- */
-router.get('/summary', async (req,res)=>{ 
+router.get('/summary', adminGuard, async (req,res)=>{ 
   try{
     const tz = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
+    const incl = wantHum(req);
 
     const u = await db.query('select count(*)::int as c from users');
     const users = u.rows?.[0]?.c ?? 0;
@@ -293,14 +294,14 @@ router.get('/summary', async (req,res)=>{
       canon as (select * from login union all select * from auth_orphan)
       select
         (select count(*)::int from canon c where c.ts_msk::date >= (select since from b)) as auth7_total,
-        (select count(distinct coalesce(u.hum_id,u.id))::int from canon c join users u on u.id=c.user_id
+        (select count(distinct CASE WHEN $2::boolean THEN coalesce(u.hum_id,u.id) ELSE u.id END)::int from canon c join users u on u.id=c.user_id
           where c.ts_msk::date >= (select since from b)) as auth7
     `;
-    const r = await db.query(sql, [tz]);
+    const r = await db.query(sql, [tz, incl]);
     const x = r.rows?.[0] || {};
 
     const rU = await db.query(
-      `select count(distinct coalesce(u.hum_id,u.id))::int as c
+      `select count(distinct CASE WHEN $2::boolean THEN coalesce(u.hum_id,u.id) ELSE u.id END)::int as c
          from events e join users u on u.id=e.user_id
         where (${tzExprN(1,'created_at','e')}) > (now() at time zone $1) - interval '7 days'`,
       [tz]
@@ -321,6 +322,7 @@ async function daily(req,res){
   try{
     const days = Math.max(1,Math.min(31,parseInt(req.query.days||'7',10)));
     const tz   = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
+    const incl = wantHum(req);
 
     const cols = await getCols('events');
     const typeExpr = cols.has('event_type') ? 'e.event_type::text'
@@ -348,7 +350,7 @@ async function daily(req,res){
       ),
       canon as (select * from login union all select * from auth_orphan),
       totals as ( select c.ts_msk::date d, count(*) c from canon c group by 1 ),
-      uniq   as ( select c.ts_msk::date d, count(distinct coalesce(u.hum_id,u.id)) c
+      uniq   as ( select c.ts_msk::date d, count(distinct CASE WHEN $3::boolean THEN coalesce(u.hum_id,u.id) ELSE u.id END) c
                   from canon c join users u on u.id=c.user_id group by 1 )
       select to_char(d.day,'YYYY-MM-DD') as day,
              coalesce(t.c,0) as auth_total,
@@ -358,18 +360,19 @@ async function daily(req,res){
         left join uniq   u on u.d=d.day
        order by d.day asc
     `;
-    const r = await db.query(sql, [tz, days]);
+    const r = await db.query(sql, [tz, days, incl]);
     const rows = (r.rows||[]).map(x=>({ date:x.day, auth_total:Number(x.auth_total||0), auth_unique:Number(x.auth_unique||0) }));
     res.json({ ok:true, days: rows });
   }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 }
-router.get('/daily', daily);
-router.get('/summary/daily', daily);
+router.get('/daily', adminGuard, daily);
+router.get('/summary/daily', adminGuard, daily);
 
 /* -------------------- NEW: /api/admin/range -------------------- */
-router.get('/range', async (req, res) => {
+router.get('/range', adminGuard, async (req, res) => {
   try {
     const tz = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
+    const incl = wantHum(req);
     const fromStr = (req.query.from || '').toString().trim(); // 'YYYY-MM-DD' или ''
     const toStr   = (req.query.to   || '').toString().trim();
 
@@ -433,7 +436,7 @@ router.get('/range', async (req, res) => {
       ),
       canon  as (select * from login union all select * from auth_orphan),
       totals as ( select c.ts_msk::date d, count(*) c from canon c group by 1 ),
-      uniq   as ( select c.ts_msk::date d, count(distinct coalesce(u.hum_id,u.id)) c
+      uniq   as ( select c.ts_msk::date d, count(distinct CASE WHEN $3::boolean THEN coalesce(u.hum_id,u.id) ELSE u.id END) c
                    from canon c join users u on u.id=c.user_id group by 1 )
       select to_char(d.day,'YYYY-MM-DD') as day,
              coalesce(t.c,0)::int as auth_total,
@@ -443,7 +446,7 @@ router.get('/range', async (req, res) => {
         left join uniq   u on u.d=d.day
        order by d.day asc
     `;
-    const r = await db.query(sql, [tz, fromDate, toDate]);
+    const r = await db.query(sql, [tz, fromDate, toDate, incl]);
     const rows = (r.rows||[]).map(x => ({
       day: x.day, auth_total: Number(x.auth_total||0), auth_unique: Number(x.auth_unique||0)
     }));
