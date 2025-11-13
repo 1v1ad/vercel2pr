@@ -142,7 +142,7 @@ app.get('/api/me', async (req, res) => {
 });
 
 // ---------------------- routers mount ----------------------
-app.use('/api', adminRoutes);          // админка (summary/users/events/range/…)
+app.use('/api/admin', adminRoutes);          // админка (summary/users/events/range/…)
 app.use('/api/profile/link', profileLinkRoutes);
 app.use('/api/auth/tg', tgRouter);
 app.use('/api/auth', authRouter);
