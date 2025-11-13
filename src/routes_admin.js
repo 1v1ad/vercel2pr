@@ -1,225 +1,344 @@
 // src/routes_admin.js
-// Админ-роуты GG ROOM: summary / daily / range / users / events
 import { Router } from 'express';
-import { db } from './db.js';
+import { db, logEvent } from './db.js';
 
-const router = Router();
+export const adminRouter = Router();
 
-/* ------- admin auth ------- */
-function isAdminOk(req) {
-  const v = req.headers['x-admin-password'] || req.headers['X-Admin-Password'];
-  const pwd = process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD || '';
-  return !!v && v === pwd;
+// ──────────────────────────────────────────────────────────────────────────────
+// helpers
+function int(v, d = 0) {
+  const n = Number.parseInt(v, 10);
+  return Number.isFinite(n) ? n : d;
 }
-function assertAdmin(req, res) {
-  if (!isAdminOk(req)) {
-    res.status(401).json({ ok: false, error: 'unauthorized' });
-    return false;
-  }
-  return true;
+function bool(v) {
+  if (typeof v === 'boolean') return v;
+  if (v == null) return false;
+  const s = String(v).toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes';
 }
+function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
 
-/* ------- helpers ------- */
-function iso(d) { return new Date(d).toISOString().slice(0,10); }
+// МСК-время как now()
+const NOW_MSK = `now() at time zone 'Europe/Moscow'`;
 
-/* ------- /api/admin/summary ------- */
-router.get('/summary', async (req, res) => {
+// обязательный заголовок для админки (простейшая защита)
+adminRouter.use((req, res, next) => {
+  // если нужен пароль — раскомментируй и установи ADM_PASS в окружении
+  const need = process.env.ADM_PASS;
+  if (!need) return next();
+  const got = req.get('X-Admin-Password') || '';
+  if (got !== need) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  next();
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// health
+adminRouter.get('/api/admin/health', async (_req, res) => {
   try {
-    if (!assertAdmin(req, res)) return;
+    await db.query('select 1');
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false });
+  }
+});
 
-    const users  = await db.query('select count(*)::int as c from users');
-    const events = await db.query('select count(*)::int as c from events');
-    const auth7d = await db.query(
-      `select count(*)::int as c
-         from events
-        where event_type='auth_success'
-          and created_at >= now() - interval '7 days'`
-    );
+// ──────────────────────────────────────────────────────────────────────────────
+// summary (карточки сверху): users / events / auth7_total / unique7
+adminRouter.get('/api/admin/summary', async (req, res) => {
+  try {
+    const [{ rows: [u] }, { rows: [e] }, { rows: [a7] }, { rows: [q7] }] = await Promise.all([
+      db.query(`select count(*)::int as users from users`),
+      db.query(`select count(*)::int as events from events`),
+      db.query(`
+        select count(*)::int as auth7_total
+        from events
+        where event_type = 'auth_success'
+          and created_at >= (${NOW_MSK}) - interval '7 days'
+      `),
+      db.query(`
+        select count(distinct coalesce(hum_id::text, user_id::text))::int as unique7
+        from events
+        where event_type = 'auth_success'
+          and created_at >= (${NOW_MSK}) - interval '7 days'
+      `),
+    ]);
 
-    res.json({
+    return res.json({
       ok: true,
-      users_total: users.rows[0]?.c ?? 0,
-      events_total: events.rows[0]?.c ?? 0,
-      auth_7d: auth7d.rows[0]?.c ?? 0,
+      users: u?.users ?? 0,
+      events: e?.events ?? 0,
+      auth7_total: a7?.auth7_total ?? 0,
+      unique7: q7?.unique7 ?? 0,
     });
-  } catch (e) {
-    console.error('admin/summary', e);
-    res.status(500).json({ ok:false, error:'server_error' });
+  } catch (err) {
+    console.error('summary:', err);
+    return res.status(500).json({ ok: false, error: 'summary_error' });
   }
 });
 
-/* ------- /api/admin/daily  (для admin/chart.js) ------- */
-router.get('/daily', async (req, res) => {
-  try {
-    if (!assertAdmin(req, res)) return;
+// ──────────────────────────────────────────────────────────────────────────────
+// users (таблица)
+// q: take, skip, search
+adminRouter.get('/api/admin/users', async (req, res) => {
+  const take = clamp(int(req.query.take, 25), 1, 200);
+  const skip = clamp(int(req.query.skip, 0), 0, 1000000);
+  const search = (req.query.search || '').toString().trim();
 
-    const days = Math.max(1, Math.min(400, parseInt(req.query.days || '7', 10)));
-
-    const sql = `
-      with days as (
-        select d::date as d
-        from generate_series((now()::date - ($1::int - 1) * interval '1 day'), now()::date, interval '1 day') as d
-      ),
-      ev as (
-        select created_at::date as d, hum_id
-          from events
-         where event_type='auth_success'
-           and created_at >= (now()::date - ($1::int - 1) * interval '1 day')
-      ),
-      agg as (
-        select d, count(*) as auth_total, count(distinct hum_id) as auth_unique
-          from ev
-         group by d
+  // Поиск: по имени/фамилии, по user_id / hum_id, по provider_user_id (vk/tg и т.д.)
+  const params = [];
+  let where = 'true';
+  if (search) {
+    params.push(search, `%${search}%`, `%${search}%`);
+    where = `
+      (
+        cast(u.id as text) = $1
+        or cast(u.hum_id as text) = $1
+        or u.first_name ilike $2
+        or u.last_name  ilike $3
+        or exists(
+          select 1 from auth_accounts aa2
+          where aa2.user_id = u.id
+            and (aa2.provider_user_id = $1 or aa2.provider_user_id ilike $2)
+        )
       )
-      select to_char(days.d,'YYYY-MM-DD') as date,
-             coalesce(agg.auth_total,0)   as auth_total,
-             coalesce(agg.auth_unique,0)  as auth_unique
-        from days
-   left join agg on agg.d = days.d
-    order by days.d asc
     `;
-    const q = await db.query(sql, [days]);
-    res.json({ ok:true, days: q.rows || [] });
-  } catch (e) {
-    console.error('admin/daily', e);
-    res.status(500).json({ ok:false, error:'server_error' });
   }
-});
 
-/* ------- /api/admin/range (для admin/chart-range.js) ------- */
-router.get('/range', async (req, res) => {
-  try {
-    if (!assertAdmin(req, res)) return;
-
-    const fromRaw = (req.query.from||'').toString().trim();
-    const toRaw   = (req.query.to||'').toString().trim();
-
-    const to   = /^\d{4}-\d{2}-\d{2}$/.test(toRaw)   ? toRaw   : iso(new Date());
-    const from = /^\d{4}-\d{2}-\d{2}$/.test(fromRaw) ? fromRaw : iso(Date.now() - 30*864e5);
-
-    const span = Math.ceil((Date.parse(to) - Date.parse(from)) / 86400000) + 1;
-    if (!(span > 0) || span > 400) return res.status(400).json({ ok:false, error:'range_too_wide' });
-
-    const sql = `
-      with days as (
-        select d::date as d
-        from generate_series($1::date, $2::date, interval '1 day') as d
-      ),
-      ev as (
-        select created_at::date as d, hum_id
-          from events
-         where event_type='auth_success'
-           and created_at >= $1::date
-           and created_at <  ($2::date + interval '1 day')
-      ),
-      agg as (
-        select d, count(*) as auth_total, count(distinct hum_id) as auth_unique
-          from ev
-         group by d
-      )
-      select to_char(days.d,'YYYY-MM-DD') as day,
-             coalesce(agg.auth_total,0)    as auth_total,
-             coalesce(agg.auth_unique,0)   as auth_unique
-        from days
-   left join agg on agg.d = days.d
-    order by days.d asc
-    `;
-    const q = await db.query(sql, [from, to]);
-    res.json({ ok:true, from, to, days: q.rows || [] });
-  } catch (e) {
-    console.error('admin/range', e);
-    res.status(500).json({ ok:false, error:'server_error' });
-  }
-});
-
-/* ------- /api/admin/users ------- */
-router.get('/users', async (req, res) => {
-  try {
-    if (!assertAdmin(req, res)) return;
-
-    const search = (req.query.search || '').toString().trim();
-    const limit  = Math.min(500, Math.max(1, parseInt(req.query.limit || '100', 10)));
-    const offset = Math.max(0, parseInt(req.query.offset || '0', 10));
-
-    const params = [];
-    let where = '';
-
-    if (search) {
-      params.push(`%${search}%`);
-      where = `
-        where cast(u.id as text) ilike $${params.length}
-           or (coalesce(u.first_name,'') || ' ' || coalesce(u.last_name,'')) ilike $${params.length}
-           or exists (
-                select 1 from auth_accounts a
-                 where a.user_id = u.id
-                   and (a.provider_user_id ilike $${params.length}
-                        or a.username ilike $${params.length})
-           )
-      `;
-    }
-
-    const sql = `
+  // агрегируем провайдеров и берём «визитку» vk/tg для удобного отображения
+  const sql = `
+    with agg as (
       select
-        u.id                                   as user_id,
-        coalesce(u.hum_id, u.id)              as hum_id,
-        coalesce(u.first_name,'')             as first_name,
-        coalesce(u.last_name,'')              as last_name,
-        coalesce(u.country_name,'')           as country,
-        coalesce(u.balance,0)::bigint         as balance,
-        to_char(u.created_at,'YYYY-MM-DD HH24:MI:SS') as created_at,
-        array_agg(distinct a.provider)          filter (where a.provider is not null)         as providers,
-        array_agg(distinct a.provider_user_id)  filter (where a.provider_user_id is not null) as provider_ids
+        u.id as user_id,
+        u.hum_id,
+        u.first_name,
+        u.last_name,
+        u.balance,
+        coalesce(nullif(u.country_name,''), u.country_code) as country,
+        u.created_at,
+        array_remove(array_agg(distinct aa.provider)
+          filter (where aa.provider is not null), null) as providers,
+        max(case when aa.provider='vk' then aa.provider_user_id end)   as vk_id,
+        max(case when aa.provider='tg' then 'tg:'||aa.provider_user_id end) as tg_id
       from users u
-      left join auth_accounts a on a.user_id = u.id
-      ${where}
+      left join auth_accounts aa on aa.user_id = u.id
+      where ${where}
       group by u.id
-      order by u.id asc
-      limit ${limit} offset ${offset}
-    `;
-    const rows = (await db.query(sql, params)).rows || [];
-    res.json({ ok:true, users: rows });
-  } catch (e) {
-    console.error('admin/users', e);
-    res.status(500).json({ ok:false, error:'server_error' });
-  }
-});
+      order by u.created_at desc
+      limit ${take} offset ${skip}
+    )
+    select
+      user_id as id,
+      hum_id,
+      first_name, last_name,
+      balance,
+      country,
+      created_at,
+      providers,
+      coalesce(vk_id, tg_id) as vk_id
+    from agg
+  `;
 
-/* ------- /api/admin/events ------- */
-router.get('/events', async (req, res) => {
   try {
-    if (!assertAdmin(req, res)) return;
-
-    const limit  = Math.min(500, Math.max(1, parseInt(req.query.limit || '100', 10)));
-    const offset = Math.max(0, parseInt(req.query.offset || '0', 10));
-    const userId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
-    const type   = (req.query.type || '').toString().trim();
-
-    const params = [];
-    const where = [];
-    if (userId) { params.push(userId); where.push(`user_id = $${params.length}`); }
-    if (type)   { params.push(type);   where.push(`event_type = $${params.length}`); }
-
-    const sql = `
-      select
-        id,
-        coalesce(hum_id, user_id)                         as hum_id,
-        user_id,
-        event_type,
-        coalesce(payload->>'type','')                     as type,
-        coalesce(ip::text,'')                             as ip,
-        coalesce(ua,'')                                   as ua,
-        to_char(created_at,'YYYY-MM-DD HH24:MI:SS')       as created_at
-      from events
-      ${where.length ? 'where ' + where.join(' and ') : ''}
-      order by id desc
-      limit ${limit} offset ${offset}
-    `;
-    const rows = (await db.query(sql, params)).rows || [];
-    res.json({ ok:true, events: rows });
-  } catch (e) {
-    console.error('admin/events', e);
-    res.status(500).json({ ok:false, error:'server_error' });
+    const { rows } = await db.query(sql, params);
+    return res.json({ ok: true, users: rows });
+  } catch (err) {
+    console.error('users:', err);
+    return res.status(500).json({ ok: false, error: 'users_error' });
   }
 });
 
-export default router;
+// ──────────────────────────────────────────────────────────────────────────────
+// events (таблица)
+// q: take, skip, type / event_type, user_id
+adminRouter.get('/api/admin/events', async (req, res) => {
+  const take = clamp(int(req.query.take, 50), 1, 500);
+  const skip = clamp(int(req.query.skip, 0), 0, 1000000);
+  const type = (req.query.type || req.query.event_type || '').toString().trim();
+  const userId = (req.query.user_id || '').toString().trim();
+
+  const params = [];
+  const cond = ['true'];
+
+  if (type) {
+    params.push(type);
+    cond.push(`event_type = $${params.length}`);
+  }
+  if (userId) {
+    params.push(int(userId));
+    cond.push(`user_id = $${params.length}`);
+  }
+
+  const sql = `
+    select
+      id,
+      hum_id,
+      user_id,
+      event_type,
+      (payload->>'type') as type,
+      ip::text as ip,
+      ua,
+      created_at
+    from events
+    where ${cond.join(' and ')}
+    order by created_at desc
+    limit ${take} offset ${skip}
+  `;
+
+  try {
+    const { rows } = await db.query(sql, params);
+    return res.json({ ok: true, events: rows });
+  } catch (err) {
+    console.error('events:', err);
+    return res.status(500).json({ ok: false, error: 'events_error' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// metrics: 7 days (нижний график)
+adminRouter.get('/api/admin/metrics/7d', async (_req, res) => {
+  try {
+    const { rows } = await db.query(`
+      with days as (
+        select generate_series(
+          date_trunc('day', (${NOW_MSK}) - interval '6 days'),
+          date_trunc('day', ${NOW_MSK}),
+          interval '1 day'
+        )::date d
+      )
+      select
+        d::text as day,
+        coalesce((
+          select count(distinct coalesce(hum_id::text, user_id::text))
+          from events
+          where event_type='auth_success'
+            and created_at >= d
+            and created_at <  d + interval '1 day'
+        ), 0)::int as uniques
+      from days
+      order by day
+    `);
+
+    const labels = rows.map(r => r.day);
+    const data = rows.map(r => r.uniques);
+    return res.json({
+      ok: true,
+      labels,
+      series: [
+        { name: 'Уникальные', data }
+      ],
+      note: `Период: ${labels[0]} — ${labels[labels.length - 1]} (МСК)`,
+    });
+  } catch (err) {
+    console.error('metrics/7d:', err);
+    return res.status(500).json({ ok: false, error: 'metrics_7d_error' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// metrics: range (верхний график + пресеты 7/30/90/365/всё)
+// q: from=YYYY-MM-DD, to=YYYY-MM-DD, include_analytics=0/1
+adminRouter.get('/api/admin/metrics/range', async (req, res) => {
+  try {
+    // границы
+    const from = (req.query.from || '').toString().slice(0, 10);
+    const to   = (req.query.to   || '').toString().slice(0, 10);
+    const includeAnalytics = bool(req.query.include_analytics);
+
+    // если границы не заданы — показываем последние 31 день
+    const { rows: base } = await db.query(`
+      with bounds as (
+        select
+          coalesce(nullif($1,''), ((${NOW_MSK})::date - interval '30 days')::date)::date as dfrom,
+          coalesce(nullif($2,''), ((${NOW_MSK})::date)::date)::date as dto
+      ),
+      days as (
+        select generate_series(
+          (select dfrom from bounds),
+          (select dto   from bounds),
+          interval '1 day'
+        )::date d
+      )
+      select d::text as day from days order by day
+    `, [from, to]);
+
+    // считаем авторизации по дням
+    const { rows: met } = await db.query(`
+      with bounds as (
+        select
+          coalesce(nullif($1,''), ((${NOW_MSK})::date - interval '30 days')::date)::date as dfrom,
+          coalesce(nullif($2,''), ((${NOW_MSK})::date)::date)::date as dto
+      ),
+      agg as (
+        select
+          date_trunc('day', created_at)::date as d,
+          count(*)::int as total,
+          count(distinct coalesce(hum_id::text, user_id::text))::int as uniques
+        from events
+        where event_type='auth_success'
+          and created_at >= (select dfrom from bounds)
+          and created_at <  (select dto   from bounds) + interval '1 day'
+        group by 1
+      )
+      select d::text as day, total, uniques
+      from agg
+    `, [from, to]);
+
+    const byDay = new Map(met.map(r => [r.day, r]));
+    const labels = base.map(r => r.day);
+    const total = labels.map(d => (byDay.get(d)?.total ?? 0));
+    const uniq  = labels.map(d => (byDay.get(d)?.uniques ?? 0));
+
+    return res.json({
+      ok: true,
+      labels,
+      series: [
+        { name: 'Авторизаций', data: total },
+        { name: 'Уникальные',  data: uniq  },
+      ],
+      include_analytics: includeAnalytics ? 1 : 0,
+      note: `Период: ${labels[0]} — ${labels[labels.length - 1]} (МСК)`,
+    });
+  } catch (err) {
+    console.error('metrics/range:', err);
+    return res.status(500).json({ ok: false, error: 'metrics_range_error' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ручное пополнение (как было)
+adminRouter.post('/api/admin/users/:id/topup', async (req, res) => {
+  const userId = int(req.params.id);
+  const amount = int(req.body?.amount, 0);
+
+  if (!userId || !amount) {
+    return res.status(400).json({ ok: false, error: 'bad_params' });
+  }
+  try {
+    await db.query('begin');
+    await db.query(
+      `update users set balance = coalesce(balance,0) + $1, updated_at = now() where id = $2`,
+      [amount, userId]
+    );
+    await db.query(
+      `insert into events(user_id, hum_id, event_type, amount, payload)
+       values ($1, (select hum_id from users where id=$1), 'admin_topup', $2, $3)`,
+      [userId, amount, { source: 'admin' }]
+    );
+    await db.query('commit');
+    res.json({ ok: true });
+  } catch (err) {
+    await db.query('rollback').catch(() => {});
+    console.error('topup:', err);
+    res.status(500).json({ ok: false, error: 'topup_error' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Склейка «предложения» — заглушка (оставь свою реализацию, если она уже есть)
+adminRouter.get('/api/admin/users/merge/suggestions', async (_req, res) => {
+  // здесь может быть твоя логика автосклейки по эвристикам
+  res.json({ ok: true, merged: 0 });
+});
+
+export default adminRouter;
