@@ -1,17 +1,18 @@
 // server.js — API для GG ROOM (HUM баланс + линковка + события)
-import publicRoutes from './src/routes_public.js';
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
 import geoip from 'geoip-lite';
 
-import { db, ensureTables, logEvent, updateUserCountryIfNull } from './src/db.js';
+import publicRoutes from './src/routes_public.js';
 import adminRoutes from './src/routes_admin.js';
 import authRouter from './src/routes_auth.js';
 import linkRouter from './src/routes_link.js';
 import tgRouter from './src/routes_tg.js';
 import profileLinkRoutes from './src/routes_profile_link.js';
+
+import { db, ensureTables, logEvent, updateUserCountryIfNull } from './src/db.js';
 
 dotenv.config();
 
@@ -24,19 +25,44 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// === HUM: баланс по провайдеру (tg/vk) с суммой по hum_id ===
+// ---------------------- util ----------------------
+// Извлекаем user_id из X-User-Id или sid/JWT (если есть)
+const resolveUserId = (req) => {
+  const headerUid = Number(req.get('X-User-Id') || req.query.user_id || 0);
+  if (Number.isFinite(headerUid) && headerUid > 0) return headerUid;
+
+  const token = req.cookies?.sid;
+  if (!token) return null;
+  const parts = token.split('.');
+  if (parts.length < 2) return null;
+
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    const uid = Number(payload?.uid || 0);
+    return Number.isFinite(uid) && uid > 0 ? uid : null;
+  } catch {
+    return null;
+  }
+};
+
+// ---------------------- endpoints ----------------------
+
+// HUM-баланс по провайдеру (vk/tg) с суммой по hum_id
 app.get('/api/balance/by-provider', async (req, res) => {
   try {
     const provider = String(req.query.provider || '').trim();
     const pid = String(req.query.provider_user_id || '').trim();
-    if (!provider || !pid) return res.status(400).json({ ok:false, error:'bad_params' });
+    if (!provider || !pid) return res.status(400).json({ ok: false, error: 'bad_params' });
 
     const q = `
       with acc as (
-        select user_id from auth_accounts where provider=$1 and provider_user_id=$2 limit 1
+        select user_id from auth_accounts
+        where provider=$1 and provider_user_id=$2
+        limit 1
       ),
       me as (
-        select id, coalesce(hum_id,id) as hum_id from users where id = (select user_id from acc)
+        select id, coalesce(hum_id,id) as hum_id
+        from users where id = (select user_id from acc)
       ),
       agg as (
         select sum(coalesce(balance,0))::bigint as hum_balance
@@ -48,11 +74,11 @@ app.get('/api/balance/by-provider', async (req, res) => {
       limit 1
     `;
     const r = await db.query(q, [provider, pid]);
-    if (!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' });
-    return res.json({ ok:true, user: r.rows[0] });
+    if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
+    return res.json({ ok: true, user: r.rows[0] });
   } catch (e) {
     console.error('by-provider error', e);
-    return res.status(500).json({ ok:false, error:'server_error' });
+    return res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
 
@@ -60,40 +86,9 @@ app.get('/api/balance/by-provider', async (req, res) => {
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 app.get('/api/admin/health', (_req, res) => res.json({ ok: true }));
 
-// helper: извлекаем uid из sid/JWT или X-User-Id
-const resolveUserId = (req) => {
-  const headerUid = Number(req.get('X-User-Id') || req.query.user_id || 0);
-  if (Number.isFinite(headerUid) && headerUid > 0) return headerUid;
-
-  const token = req.cookies?.sid;
-  if (!token) return null;
-  const parts = token.split('.');
-  if (parts.length < 2) return null;
-  try {
-    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-    const uid = Number(payload?.uid || 0);
-    return Number.isFinite(uid) && uid > 0 ? uid : null;
-  } catch { return null; }
-};
-
-// профиль текущего пользователя с HUM-балансом и флагами linked
-// исправляю /api/me (убираю неоднозначный id) и оставляю флаги linked
+// Профиль текущего пользователя с HUM-балансом и флагами linked
 app.get('/api/me', async (req, res) => {
   try {
-    const headerUid = Number(req.get('X-User-Id') || req.query.user_id || 0);
-    const resolveUserId = (req) => {
-      if (Number.isFinite(headerUid) && headerUid > 0) return headerUid;
-      const token = req.cookies?.sid;
-      if (!token) return null;
-      const parts = token.split('.');
-      if (parts.length < 2) return null;
-      try {
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-        const uid = Number(payload?.uid || 0);
-        return Number.isFinite(uid) && uid > 0 ? uid : null;
-      } catch { return null; }
-    };
-
     const uid = resolveUserId(req);
     if (!uid) return res.json({ ok: false, error: 'no_user' });
 
@@ -103,7 +98,6 @@ app.get('/api/me', async (req, res) => {
         from users where id = $1
       ),
       cluster as (
-        -- ВАЖНО: берём именно u.id, иначе "id" неоднозначен (u.id и me.id)
         select u.id as id
         from users u
         join me on coalesce(u.hum_id,u.id)=me.hum_id
@@ -132,6 +126,7 @@ app.get('/api/me', async (req, res) => {
 
     const user = result.rows[0];
     const provider = String(user.vk_id || '').startsWith('tg:') ? 'tg' : 'vk';
+
     res.json({
       ok: true,
       user: {
@@ -146,17 +141,15 @@ app.get('/api/me', async (req, res) => {
   }
 });
 
-
-
-// маршруты
-app.use('/api/admin', adminRoutes);
+// ---------------------- routers mount ----------------------
+app.use('/api/admin', adminRoutes);          // админка (summary/users/events/range/…)
 app.use('/api/profile/link', profileLinkRoutes);
 app.use('/api/auth/tg', tgRouter);
 app.use('/api/auth', authRouter);
 app.use('/api', publicRoutes);
 app.use('/api', linkRouter);
 
-// события
+// ---------------------- events logger ----------------------
 app.post('/api/events', async (req, res) => {
   try {
     const { type, payload } = req.body || {};
@@ -164,7 +157,7 @@ app.post('/api/events', async (req, res) => {
 
     const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
     const ip = ipHeader.split(',')[0].trim();
-    let userId = resolveUserId(req);
+    const userId = resolveUserId(req);
 
     let country_code = null;
     try {
@@ -195,7 +188,7 @@ app.post('/api/events', async (req, res) => {
 // root
 app.get('/', (_req, res) => res.send('VK Auth backend up'));
 
-// bootstrap
+// ---------------------- bootstrap ----------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('API on', PORT));
 
