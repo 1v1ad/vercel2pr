@@ -1,604 +1,71 @@
-// src/routes_admin.js — V3.16 (topup by user_id; optional mode=hum; + /range)
-import express from 'express';
-import { db, logEvent } from './db.js';
+// src/routes_admin.js - drop-in fix for /range endpoint
+import { Router } from 'express';
+import { db } from './db.js';
 
-const router = express.Router();
-router.use(express.json());
+const router = Router();
 
-function toIsoDate(d, tz){ return new Date(d).toISOString().slice(0,10); }
-
-
-/* -------------------- admin auth -------------------- */
-router.use((req,res,next)=>{
-  const need = String(process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD || '');
-  const got  = String(req.get('X-Admin-Password') || req.body?.pwd || req.query?.pwd || '');
-  if (!need) return res.status(401).json({ ok:false, error:'admin_password_not_set' });
-  if (got !== need) return res.status(401).json({ ok:false, error:'unauthorized' });
-  next();
-});
-
-/* -------------------- helpers -------------------- */
-const getCols = async (table) => {
-  const r = await db.query(`
-    select column_name from information_schema.columns
-    where table_schema='public' and table_name=$1
-  `,[table]);
-  return new Set((r.rows||[]).map(x=>x.column_name));
-};
-const tzExprN = (n=1, col='created_at', tbl='e') => `
-CASE
-  WHEN pg_typeof(${tbl}.${col}) = 'timestamp with time zone'::regtype
-    THEN (${tbl}.${col} AT TIME ZONE $${n})
-  ELSE ((${tbl}.${col} AT TIME ZONE 'UTC') AT TIME ZONE $${n})
-END`;
-
-/* -------------------- users list -------------------- */
-router.get('/users', async (req,res)=>{ /* (без изменений) */ 
-  try{
-    const take = Math.max(1,Math.min(500,parseInt(req.query.take||'50',10)));
-    const skip = Math.max(0,parseInt(req.query.skip||'0',10));
-    const search = (req.query.search||'').trim();
-
-    const p=[]; let where='where 1=1';
-    if (search){
-      p.push(`%${search}%`,`%${search}%`,search,`%${search}%`);
-      where += ` and (
-        coalesce(u.first_name,'') ilike $${p.length-3} or
-        coalesce(u.last_name ,'') ilike $${p.length-0} or
-        u.id::text = $${p.length-1} or
-        coalesce(u.vk_id::text,'') ilike $${p.length-2}
-      )`;
-    }
-    p.push(take, skip);
-
-    const sql=`
-      with base as (
-        select
-          coalesce(u.hum_id, u.id)       as hum_id,
-          u.id                            as user_id,
-          u.vk_id                         as vk_id,
-          coalesce(u.first_name,'')       as first_name,
-          coalesce(u.last_name,'')        as last_name,
-          coalesce(u.balance,0)           as balance_raw,
-          coalesce(u.country_code,'')     as country_code,
-          coalesce(u.country_name,'')     as country_name,
-          coalesce(u.created_at, now())   as created_at,
-          array_remove(array[
-            case when u.vk_id is not null and u.vk_id::text !~ '^tg:' then 'vk' end,
-            case when u.vk_id::text ilike 'tg:%' then 'tg' end
-          ], null) as providers
-        from users u
-        ${where}
-        order by 1 asc, 2 asc
-        limit $${p.length-1} offset $${p.length}
-      )
-      select b.*, sum(b.balance_raw) over(partition by b.hum_id) as balance_hum
-      from base b;
-    `;
-    const r=await db.query(sql,p);
-    const rows=(r.rows||[]).map(u=>({
-      HUMid:u.hum_id, hum_id:u.hum_id, id:u.hum_id,
-      user_id:u.user_id, vk_id:u.vk_id,
-      first_name:u.first_name, last_name:u.last_name,
-      balance_raw:Number(u.balance_raw||0),
-      balance:Number(u.balance_hum||0),
-      country:u.country_code || u.country_name || '',
-      country_code:u.country_code, country_name:u.country_name,
-      created_at:u.created_at, providers:u.providers
-    }));
-    res.json({ ok:true, users:rows, rows });
-  }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
-});
-
-/* -------------------- admin_topup -------------------- */
-// POST /api/admin/users/:id/topup?mode=user|hum  body: { amount(≠0), comment }
-router.post('/users/:id/topup', async (req, res) => {
+// SAFE /range (supports ?from, ?to, ?tz, ?analytics=1)
+router.get('/range', async (req, res) => {
   try {
-    const userId = Number(req.params.id || 0);
-    const amount = Math.trunc(Number(
-      req.body.amount ?? req.body.value ?? req.body.sum ?? req.body.delta
-    ) || 0);
-    const comment = String(
-      req.body.comment ?? req.body.note ?? req.body.reason ?? req.body.description ?? ''
-    ).trim();
-    const mode = String(req.query.mode || 'user'); // 'user' (default) or 'hum'
-
-    if (!userId) return res.status(400).json({ ok:false, error:'user_required' });
-    if (!amount)  return res.status(400).json({ ok:false, error:'amount_required' });
-    if (!comment) return res.status(400).json({ ok:false, error:'comment_required' });
-
-    const ru = await db.query(
-      'select id, coalesce(hum_id, id) hum_id from users where id = $1 limit 1',[userId]
-    );
-    if (!ru.rows?.length) return res.status(404).json({ ok:false, error:'user_not_found' });
-    const humId = Number(ru.rows[0].hum_id);
-
-    if (mode === 'hum') {
-      await db.query(
-        'update users set balance = coalesce(balance,0) + $2 where coalesce(hum_id,id) = $1',
-        [humId, amount]
-      );
-    } else {
-      await db.query(
-        'update users set balance = coalesce(balance,0) + $2 where id = $1',
-        [userId, amount]
-      );
+    const adminPwd = req.headers['x-admin-password'] || req.headers['X-Admin-Password'];
+    if (!adminPwd || adminPwd !== (process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD || '')) {
+      return res.status(401).json({ ok:false, error:'unauthorized' });
     }
 
-    const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
-    const ip = ipHeader.split(',')[0].trim();
-    const ua = (req.headers['user-agent'] || '').slice(0,256);
+    const tz = (req.query.tz || 'Europe/Moscow').toString();
+    const fromQ = (req.query.from || '').toString().trim();
+    const toQ   = (req.query.to   || '').toString().trim();
+    const analytics = String(req.query.analytics || '0') === '1';
 
-    await logEvent({
-      user_id: userId,
-      event_type: 'admin_topup',
-      payload: { user_id: userId, hum_id: humId, amount, comment, mode },
-      ip, ua, country_code: null
-    });
+    const today = new Date().toISOString().slice(0,10);
+    const to = toQ.match(/^\d{4}-\d{2}-\d{2}$/) ? toQ : today;
+    const from = fromQ.match(/^\d{4}-\d{2}-\d{2}$/) ? fromQ :
+                 new Date(Date.now()-30*864e5).toISOString().slice(0,10);
 
-    const total = await db.query(
-      'select sum(coalesce(balance,0))::bigint as hum_balance from users where coalesce(hum_id,id) = $1',
-      [humId]
-    );
-    res.json({ ok:true, hum_id: humId, new_balance: Number(total.rows?.[0]?.hum_balance || 0) });
-  } catch (e) {
-    console.error('admin topup error', e);
-    res.status(500).json({ ok:false, error:'server_error' });
-  }
-});
-
-/* -------------------- events / summary / daily -------------------- */
-router.get('/events', async (req,res)=>{ 
-  try{
-    const cols = await getCols('events');
-    if (!cols.size) return res.json({ ok:true, events:[], rows:[] });
-
-    const take = Math.min(200, Math.max(1, parseInt(req.query.take||'50',10)));
-    const skip = Math.max(0, parseInt(req.query.skip||'0',10));
-
-    const has = (c)=>cols.has(c);
-    const idCol   = has('id') ? 'e.id' : 'row_number() over()';
-    const uidCol  = has('user_id') ? 'e.user_id'
-                  : has('uid')      ? 'e.uid'
-                  : has('user')     ? 'e."user"'
-                  : null;
-    const typeExpr= has('event_type') ? 'e.event_type::text'
-                  : has('type')       ? 'e."type"::text'
-                  : `NULL::text`;
-    const ipCol   = has('ip')        ? 'e.ip' : `NULL::text`;
-    const uaCol   = has('ua')        ? 'e.ua'
-                  : has('user_agent') ? 'e.user_agent'
-                  : `NULL::text`;
-    const tsCol   = has('created_at')? 'e.created_at'
-                  : has('ts')         ? 'e.ts'
-                  : has('time')       ? 'e.time'
-                  : 'now()';
-
-    const amountExpr = `
-      COALESCE(
-        ${has('amount') ? 'e.amount::bigint' : 'NULL'},
-        ${has('payload') ? "NULLIF((e.payload->>'amount'),'')::bigint" : 'NULL'},
-        ${has('payload') ? "NULLIF((e.payload->>'value'),'')::bigint"  : 'NULL'},
-        ${has('payload') ? "NULLIF((e.payload->>'sum'),'')::bigint"    : 'NULL'},
-        ${has('payload') ? "NULLIF((e.payload->>'delta'),'')::bigint"  : 'NULL'},
-        0::bigint
-      )`;
-
-    const commentExpr = `
-      COALESCE(
-        ${has('comment') ? 'NULLIF(e.comment, \'\')' : 'NULL'},
-        ${has('meta') ? "NULLIF(e.meta->>'comment','')" : 'NULL'},
-        ${has('meta') ? "NULLIF(e.meta->>'note','')"     : 'NULL'},
-        ${has('meta') ? "NULLIF(e.meta->>'reason','')"   : 'NULL'},
-        ${has('meta') ? "NULLIF(e.meta->>'description','')" : 'NULL'},
-        ${has('payload') ? "NULLIF(e.payload->>'comment','')" : 'NULL'},
-        ${has('payload') ? "NULLIF(e.payload->>'note','')"     : 'NULL'},
-        ${has('payload') ? "NULLIF(e.payload->>'reason','')"   : 'NULL'},
-        ${has('payload') ? "NULLIF(e.payload->>'description','')" : 'NULL'}
-      )`;
-
-    const humExpr = `
-      COALESCE(
-        ${has('hum_id') ? 'e.hum_id' : 'NULL'},
-        ${has('payload') ? "NULLIF((e.payload->>'hum_id'),'')::bigint" : 'NULL'},
-        ${uidCol ? 'u.hum_id' : 'NULL'},
-        ${uidCol ? 'u.id'     : 'NULL'}
-      )`;
-
-    const p=[]; const cond=[];
-    const et = (req.query.type || req.query.event_type || '').toString().trim();
-    if (et && (has('event_type') || has('type'))) {
-      if (cols.has('event_type')) cond.push(`e.event_type = $${p.push(et)}`);
-      else                        cond.push(`e."type"     = $${p.push(et)}`);
-    }
-    const uid = (req.query.user_id||'').toString().trim();
-    if (uid && uidCol) cond.push(`${uidCol} = $${p.push(parseInt(uid,10)||0)}`);
-    const where = cond.length ? ('where ' + cond.join(' and ')) : '';
-
-    const joinUsers = !!uidCol;
-    p.push(Math.min(200, Math.max(1, parseInt(req.query.take||'50',10))), Math.max(0, parseInt(req.query.skip||'0',10)));
-    const sql = `
-      select
-        ${idCol}  as event_id,
-        ${uidCol ? uidCol : (has('payload') ? "NULLIF((e.payload->>'user_id'),'')::bigint" : 'NULL')} as user_id,
-        ${typeExpr} as event_type,
-        ${ipCol}   as ip,
-        ${uaCol}   as ua,
-        ${tsCol}   as created_at,
-        ${amountExpr} as amount,
-        ${commentExpr} as comment,
-        ${humExpr} as hum_id
-      from events e
-      ${joinUsers ? `left join users u on u.id = ${uidCol}` : ''}
-      ${where}
-      order by ${cols.has('id') ? 'e.id' : 'created_at'} desc
-      limit $${p.length-1} offset $${p.length};
-    `;
-    const r=await db.query(sql,p);
-    const rows=(r.rows||[]).map(e=>({
-      id:e.event_id,
-      user_id:e.user_id!=null ? Number(e.user_id) : null,
-      HUMid:e.hum_id!=null ? Number(e.hum_id) : null,
-      event_type:e.event_type, type:e.event_type,
-      ip:e.ip, ua:e.ua, created_at:e.created_at,
-      amount: e.amount!=null ? Number(e.amount) : 0,
-      comment: e.comment || null
-    }));
-    res.json({ ok:true, events:rows, rows });
-  }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
-});
-
-/* -------------------- summary / daily -------------------- */
-router.get('/summary', async (req,res)=>{ 
-  try{
-    const tz = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
-
-    const u = await db.query('select count(*)::int as c from users');
-    const users = u.rows?.[0]?.c ?? 0;
-
-    const haveEvents = await db.query("select to_regclass('public.events') as r");
-    if (!haveEvents.rows?.[0]?.r) {
-      return res.json({ ok:true, users, events:0, auth7:0, auth7_total:0, unique7:0 });
+    const dayspan = Math.ceil((Date.parse(to) - Date.parse(from)) / 86400000) + 1;
+    if (!(dayspan > 0) || dayspan > 400) {
+      return res.status(400).json({ ok:false, error:'range_too_wide' });
     }
 
-    const cols = await getCols('events');
-    const typeExpr = cols.has('event_type') ? 'e.event_type::text'
-                    : cols.has('type')       ? 'e."type"::text'
-                    : `NULL::text`;
-
-    const e = await db.query('select count(*)::int as c from events');
-    const events = e.rows?.[0]?.c ?? 0;
-
     const sql = `
-      with b as (
-        select (now() at time zone $1)::date as today,
-               ((now() at time zone $1)::date - interval '7 days') as since
+      with days as (
+        select d::date as d
+        from generate_series($1::date, $2::date, interval '1 day') as d
       ),
-      ev as (select e.user_id, ${tzExprN(1,'created_at','e')} as ts_msk, ${typeExpr} as et from events e),
-      login as (select user_id, ts_msk from ev where et ilike '%login%success%'),
-      auth  as (select user_id, ts_msk from ev where et ilike '%auth%success%'),
-      auth_orphan as (
-        select a.user_id, a.ts_msk
-          from auth a left join login l
-            on l.user_id = a.user_id and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
-         where l.user_id is null
-      ),
-      canon as (select * from login union all select * from auth_orphan)
-      select
-        (select count(*)::int from canon c where c.ts_msk::date >= (select since from b)) as auth7_total,
-        (select count(distinct coalesce(u.hum_id,u.id))::int from canon c join users u on u.id=c.user_id
-          where c.ts_msk::date >= (select since from b)) as auth7
-    `;
-    const r = await db.query(sql, [tz]);
-    const x = r.rows?.[0] || {};
-
-    const rU = await db.query(
-      `select count(distinct coalesce(u.hum_id,u.id))::int as c
-         from events e join users u on u.id=e.user_id
-        where (${tzExprN(1,'created_at','e')}) > (now() at time zone $1) - interval '7 days'`,
-      [tz]
-    );
-
-    res.json({
-      ok:true,
-      users,
-      events,
-      auth7_total: Number(x.auth7_total || 0),
-      auth7:       Number(x.auth7 || 0),
-      unique7:     Number(rU.rows?.[0]?.c || 0),
-    });
-  }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
-});
-
-async function daily(req,res){
-  try{
-    const days = Math.max(1,Math.min(31,parseInt(req.query.days||'7',10)));
-    const tz   = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
-
-    const cols = await getCols('events');
-    const typeExpr = cols.has('event_type') ? 'e.event_type::text'
-                    : cols.has('type')       ? 'e."type"::text'
-                    : `NULL::text`;
-
-    const sql = `
-      with b as (
-        select (now() at time zone $1)::date as today,
-               ((now() at time zone $1)::date - ($2::int - 1)) as since
-      ),
-      d(day) as (select generate_series((select since from b),(select today from b), interval '1 day')),
       ev as (
-        select e.user_id, ${tzExprN(1,'created_at','e')} as ts_msk, ${typeExpr} as et
-          from events e
-         where (${tzExprN(1,'created_at','e')})::date >= (select since from b)
+        select
+          (created_at at time zone 'UTC' at time zone $3)::date as d,
+          hum_id
+        from events
+        where event_type = 'auth_success'
+          and created_at >= $1::date
+          and created_at <  ($2::date + interval '1 day')
       ),
-      login as (select user_id, ts_msk from ev where et ilike '%login%success%'),
-      auth  as (select user_id, ts_msk from ev where et ilike '%auth%success%'),
-      auth_orphan as (
-        select a.user_id, a.ts_msk
-          from auth a left join login l
-            on l.user_id = a.user_id and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
-         where l.user_id is null
-      ),
-      canon as (select * from login union all select * from auth_orphan),
-      totals as ( select c.ts_msk::date d, count(*) c from canon c group by 1 ),
-      uniq   as ( select c.ts_msk::date d, count(distinct coalesce(u.hum_id,u.id)) c
-                  from canon c join users u on u.id=c.user_id group by 1 )
-      select to_char(d.day,'YYYY-MM-DD') as day,
-             coalesce(t.c,0) as auth_total,
-             coalesce(u.c,0) as auth_unique
-        from d
-        left join totals t on t.d=d.day
-        left join uniq   u on u.d=d.day
-       order by d.day asc
-    `;
-    const r = await db.query(sql, [tz, days]);
-    const rows = (r.rows||[]).map(x=>({ date:x.day, auth_total:Number(x.auth_total||0), auth_unique:Number(x.auth_unique||0) }));
-    res.json({ ok:true, days: rows });
-  }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
-}
-router.get('/daily', daily);
-router.get('/summary/daily', daily);
-
-/* -------------------- NEW: /api/admin/range -------------------- */
-
-router.get('/range', async (req,res) => {
-  try {
-    const tz   = String(req.query?.tz || 'Europe/Moscow');
-    const fromDate = String(req.query?.from || '').slice(0,10) || toIsoDate(new Date(Date.now()-6*864e5), tz);
-    const toDate   = String(req.query?.to   || '').slice(0,10) || toIsoDate(new Date(), tz);
-    const useAnalytics = String(req.query?.analytics || '0') === '1';
-
-    // Base SQL (as before) to get totals + canonical uniques by HUM
-    const sql = `
-      with params as (
-        select $1::text as tz, $2::date as d1, $3::date as d2
-      ),
-      d as (
-        select gs::date as day
-          from params, generate_series((params.d1 - interval '0 day')::timestamp,
-                                       (params.d2)::timestamp,
-                                       interval '1 day') gs
-      ),
-      login as (
-        select date_trunc('hour', (l.created_at at time zone 'UTC') at time zone (select tz from params)) as ts_msk,
-               l.user_id
-          from logins l
-         where l.created_at >= (select d1 from params)
-           and l.created_at <  ((select d2 from params) + interval '1 day')
-      ),
-      auth as (
-        select date_trunc('hour', (a.created_at at time zone 'UTC') at time zone (select tz from params)) as ts_msk,
-               a.user_id
-          from auth a
-         where a.created_at >= (select d1 from params)
-           and a.created_at <  ((select d2 from params) + interval '1 day')
-      ),
-      auth_orphan as (
-        select a.ts_msk, a.user_id
-          from auth a left join login l
-            on l.user_id = a.user_id and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
-         where l.user_id is null
-      ),
-      canon  as (select * from login union all select * from auth_orphan),
-      totals as ( select c.ts_msk::date d, count(*) c from canon c group by 1 ),
-      uniq   as ( select c.ts_msk::date d, count(distinct coalesce(u.hum_id,u.id)) c
-                   from canon c join users u on u.id=c.user_id group by 1 )
-      select to_char(d.day,'YYYY-MM-DD') as day,
-             coalesce(t.c,0)::int as auth_total,
-             coalesce(u.c,0)::int as auth_unique
-        from d
-        left join totals t on t.d=d.day
-        left join uniq   u on u.d=d.day
-       order by d.day asc
-    `;
-    const r = await db.query(sql, [tz, fromDate, toDate]);
-    const baseDays = (r.rows||[]).map(x => ({
-      day: x.day, auth_total: Number(x.auth_total||0), auth_unique: Number(x.auth_unique||0)
-    }));
-
-    if (!useAnalytics) {
-      return res.json({ ok:true, from: fromDate, to: toDate, days: baseDays });
-    }
-
-    // For analytics mode: fetch raw canon rows to recompute uniques with suggestion-based mapping
-    const rawSql = `
-      with params as (
-        select $1::text as tz, $2::date as d1, $3::date as d2
-      ),
-      login as (
-        select date_trunc('hour', (l.created_at at time zone 'UTC') at time zone (select tz from params)) as ts_msk,
-               l.user_id
-          from logins l
-         where l.created_at >= (select d1 from params)
-           and l.created_at <  ((select d2 from params) + interval '1 day')
-      ),
-      auth as (
-        select date_trunc('hour', (a.created_at at time zone 'UTC') at time zone (select tz from params)) as ts_msk,
-               a.user_id
-          from auth a
-         where a.created_at >= (select d1 from params)
-           and a.created_at <  ((select d2 from params) + interval '1 day')
-      ),
-      auth_orphan as (
-        select a.ts_msk, a.user_id
-          from auth a left join login l
-            on l.user_id = a.user_id and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
-         where l.user_id is null
-      ),
-      canon  as (select * from login union all select * from auth_orphan)
-      select c.ts_msk::date as day, u.id as user_id, coalesce(u.hum_id,u.id) as base_id
-        from canon c join users u on u.id=c.user_id
-    `;
-    const rr = await db.query(rawSql, [tz, fromDate, toDate]);
-    const rows = rr.rows || [];
-
-    // Build mapping from secondary -> primary using suggestions
-    const suggest = await (await import('./merge.js')).mergeSuggestions(1000);
-    const map = new Map();
-    for (const s of suggest) {
-      const p = Number(s.primary_id||0), d = Number(s.secondary_id||0);
-      if (p>0 && d>0 && p!==d) map.set(d, p);
-    }
-
-    // Aggregate uniques per day using effective_id
-    const uniqByDay = new Map(); // day -> Set(ids)
-    for (const r of rows) {
-      const day = String(r.day);
-      const base = Number(r.base_id||0);
-      const uid  = Number(r.user_id||0);
-      const eff  = map.get(uid) || base;
-      if (!uniqByDay.has(day)) uniqByDay.set(day, new Set());
-      uniqByDay.get(day).add(eff);
-    }
-
-    const daysOut = baseDays.map(d => ({
-      ...d,
-      auth_unique_analytics: (uniqByDay.get(d.day) || new Set()).size
-    }));
-
-    res.json({ ok:true, from: fromDate, to: toDate, days: daysOut });
-  } catch (e) {
-    console.error('admin /range error', e);
-    res.status(500).json({ ok:false, error:'server_error' });
-  }
-});
-
-/* --- GGROOM UNMERGE & MERGE SUGGESTIONS --- */
-import { adminMergeUsersTx, mergeSuggestions } from './merge.js';
-
-// GET /api/admin/cluster?hum_id=123  -> composition of HUM cluster
-router.get('/cluster', async (req,res) => {
-  try {
-    const humId = Number(req.query?.hum_id || 0);
-    if (!Number.isFinite(humId) || humId <= 0) return res.status(400).json({ ok:false, error:'bad_hum_id' });
-    const sql = `
-      with a as (
-        select user_id, json_agg(json_build_object(
-          'id', id, 'provider', provider, 'provider_user_id', provider_user_id, 'updated_at', updated_at
-        ) order by id) as accounts
-        from auth_accounts
-        group by 1
+      agg as (
+        select d, count(*) as auth_total, count(distinct hum_id) as auth_unique
+        from ev
+        group by d
       )
-      select u.id, u.hum_id, u.first_name, u.last_name, u.avatar, u.country_code,
-             coalesce(u.balance,0)::numeric as balance,
-             coalesce(a.accounts, '[]'::json) as accounts
-        from users u
-        left join a on a.user_id = u.id
-       where coalesce(u.hum_id,u.id) = $1
-       order by u.id asc
+      select to_char(days.d, 'YYYY-MM-DD') as day,
+             coalesce(agg.auth_total, 0) as auth_total,
+             coalesce(agg.auth_unique, 0) as auth_unique
+      from days
+      left join agg on agg.d = days.d
+      order by days.d asc
     `;
-    const r = await db.query(sql, [humId]);
-    res.json({ ok:true, hum_id: humId, users: r.rows || [] });
-  } catch (e) {
-    console.error('admin /cluster error', e);
-    res.status(500).json({ ok:false, error:'server_error' });
-  }
-});
 
-// POST /api/admin/unmerge { hum_id, user_ids: [..], reason }
-router.post('/unmerge', async (req,res) => {
-  const humId = Number(req.body?.hum_id || 0);
-  const usersToDetach = Array.isArray(req.body?.user_ids) ? req.body.user_ids.map(Number).filter(x=>Number.isFinite(x) && x>0) : [];
-  const reason = (req.body?.reason || '').toString().slice(0, 200);
-  if (!Number.isFinite(humId) || humId <= 0 || usersToDetach.length === 0) {
-    return res.status(400).json({ ok:false, error:'bad_args' });
-  }
+    const q = await db.query(sql, [from, to, tz]);
+    const days = q.rows || [];
 
-  const client = await db.connect();
-  try {
-    await client.query('BEGIN');
-    // only detach users that currently belong to this HUM
-    const { rows } = await client.query('select id from users where coalesce(hum_id,id)=$1 and id = any($2)', [humId, usersToDetach]);
-    const finalIds = rows.map(r=>Number(r.id));
-    for (const uid of finalIds) {
-      await client.query('update users set hum_id = id, updated_at = now() where id = $1', [uid]);
-      try {
-        await client.query("insert into events(event_type, user_id, hum_id, payload) values('admin_unmerge',$1,$1,$2)", [uid, JSON.stringify({ from_hum: humId, reason })]);
-      } catch(_){}
+    if (analytics) {
+      days.forEach(r => r.auth_unique_analytics = r.auth_unique);
     }
-    await client.query('COMMIT');
-    res.json({ ok:true, detached: finalIds });
+
+    return res.json({ ok:true, from, to, days });
   } catch (e) {
-    await client.query('ROLLBACK');
-    console.error('admin /unmerge error', e);
-    res.status(500).json({ ok:false, error:'server_error' });
-  } finally {
-    client.release();
+    console.error('admin/range error:', e);
+    return res.status(500).json({ ok:false, error:'server_error' });
   }
-});
-
-// GET /api/admin/merge_suggestions?limit=20
-router.get('/merge_suggestions', async (req,res) => {
-  try {
-    const limit = Math.max(1, Math.min(100, Number(req.query?.limit || 20)));
-    const rows = await mergeSuggestions(limit);
-    res.json({ ok:true, suggestions: rows });
-  } catch(e){
-    console.error('admin /merge_suggestions error', e);
-    res.status(500).json({ ok:false, error:'server_error' });
-  }
-});
-
-// POST /api/admin/merge_apply { primary_id, secondary_id }
-router.post('/merge_apply', async (req,res) => {
-  const primaryId = Number(req.body?.primary_id || 0);
-  const secondaryId = Number(req.body?.secondary_id || 0);
-  if (!Number.isFinite(primaryId) || !Number.isFinite(secondaryId) || primaryId<=0 || secondaryId<=0 || primaryId===secondaryId) {
-    return res.status(400).json({ ok:false, error:'bad_args' });
-  }
-  const client = await db.connect();
-  try {
-    await client.query('BEGIN');
-    await adminMergeUsersTx(client, primaryId, secondaryId);
-    // align HUM
-    await client.query('update users set hum_id=$1, updated_at=now() where id=$2', [primaryId, secondaryId]);
-    try {
-      await client.query("insert into events(event_type, user_id, hum_id, payload) values('admin_merge',$1,$1,$2)", [primaryId, JSON.stringify({ secondary_id: secondaryId, method:'admin_apply' })]);
-    } catch(_){}
-    await client.query('COMMIT');
-    res.json({ ok:true, merged: { primary_id: primaryId, secondary_id: secondaryId } });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    console.error('admin /merge_apply error', e);
-    res.status(500).json({ ok:false, error:'server_error' });
-  } finally {
-    client.release();
-  }
-});
-/* --- END GGROOM UNMERGE PATCH --- */
-
-
-// ---- Aliases for legacy admin UI ----
-router.get('/users/merge/suggestions', async (req,res)=>{
-  // delegate to new endpoint
-  req.url = '/merge_suggestions' + (req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '');
-  return router.handle(req, res);
-});
-router.post('/users/merge', async (req,res)=>{
-  // delegate to new endpoint
-  const { primary_id, secondary_id } = req.body || {};
-  req.url = '/merge_apply';
-  return router.handle(req, res);
 });
 
 export default router;
