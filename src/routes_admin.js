@@ -1,297 +1,459 @@
-// src/routes_admin.js
-// Админ-эндпоинты для /admin/*
-// МОНТИРУЕМ ЭТОТ РОУТЕР ТАК: app.use('/api', routesAdmin)
-
-import { Router } from 'express';
+// src/routes_admin.js — V3.16 (topup by user_id; optional mode=hum; + /range)
+import express from 'express';
 import { db, logEvent } from './db.js';
 
-const router = Router();
+const router = express.Router();
+router.use(express.json());
 
-// ====== утилиты ======
-const ADMIN_HEADER = 'x-admin-key';
-const ADMIN_ENV = process.env.ADMIN_KEY || process.env.ADMIN_TOKEN || '';
-
-function requireAdmin(req, res, next) {
-  try {
-    const key = (req.headers[ADMIN_HEADER] || '').toString();
-    if (!ADMIN_ENV) {
-      // Если ключ не задан в окружении — разрешим (на твой страх и риск в DEV)
-      return next();
-    }
-    if (key && ADMIN_ENV && key === ADMIN_ENV) return next();
-    return res.status(401).json({ ok: false, error: 'unauthorized' });
-  } catch (e) {
-    return res.status(401).json({ ok: false, error: 'unauthorized' });
-  }
+// helper: parse include_hum / cluster flags
+function wantHum(req){
+  const v = (req.query.include_hum ?? req.query.cluster ?? req.query.hum ?? '').toString().toLowerCase();
+  if (v === '1' || v === 'true' || v === 'yes') return true;
+  if (v === '0' || v === 'false' || v === 'no') return false;
+  // default: true (backward compat — считать по HUM)
+  return true;
 }
 
-function parseIntSafe(v, def = 0) {
-  const n = Number.parseInt(v, 10);
-  return Number.isFinite(n) ? n : def;
-}
 
-function parseFloatSafe(v, def = 0) {
-  const n = Number.parseFloat(v);
-  return Number.isFinite(n) ? n : def;
-}
-
-function isoDay(d) {
-  const dt = new Date(d);
-  dt.setHours(0, 0, 0, 0);
-  return dt.toISOString().slice(0, 10);
-}
-
-// ====== ping ======
-router.get('/admin/ping', requireAdmin, (req, res) => {
-  res.json({ ok: true, now: new Date().toISOString() });
+/* -------------------- admin auth -------------------- */
+router.use((req,res,next)=>{
+  const need = String(process.env.ADMIN_PASSWORD || process.env.ADMIN_PWD || '');
+  const got  = String(req.get('X-Admin-Password') || req.body?.pwd || req.query?.pwd || '');
+  if (!need) return res.status(401).json({ ok:false, error:'admin_password_not_set' });
+  if (got !== need) return res.status(401).json({ ok:false, error:'unauthorized' });
+  next();
 });
 
-// ====== SUMMARY: быстрые цифры ======
-// GET /api/admin/summary?days=7
-router.get('/admin/summary', requireAdmin, async (req, res) => {
+/* -------------------- helpers -------------------- */
+const getCols = async (table) => {
+  const r = await db.query(`
+    select column_name from information_schema.columns
+    where table_schema='public' and table_name=$1
+  `,[table]);
+  return new Set((r.rows||[]).map(x=>x.column_name));
+};
+const tzExprN = (n=1, col='created_at', tbl='e') => `
+CASE
+  WHEN pg_typeof(${tbl}.${col}) = 'timestamp with time zone'::regtype
+    THEN (${tbl}.${col} AT TIME ZONE $${n})
+  ELSE ((${tbl}.${col} AT TIME ZONE 'UTC') AT TIME ZONE $${n})
+END`;
+
+/* -------------------- users list -------------------- */
+router.get('/users', async (req,res)=>{ /* (без изменений) */ 
+  try{
+    const take = Math.max(1,Math.min(500,parseInt(req.query.take||'50',10)));
+    const skip = Math.max(0,parseInt(req.query.skip||'0',10));
+    const search = (req.query.search||'').trim();
+
+    const p=[]; let where='where 1=1';
+    if (search){
+      p.push(`%${search}%`,`%${search}%`,search,`%${search}%`);
+      where += ` and (
+        coalesce(u.first_name,'') ilike $${p.length-3} or
+        coalesce(u.last_name ,'') ilike $${p.length-0} or
+        u.id::text = $${p.length-1} or
+        coalesce(u.vk_id::text,'') ilike $${p.length-2}
+      )`;
+    }
+    p.push(take, skip);
+
+    const sql=`
+      with base as (
+        select
+          coalesce(u.hum_id, u.id)       as hum_id,
+          u.id                            as user_id,
+          u.vk_id                         as vk_id,
+          coalesce(u.first_name,'')       as first_name,
+          coalesce(u.last_name,'')        as last_name,
+          coalesce(u.balance,0)           as balance_raw,
+          coalesce(u.country_code,'')     as country_code,
+          coalesce(u.country_name,'')     as country_name,
+          coalesce(u.created_at, now())   as created_at,
+          array_remove(array[
+            case when u.vk_id is not null and u.vk_id::text !~ '^tg:' then 'vk' end,
+            case when u.vk_id::text ilike 'tg:%' then 'tg' end
+          ], null) as providers
+        from users u
+        ${where}
+        order by 1 asc, 2 asc
+        limit $${p.length-1} offset $${p.length}
+      )
+      select b.*, sum(b.balance_raw) over(partition by b.hum_id) as balance_hum
+      from base b;
+    `;
+    const r=await db.query(sql,p);
+    const rows=(r.rows||[]).map(u=>({
+      HUMid:u.hum_id, hum_id:u.hum_id, id:u.hum_id,
+      user_id:u.user_id, vk_id:u.vk_id,
+      first_name:u.first_name, last_name:u.last_name,
+      balance_raw:Number(u.balance_raw||0),
+      balance:Number(u.balance_hum||0),
+      country:u.country_code || u.country_name || '',
+      country_code:u.country_code, country_name:u.country_name,
+      created_at:u.created_at, providers:u.providers
+    }));
+    res.json({ ok:true, users:rows, rows });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
+});
+
+/* -------------------- admin_topup -------------------- */
+// POST /api/admin/users/:id/topup?mode=user|hum  body: { amount(≠0), comment }
+router.post('/users/:id/topup', async (req, res) => {
   try {
-    const days = parseIntSafe(req.query.days, 7);
+    const userId = Number(req.params.id || 0);
+    const amount = Math.trunc(Number(
+      req.body.amount ?? req.body.value ?? req.body.sum ?? req.body.delta
+    ) || 0);
+    const comment = String(
+      req.body.comment ?? req.body.note ?? req.body.reason ?? req.body.description ?? ''
+    ).trim();
+    const mode = String(req.query.mode || 'user'); // 'user' (default) or 'hum'
 
-    // users total
-    let totalUsers = 0;
-    try {
-      const r = await db`SELECT COUNT(*)::int AS c FROM users`;
-      totalUsers = r?.[0]?.c ?? 0;
-    } catch {}
+    if (!userId) return res.status(400).json({ ok:false, error:'user_required' });
+    if (!amount)  return res.status(400).json({ ok:false, error:'amount_required' });
+    if (!comment) return res.status(400).json({ ok:false, error:'comment_required' });
 
-    // auth_accounts total
-    let totalAuth = 0;
-    try {
-      const r = await db`SELECT COUNT(*)::int AS c FROM auth_accounts`;
-      totalAuth = r?.[0]?.c ?? 0;
-    } catch {}
+    const ru = await db.query(
+      'select id, coalesce(hum_id, id) hum_id from users where id = $1 limit 1',[userId]
+    );
+    if (!ru.rows?.length) return res.status(404).json({ ok:false, error:'user_not_found' });
+    const humId = Number(ru.rows[0].hum_id);
 
-    // events last N days
-    let eventsLast = 0;
-    try {
-      const r = await db`
-        SELECT COUNT(*)::int AS c
-        FROM events
-        WHERE created_at >= now() - ${days} * interval '1 day'
-      `;
-      eventsLast = r?.[0]?.c ?? 0;
-    } catch {}
+    if (mode === 'hum') {
+      await db.query(
+        'update users set balance = coalesce(balance,0) + $2 where coalesce(hum_id,id) = $1',
+        [humId, amount]
+      );
+    } else {
+      await db.query(
+        'update users set balance = coalesce(balance,0) + $2 where id = $1',
+        [userId, amount]
+      );
+    }
+
+    const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
+    const ip = ipHeader.split(',')[0].trim();
+    const ua = (req.headers['user-agent'] || '').slice(0,256);
+
+    await logEvent({
+      user_id: userId,
+      event_type: 'admin_topup',
+      payload: { user_id: userId, hum_id: humId, amount, comment, mode },
+      ip, ua, country_code: null
+    });
+
+    const total = await db.query(
+      'select sum(coalesce(balance,0))::bigint as hum_balance from users where coalesce(hum_id,id) = $1',
+      [humId]
+    );
+    res.json({ ok:true, hum_id: humId, new_balance: Number(total.rows?.[0]?.hum_balance || 0) });
+  } catch (e) {
+    console.error('admin topup error', e);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+});
+
+/* -------------------- events / summary / daily -------------------- */
+router.get('/events', async (req,res)=>{ 
+  try{
+    const cols = await getCols('events');
+    if (!cols.size) return res.json({ ok:true, events:[], rows:[] });
+
+    const take = Math.min(200, Math.max(1, parseInt(req.query.take||'50',10)));
+    const skip = Math.max(0, parseInt(req.query.skip||'0',10));
+
+    const has = (c)=>cols.has(c);
+    const idCol   = has('id') ? 'e.id' : 'row_number() over()';
+    const uidCol  = has('user_id') ? 'e.user_id'
+                  : has('uid')      ? 'e.uid'
+                  : has('user')     ? 'e."user"'
+                  : null;
+    const typeExpr= has('event_type') ? 'e.event_type::text'
+                  : has('type')       ? 'e."type"::text'
+                  : `NULL::text`;
+    const ipCol   = has('ip')        ? 'e.ip' : `NULL::text`;
+    const uaCol   = has('ua')        ? 'e.ua'
+                  : has('user_agent') ? 'e.user_agent'
+                  : `NULL::text`;
+    const tsCol   = has('created_at')? 'e.created_at'
+                  : has('ts')         ? 'e.ts'
+                  : has('time')       ? 'e.time'
+                  : 'now()';
+
+    const amountExpr = `
+      COALESCE(
+        ${has('amount') ? 'e.amount::bigint' : 'NULL'},
+        ${has('payload') ? "NULLIF((e.payload->>'amount'),'')::bigint" : 'NULL'},
+        ${has('payload') ? "NULLIF((e.payload->>'value'),'')::bigint"  : 'NULL'},
+        ${has('payload') ? "NULLIF((e.payload->>'sum'),'')::bigint"    : 'NULL'},
+        ${has('payload') ? "NULLIF((e.payload->>'delta'),'')::bigint"  : 'NULL'},
+        0::bigint
+      )`;
+
+    const commentExpr = `
+      COALESCE(
+        ${has('comment') ? 'NULLIF(e.comment, \'\')' : 'NULL'},
+        ${has('meta') ? "NULLIF(e.meta->>'comment','')" : 'NULL'},
+        ${has('meta') ? "NULLIF(e.meta->>'note','')"     : 'NULL'},
+        ${has('meta') ? "NULLIF(e.meta->>'reason','')"   : 'NULL'},
+        ${has('meta') ? "NULLIF(e.meta->>'description','')" : 'NULL'},
+        ${has('payload') ? "NULLIF(e.payload->>'comment','')" : 'NULL'},
+        ${has('payload') ? "NULLIF(e.payload->>'note','')"     : 'NULL'},
+        ${has('payload') ? "NULLIF(e.payload->>'reason','')"   : 'NULL'},
+        ${has('payload') ? "NULLIF(e.payload->>'description','')" : 'NULL'}
+      )`;
+
+    const humExpr = `
+      COALESCE(
+        ${has('hum_id') ? 'e.hum_id' : 'NULL'},
+        ${has('payload') ? "NULLIF((e.payload->>'hum_id'),'')::bigint" : 'NULL'},
+        ${uidCol ? 'u.hum_id' : 'NULL'},
+        ${uidCol ? 'u.id'     : 'NULL'}
+      )`;
+
+    const p=[]; const cond=[];
+    const et = (req.query.type || req.query.event_type || '').toString().trim();
+    if (et && (has('event_type') || has('type'))) {
+      if (cols.has('event_type')) cond.push(`e.event_type = $${p.push(et)}`);
+      else                        cond.push(`e."type"     = $${p.push(et)}`);
+    }
+    const uid = (req.query.user_id||'').toString().trim();
+    if (uid && uidCol) cond.push(`${uidCol} = $${p.push(parseInt(uid,10)||0)}`);
+    const where = cond.length ? ('where ' + cond.join(' and ')) : '';
+
+    const joinUsers = !!uidCol;
+    p.push(Math.min(200, Math.max(1, parseInt(req.query.take||'50',10))), Math.max(0, parseInt(req.query.skip||'0',10)));
+    const sql = `
+      select
+        ${idCol}  as event_id,
+        ${uidCol ? uidCol : (has('payload') ? "NULLIF((e.payload->>'user_id'),'')::bigint" : 'NULL')} as user_id,
+        ${typeExpr} as event_type,
+        ${ipCol}   as ip,
+        ${uaCol}   as ua,
+        ${tsCol}   as created_at,
+        ${amountExpr} as amount,
+        ${commentExpr} as comment,
+        ${humExpr} as hum_id
+      from events e
+      ${joinUsers ? `left join users u on u.id = ${uidCol}` : ''}
+      ${where}
+      order by ${cols.has('id') ? 'e.id' : 'created_at'} desc
+      limit $${p.length-1} offset $${p.length};
+    `;
+    const r=await db.query(sql,p);
+    const rows=(r.rows||[]).map(e=>({
+      id:e.event_id,
+      user_id:e.user_id!=null ? Number(e.user_id) : null,
+      HUMid:e.hum_id!=null ? Number(e.hum_id) : null,
+      event_type:e.event_type, type:e.event_type,
+      ip:e.ip, ua:e.ua, created_at:e.created_at,
+      amount: e.amount!=null ? Number(e.amount) : 0,
+      comment: e.comment || null
+    }));
+    res.json({ ok:true, events:rows, rows });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
+});
+
+/* -------------------- summary / daily -------------------- */
+router.get('/summary', async (req,res)=>{ 
+  try{
+    const tz = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
+    const incl = wantHum(req);
+
+    const u = await db.query('select count(*)::int as c from users');
+    const users = u.rows?.[0]?.c ?? 0;
+
+    const haveEvents = await db.query("select to_regclass('public.events') as r");
+    if (!haveEvents.rows?.[0]?.r) {
+      return res.json({ ok:true, users, events:0, auth7:0, auth7_total:0, unique7:0 });
+    }
+
+    const cols = await getCols('events');
+    const typeExpr = cols.has('event_type') ? 'e.event_type::text'
+                    : cols.has('type')       ? 'e."type"::text'
+                    : `NULL::text`;
+
+    const e = await db.query('select count(*)::int as c from events');
+    const events = e.rows?.[0]?.c ?? 0;
+
+    const sql = `
+      with b as (
+        select (now() at time zone $1)::date as today,
+               ((now() at time zone $1)::date - interval '7 days') as since
+      ),
+      ev as (select e.user_id, ${tzExprN(1,'created_at','e')} as ts_msk, ${typeExpr} as et from events e),
+      login as (select user_id, ts_msk from ev where et ilike '%login%success%'),
+      auth  as (select user_id, ts_msk from ev where et ilike '%auth%success%'),
+      auth_orphan as (
+        select a.user_id, a.ts_msk
+          from auth a left join login l
+            on l.user_id = a.user_id and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
+         where l.user_id is null
+      ),
+      canon as (select * from login union all select * from auth_orphan)
+      select
+        (select count(*)::int from canon c where c.ts_msk::date >= (select since from b)) as auth7_total,
+        (select count(distinct coalesce(u.hum_id,u.id))::int from canon c join users u on u.id=c.user_id
+          where c.ts_msk::date >= (select since from b)) as auth7
+    `;
+    const r = await db.query(sql, [tz]);
+    const x = r.rows?.[0] || {};
+
+    const rU = await db.query(
+      `select count(distinct coalesce(u.hum_id,u.id))::int as c
+         from events e join users u on u.id=e.user_id
+        where (${tzExprN(1,'created_at','e')}) > (now() at time zone $1) - interval '7 days'`,
+      [tz]
+    );
 
     res.json({
-      ok: true,
-      data: {
-        total_users: totalUsers,
-        total_auth_accounts: totalAuth,
-        events_last_days: eventsLast,
-      },
+      ok:true,
+      users,
+      events,
+      auth7_total: Number(x.auth7_total || 0),
+      auth7:       Number(x.auth7 || 0),
+      unique7:     Number(rU.rows?.[0]?.c || 0),
     });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
+  }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
 });
 
-// ====== RANGE: аналитика по диапазону ======
-// GET /api/admin/range?d1=2025-10-01&d2=2025-10-31&tz=Europe/Moscow
-router.get('/admin/range', requireAdmin, async (req, res) => {
-  try {
-    const d1 = req.query.d1 ? String(req.query.d1) : isoDay(Date.now() - 6 * 86400000);
-    const d2 = req.query.d2 ? String(req.query.d2) : isoDay(Date.now());
-    // tz можно использовать на фронте, тут оно не критично
-    // unique = новые пользователи за день
-    // visits = кол-во событий авторизации/логина за день
+async function daily(req,res){
+  try{
+    const days = Math.max(1,Math.min(31,parseInt(req.query.days||'7',10)));
+    const tz   = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
+    const incl = wantHum(req);
 
-    let series = [];
-    try {
-      const r = await db`
-        WITH days AS (
-          SELECT generate_series(${d1}::date, ${d2}::date, '1 day') AS d
-        ),
-        new_users AS (
-          SELECT created_at::date AS d, COUNT(*)::int AS c
-          FROM users
-          WHERE created_at::date BETWEEN ${d1}::date AND ${d2}::date
-          GROUP BY 1
-        ),
-        visits AS (
-          SELECT created_at::date AS d, COUNT(*)::int AS c
-          FROM events
-          WHERE created_at::date BETWEEN ${d1}::date AND ${d2}::date
-            AND (event_type IN ('auth','login','tg_auth','vk_auth') OR event_type ILIKE '%auth%')
-          GROUP BY 1
-        )
-        SELECT
-          days.d::text AS day,
-          COALESCE(new_users.c, 0) AS uniques,
-          COALESCE(visits.c, 0) AS visits
-        FROM days
-        LEFT JOIN new_users ON new_users.d = days.d
-        LEFT JOIN visits ON visits.d = days.d
-        ORDER BY days.d ASC
-      `;
-      series = r ?? [];
-    } catch {
-      // если таблиц нет — отдадим пустую серийность
-      const start = new Date(d1);
-      const end = new Date(d2);
-      const arr = [];
-      for (let t = +start; t <= +end; t += 86400000) {
-        arr.push({ day: isoDay(t), uniques: 0, visits: 0 });
-      }
-      series = arr;
+    const cols = await getCols('events');
+    const typeExpr = cols.has('event_type') ? 'e.event_type::text'
+                    : cols.has('type')       ? 'e."type"::text'
+                    : `NULL::text`;
+
+    const sql = `
+      with b as (
+        select (now() at time zone $1)::date as today,
+               ((now() at time zone $1)::date - ($2::int - 1)) as since
+      ),
+      d(day) as (select generate_series((select since from b),(select today from b), interval '1 day')),
+      ev as (
+        select e.user_id, ${tzExprN(1,'created_at','e')} as ts_msk, ${typeExpr} as et
+          from events e
+         where (${tzExprN(1,'created_at','e')})::date >= (select since from b)
+      ),
+      login as (select user_id, ts_msk from ev where et ilike '%login%success%'),
+      auth  as (select user_id, ts_msk from ev where et ilike '%auth%success%'),
+      auth_orphan as (
+        select a.user_id, a.ts_msk
+          from auth a left join login l
+            on l.user_id = a.user_id and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
+         where l.user_id is null
+      ),
+      canon as (select * from login union all select * from auth_orphan),
+      totals as ( select c.ts_msk::date d, count(*) c from canon c group by 1 ),
+      uniq   as ( select c.ts_msk::date d, count(distinct CASE WHEN $3::boolean THEN coalesce(u.hum_id,u.id) ELSE u.id END) c
+                  from canon c join users u on u.id=c.user_id group by 1 )
+      select to_char(d.day,'YYYY-MM-DD') as day,
+             coalesce(t.c,0) as auth_total,
+             coalesce(u.c,0) as auth_unique
+        from d
+        left join totals t on t.d=d.day
+        left join uniq   u on u.d=d.day
+       order by d.day asc
+    `;
+    const r = await db.query(sql, [tz, days, incl]);
+    const rows = (r.rows||[]).map(x=>({ date:x.day, auth_total:Number(x.auth_total||0), auth_unique:Number(x.auth_unique||0) }));
+    res.json({ ok:true, days: rows });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e?.message||e) }); }
+}
+router.get('/daily', daily);
+router.get('/summary/daily', daily);
+
+/* -------------------- NEW: /api/admin/range -------------------- */
+router.get('/range', async (req, res) => {
+  try {
+    const tz = (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
+    const incl = wantHum(req);
+    const fromStr = (req.query.from || '').toString().trim(); // 'YYYY-MM-DD' или ''
+    const toStr   = (req.query.to   || '').toString().trim();
+
+    // Если таблицы events нет — отдаём пусто
+    const haveEvents = await db.query("select to_regclass('public.events') as r");
+    if (!haveEvents.rows?.[0]?.r) {
+      return res.json({ ok:true, from:null, to:null, days:[] });
     }
 
-    res.json({ ok: true, data: series });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
+    // Вычисляем from/to
+    let fromDate = null;
+    if (fromStr && /^\d{4}-\d{2}-\d{2}$/.test(fromStr)) {
+      fromDate = fromStr;
+    } else {
+      const rMin = await db.query(
+        `select to_char(min((${tzExprN(1,'created_at','e')})::date), 'YYYY-MM-DD') as d from events e`,
+        [tz]
+      );
+      fromDate = rMin.rows?.[0]?.d || new Date().toISOString().slice(0,10);
+    }
+    let toDate = null;
+    if (toStr && /^\d{4}-\d{2}-\d{2}$/.test(toStr)) {
+      toDate = toStr;
+    } else {
+      const rNow = await db.query(`select to_char((now() at time zone $1)::date,'YYYY-MM-DD') as d`, [tz]);
+      toDate = rNow.rows?.[0]?.d || new Date().toISOString().slice(0,10);
+    }
 
-// ====== USERS: таблица пользователей с провайдерами ======
-// GET /api/admin/users?limit=50&offset=0&search=term
-router.get('/admin/users', requireAdmin, async (req, res) => {
-  try {
-    const limit = Math.min(Math.max(parseIntSafe(req.query.limit, 50), 1), 200);
-    const offset = Math.max(parseIntSafe(req.query.offset, 0), 0);
-    const search = (req.query.search || '').toString().trim();
+    // Ограничим на всякий случай (<= 3 лет)
+    const rDays = await db.query(
+      `select (to_date($2,'YYYY-MM-DD') - to_date($1,'YYYY-MM-DD'))::int as days`,
+      [fromDate, toDate]
+    );
+    const daysSpan = Math.max(0, Number(rDays.rows?.[0]?.days || 0));
+    if (daysSpan > 1095) return res.status(400).json({ ok:false, error:'range_too_wide' });
 
-    let users = [];
-    try {
-      if (search) {
-        users = await db`
-          SELECT u.id, u.hum_id, u.first_name, u.last_name, u.country, u.balance,
-                 u.created_at, u.updated_at
-          FROM users u
-          WHERE CAST(u.id AS text) ILIKE ${'%' + search + '%'}
-             OR COALESCE(u.first_name,'') ILIKE ${'%' + search + '%'}
-             OR COALESCE(u.last_name,'') ILIKE ${'%' + search + '%'}
-          ORDER BY u.id DESC
-          LIMIT ${limit} OFFSET ${offset}
-        `;
-      } else {
-        users = await db`
-          SELECT u.id, u.hum_id, u.first_name, u.last_name, u.country, u.balance,
-                 u.created_at, u.updated_at
-          FROM users u
-          ORDER BY u.id DESC
-          LIMIT ${limit} OFFSET ${offset}
-        `;
-      }
-    } catch {}
+    // Тип события — как в daily: login_success или auth_success
+    const cols = await getCols('events');
+    const typeExpr = cols.has('event_type') ? 'e.event_type::text'
+                    : cols.has('type')       ? 'e."type"::text'
+                    : `NULL::text`;
 
-    // подтащим провайдеров
-    let mapProviders = new Map();
-    try {
-      const ids = users.map(u => u.id);
-      if (ids.length) {
-        const prov = await db`
-          SELECT aa.user_id, aa.provider, aa.provider_user_id
-          FROM auth_accounts aa
-          WHERE aa.user_id = ANY(${ids})
-        `;
-        for (const p of prov) {
-          const arr = mapProviders.get(p.user_id) || [];
-          arr.push({ provider: p.provider, provider_user_id: p.provider_user_id });
-          mapProviders.set(p.user_id, arr);
-        }
-      }
-    } catch {}
-
-    const rows = users.map(u => ({
-      ...u,
-      providers: mapProviders.get(u.id) || [],
+    const sql = `
+      with b as (
+        select to_date($2,'YYYY-MM-DD') as d1,
+               to_date($3,'YYYY-MM-DD') as d2
+      ),
+      d(day) as (select generate_series((select d1 from b),(select d2 from b), interval '1 day')::date),
+      ev as (
+        select e.user_id, ${tzExprN(1,'created_at','e')} as ts_msk, ${typeExpr} as et
+          from events e
+         where (${tzExprN(1,'created_at','e')})::date between (select d1 from b) and (select d2 from b)
+      ),
+      login as (select user_id, ts_msk from ev where et ilike '%login%success%'),
+      auth  as (select user_id, ts_msk from ev where et ilike '%auth%success%'),
+      auth_orphan as (
+        select a.user_id, a.ts_msk
+          from auth a left join login l
+            on l.user_id = a.user_id and abs(extract(epoch from (a.ts_msk - l.ts_msk))) <= 600
+         where l.user_id is null
+      ),
+      canon  as (select * from login union all select * from auth_orphan),
+      totals as ( select c.ts_msk::date d, count(*) c from canon c group by 1 ),
+      uniq   as ( select c.ts_msk::date d, count(distinct coalesce(u.hum_id,u.id)) c
+                   from canon c join users u on u.id=c.user_id group by 1 )
+      select to_char(d.day,'YYYY-MM-DD') as day,
+             coalesce(t.c,0)::int as auth_total,
+             coalesce(u.c,0)::int as auth_unique
+        from d
+        left join totals t on t.d=d.day
+        left join uniq   u on u.d=d.day
+       order by d.day asc
+    `;
+    const r = await db.query(sql, [tz, fromDate, toDate]);
+    const rows = (r.rows||[]).map(x => ({
+      day: x.day, auth_total: Number(x.auth_total||0), auth_unique: Number(x.auth_unique||0)
     }));
-
-    res.json({ ok: true, data: rows });
+    res.json({ ok:true, from: fromDate, to: toDate, days: rows });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-// ====== EVENTS: лента событий ======
-// GET /api/admin/events?limit=100&offset=0&user_id=&term=
-router.get('/admin/events', requireAdmin, async (req, res) => {
-  try {
-    const limit = Math.min(Math.max(parseIntSafe(req.query.limit, 100), 1), 500);
-    const offset = Math.max(parseIntSafe(req.query.offset, 0), 0);
-    const userId = parseIntSafe(req.query.user_id, 0);
-    const term = (req.query.term || '').toString().trim();
-
-    let events = [];
-    try {
-      if (userId) {
-        events = await db`
-          SELECT id, event_type, user_id, hum_id, ip, ua, payload, created_at
-          FROM events
-          WHERE user_id = ${userId}
-          ORDER BY id DESC
-          LIMIT ${limit} OFFSET ${offset}
-        `;
-      } else if (term) {
-        events = await db`
-          SELECT id, event_type, user_id, hum_id, ip, ua, payload, created_at
-          FROM events
-          WHERE CAST(user_id AS text) ILIKE ${'%' + term + '%'}
-             OR CAST(hum_id AS text) ILIKE ${'%' + term + '%'}
-             OR event_type ILIKE ${'%' + term + '%'}
-          ORDER BY id DESC
-          LIMIT ${limit} OFFSET ${offset}
-        `;
-      } else {
-        events = await db`
-          SELECT id, event_type, user_id, hum_id, ip, ua, payload, created_at
-          FROM events
-          ORDER BY id DESC
-          LIMIT ${limit} OFFSET ${offset}
-        `;
-      }
-    } catch {}
-
-    res.json({ ok: true, data: events });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-// ====== TOPUP: ручное пополнение ======
-// POST /api/admin/topup  { user_id, amount }
-router.post('/admin/topup', requireAdmin, async (req, res) => {
-  try {
-    const userId = parseIntSafe(req.body?.user_id, 0);
-    const amount = parseFloatSafe(req.body?.amount, 0);
-    if (!userId || !Number.isFinite(amount) || amount === 0) {
-      return res.status(400).json({ ok: false, error: 'bad_params' });
-    }
-
-    // обновим баланс
-    let updated = null;
-    try {
-      const r = await db`
-        UPDATE users
-        SET balance = COALESCE(balance,0) + ${amount}, updated_at = now()
-        WHERE id = ${userId}
-        RETURNING id, balance
-      `;
-      updated = r?.[0] || null;
-    } catch (e) {
-      return res.status(500).json({ ok: false, error: 'db_update_failed' });
-    }
-
-    // зафиксируем транзакцию если есть таблица
-    try {
-      await db`
-        INSERT INTO transactions (user_id, amount, type, meta, created_at)
-        VALUES (${userId}, ${amount}, 'admin_topup', '{"source":"admin"}', now())
-      `;
-    } catch {}
-
-    // ивент
-    try {
-      await logEvent('admin_topup', { user_id: userId }, { amount });
-    } catch {}
-
-    res.json({ ok: true, data: updated });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    console.error('admin /range error', e);
+    res.status(500).json({ ok:false, error:'server_error' });
   }
 });
 
