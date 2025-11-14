@@ -1,4 +1,4 @@
-// src/routes_admin.js — consolidated admin API (users, events, summary, daily, range, schema) with HUM analytics
+// src/routes_admin.js — consolidated admin API + manual topup
 import express from 'express';
 import { db } from './db.js';
 
@@ -39,7 +39,6 @@ async function hasCol(table,col){
 router.get('/ping', adminGuard, (_req,res)=>res.json({ ok:true, now:new Date().toISOString() }));
 
 // ---- USERS ----
-// GET /api/admin/users?search=&take=50&skip=0
 router.get('/users', adminGuard, async (req,res)=>{
   try{
     if (!await tableExists('users')) return res.json({ ok:true, users:[], rows:[] });
@@ -89,7 +88,6 @@ router.get('/users', adminGuard, async (req,res)=>{
 });
 
 // ---- EVENTS ----
-// GET /api/admin/events?term=&user_id=&take=50&skip=0
 router.get('/events', adminGuard, async (req,res)=>{
   try{
     if (!await tableExists('events')) return res.json({ ok:true, events:[], rows:[] });
@@ -141,6 +139,45 @@ router.get('/events', adminGuard, async (req,res)=>{
   }catch(e){
     console.error('admin /events error:', e);
     res.json({ ok:true, events:[], rows:[] });
+  }
+});
+
+// ---- MANUAL TOPUP ----
+// POST /api/admin/users/:id/topup  { amount, comment }
+// Adds amount (bigint) to users.balance, logs event "admin_topup"
+router.post('/users/:id/topup', adminGuard, async (req,res)=>{
+  const userId = toInt(req.params.id, 0);
+  let amount = toInt(req.body?.amount, NaN);
+  const comment = (req.body?.comment ?? '').toString().slice(0, 512);
+  if (!userId || !Number.isFinite(amount)) return res.status(400).json({ ok:false, error:'bad_params' });
+
+  try{
+    // fetch hum_id
+    const u = await db.query('select id, coalesce(hum_id,id) as hum_id, coalesce(balance,0)::bigint as balance from users where id=$1', [userId]);
+    if (!u.rows.length) return res.status(404).json({ ok:false, error:'user_not_found' });
+    const humId = u.rows[0].hum_id;
+
+    await db.query('begin');
+    const upd = await db.query('update users set balance = coalesce(balance,0)::bigint + $2::bigint, updated_at=now() where id=$1 returning balance', [userId, amount]);
+    const newBalance = upd.rows?.[0]?.balance ?? null;
+
+    // log event if table exists
+    if (await tableExists('events')){
+      const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
+      const ip = ipHeader.split(',')[0].trim();
+      const ua = (req.headers['user-agent'] || '').slice(0,256);
+      await db.query(`
+        insert into events (event_type, user_id, hum_id, payload, ip, ua, created_at)
+        values ('admin_topup', $1, $2, jsonb_build_object('amount',$3,'comment',$4), $5, $6, now())
+      `,[userId, humId, amount, comment, ip, ua]);
+    }
+
+    await db.query('commit');
+    res.json({ ok:true, user_id:userId, hum_id:humId, amount, balance:newBalance });
+  }catch(e){
+    await db.query('rollback').catch(()=>{});
+    console.error('admin topup error', e);
+    res.status(500).json({ ok:false, error:'server_error' });
   }
 });
 
