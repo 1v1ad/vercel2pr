@@ -88,22 +88,37 @@ router.get('/users', adminGuard, async (req,res)=>{
 });
 
 // ---- EVENTS ----
+// ---- EVENTS ----
 router.get('/events', adminGuard, async (req,res)=>{
   try{
-    if (!await tableExists('events')) return res.json({ ok:true, events:[], rows:[] });
+    if (!await tableExists('events')) {
+      return res.json({ ok:true, events:[], rows:[] });
+    }
     const take = Math.min(Math.max(toInt(req.query.take,50),1),500);
     const skip = Math.max(toInt(req.query.skip,0),0);
     const userId = toInt(req.query.user_id, 0);
+    const type = (req.query.type || req.query.event_type || '').toString().trim();
     const term = (req.query.term || req.query.search || '').toString().trim();
 
     const hasEventType = await hasCol('events','event_type');
     const hasType      = await hasCol('events','type');
-    const etExpr = hasEventType ? 'e.event_type::text' : (hasType ? 'e."type"::text' : 'NULL::text');
+    const etExpr = hasEventType
+      ? 'e.event_type::text'
+      : (hasType ? 'e."type"::text' : 'NULL::text');
 
     const base = `with canon as (
-      select e.id, e.user_id, u.hum_id, e.ip, e.ua, ${etExpr} as event_type, e.created_at
-        from events e
-        left join users u on u.id = e.user_id
+      select
+        e.id,
+        e.user_id,
+        coalesce(e.hum_id, u.hum_id) as hum_id,
+        e.ip,
+        e.ua,
+        ${etExpr} as event_type,
+        e.amount,
+        e.payload,
+        e.created_at
+      from events e
+      left join users u on u.id = e.user_id
     )`;
 
     let sql, params;
@@ -115,6 +130,14 @@ router.get('/events', adminGuard, async (req,res)=>{
          limit $2 offset $3
       `;
       params = [userId, take, skip];
+    } else if (type){
+      sql = base + `
+        select * from canon
+         where coalesce(event_type,'') = $1
+         order by id desc
+         limit $2 offset $3
+      `;
+      params = [type, take, skip];
     } else if (term){
       sql = base + `
         select * from canon
@@ -144,60 +167,67 @@ router.get('/events', adminGuard, async (req,res)=>{
 
 // ---- MANUAL TOPUP ----
 // POST /api/admin/users/:id/topup  { amount, comment }
-// Adds amount (integer) to users.balance, logs event "admin_topup"
+// Adds amount (bigint) to users.balance, logs event "admin_topup"
 router.post('/users/:id/topup', adminGuard, async (req,res)=>{
   const userId = toInt(req.params.id, 0);
-  let amount = toInt(req.body?.amount, NaN);
+  const rawAmount = req.body?.amount;
+  let amount = Number.isFinite(rawAmount) ? rawAmount : toInt(rawAmount, NaN);
   const comment = (req.body?.comment ?? '').toString().slice(0, 512);
 
-  // amount должен быть ненулевым целым
-  if (!userId || !Number.isFinite(amount) || !amount) {
+  if (!userId || !Number.isFinite(amount) || !amount){
     return res.status(400).json({ ok:false, error:'bad_params' });
   }
 
   try{
-    // 1) получаем hum_id и текущий баланс
+    // fetch hum_id for logging
     const uRes = await db.query(
-      'select id, coalesce(hum_id,id) as hum_id, coalesce(balance,0)::bigint as balance from users where id=$1',
+      'select id, coalesce(hum_id,id) as hum_id from users where id=$1',
       [userId]
     );
-    if (!uRes.rows.length) {
+    if (!uRes.rows.length){
       return res.status(404).json({ ok:false, error:'user_not_found' });
     }
     const humId = uRes.rows[0].hum_id;
 
-    // 2) обновляем баланс и логируем событие в одной транзакции
     await db.query('begin');
-    const updRes = await db.query(
+
+    // update balance
+    const upd = await db.query(
       'update users set balance = coalesce(balance,0)::bigint + $2::bigint, updated_at=now() where id=$1 returning balance',
       [userId, amount]
     );
-    const newBalance = updRes.rows?.[0]?.balance ?? null;
+    const newBalance = upd.rows?.[0]?.balance ?? null;
 
-    // 3) лог события, если таблица events существует
+    // log event if table exists
     if (await tableExists('events')){
       const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
-      const ip = ipHeader.split(',')[0].trim() || null;
-      const ua = (req.headers['user-agent'] || '').toString().slice(0,256);
-
+      const ip = ipHeader.split(',')[0].trim();
+      const ua = (req.headers['user-agent'] || '').slice(0,256);
       await db.query(`
         insert into events (event_type, user_id, hum_id, amount, payload, ip, ua, created_at)
-        values ('admin_topup', $1, $2, $3, jsonb_build_object('amount',$3,'comment',$4), $5, $6, now())
+        values (
+          'admin_topup',
+          $1,
+          $2,
+          $3,
+          jsonb_build_object('amount',$3::bigint,'comment',$4::text),
+          $5,
+          $6,
+          now()
+        )
       `,[userId, humId, amount, comment, ip, ua]);
     }
 
     await db.query('commit');
-    return res.json({ ok:true, user_id:userId, hum_id:humId, amount, balance:newBalance });
+    res.json({ ok:true, user_id:userId, hum_id:humId, amount, balance:newBalance });
   }catch(e){
     await db.query('rollback').catch(()=>{});
     console.error('admin topup error', e);
-    // временно возвращаем detail для дебага
-    return res.status(500).json({ ok:false, error:'server_error', detail:String(e?.message || e) });
+    res.status(500).json({ ok:false, error:'server_error', detail:String(e?.message || e) });
   }
 });
 
 // ---- SUMMARY ----
-
 router.get('/summary', adminGuard, async (req,res)=>{
   try{
     const tz = tzOf(req);
