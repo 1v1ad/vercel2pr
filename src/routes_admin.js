@@ -94,6 +94,7 @@ router.get('/events', adminGuard, async (req,res)=>{
     const take = Math.min(Math.max(toInt(req.query.take,50),1),500);
     const skip = Math.max(toInt(req.query.skip,0),0);
     const userId = toInt(req.query.user_id, 0);
+    const type = (req.query.type || req.query.event_type || '').toString().trim();
     const term = (req.query.term || req.query.search || '').toString().trim();
 
     const hasEventType = await hasCol('events','event_type');
@@ -101,9 +102,18 @@ router.get('/events', adminGuard, async (req,res)=>{
     const etExpr = hasEventType ? 'e.event_type::text' : (hasType ? 'e."type"::text' : 'NULL::text');
 
     const base = `with canon as (
-      select e.id, e.user_id, u.hum_id, e.ip, e.ua, ${etExpr} as event_type, e.created_at
-        from events e
-        left join users u on u.id = e.user_id
+      select
+        e.id,
+        e.user_id,
+        coalesce(e.hum_id, u.hum_id) as hum_id,
+        e.ip,
+        e.ua,
+        ${etExpr} as event_type,
+        e.amount,
+        e.payload,
+        e.created_at
+      from events e
+      left join users u on u.id = e.user_id
     )`;
 
     let sql, params;
@@ -115,6 +125,14 @@ router.get('/events', adminGuard, async (req,res)=>{
          limit $2 offset $3
       `;
       params = [userId, take, skip];
+    } else if (type){
+      sql = base + `
+        select * from canon
+         where coalesce(event_type,'') = $1
+         order by id desc
+         limit $2 offset $3
+      `;
+      params = [type, take, skip];
     } else if (term){
       sql = base + `
         select * from canon
@@ -167,8 +185,8 @@ router.post('/users/:id/topup', adminGuard, async (req,res)=>{
       const ip = ipHeader.split(',')[0].trim();
       const ua = (req.headers['user-agent'] || '').slice(0,256);
       await db.query(`
-        insert into events (event_type, user_id, hum_id, payload, ip, ua, created_at)
-        values ('admin_topup', $1, $2, jsonb_build_object('amount',$3,'comment',$4), $5, $6, now())
+        insert into events (event_type, user_id, hum_id, amount, payload, ip, ua, created_at)
+        values ('admin_topup', $1, $2, $3, jsonb_build_object('amount',$3,'comment',$4), $5, $6, now())
       `,[userId, humId, amount, comment, ip, ua]);
     }
 
