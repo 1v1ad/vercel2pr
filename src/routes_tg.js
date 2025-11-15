@@ -33,6 +33,46 @@ function getSessionUid(req){
   return null;
 }
 
+// ------- GEOIP (через внешний API, без хранения IP) -------
+
+// лёгкий запрос к ipwho.is
+async function geoipCountryFromReq(req){
+  const ip = firstIp(req);
+  if (!ip || ip === '127.0.0.1' || ip === '::1') return null;
+  try{
+    const url = 'https://ipwho.is/' + encodeURIComponent(ip) + '?fields=success,country,country_code';
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (!j || j.success === false || !j.country_code) return null;
+    return {
+      code: String(j.country_code).toUpperCase(),
+      name: j.country || null
+    };
+  }catch(e){
+    console.warn('tg geoip lookup failed', e?.message || e);
+    return null;
+  }
+}
+
+async function ensureCountryFromIp(userId, req){
+  if (!userId) return;
+  const geo = await geoipCountryFromReq(req);
+  if (!geo) return;
+  try{
+    await db.query(
+      `update users
+          set country_code = coalesce(nullif(country_code,''), $1),
+              country_name = coalesce(nullif(country_name,''), $2),
+              updated_at   = now()
+        where id = $3`,
+      [geo.code, geo.name, Number(userId)]
+    );
+  }catch(e){
+    console.warn('ensureCountryFromIp tg failed', e?.message || e);
+  }
+}
+
 // --- Актёр TG = native user (users.vk_id = 'tg:<id>') ---
 async function getNativeTgUserId(tgId){
   if (!tgId) return null;
@@ -125,8 +165,10 @@ router.all('/callback', async (req, res) => {
         if (r.rows.length) masterHum = Number(r.rows[0].hum_id);
       }catch{}
       try {
-        await db.query("update users set hum_id=$1 where id=$2 and (hum_id is null or hum_id<>$1)",
-          [masterHum, actorUid]);
+        await db.query(
+          "update users set hum_id=$1 where id=$2 and (hum_id is null or hum_id<>$1)",
+          [masterHum, actorUid]
+        );
       } catch (e) {
         console.warn('tg link hum set failed', e?.message);
       }
@@ -155,7 +197,12 @@ router.all('/callback', async (req, res) => {
     // 6) мягкая склейка по устройству (опционально)
     try { if (deviceId) await autoMergeByDevice({ deviceId, tgId }); } catch {}
 
-    // 7) Редирект в лобби
+    // 7) GeoIP: пытаемся заполнить страну (если ещё не заполнена)
+    try {
+      await ensureCountryFromIp(actorUid || primaryUid || null, req);
+    } catch (_) {}
+
+    // 8) Редирект в лобби
     const frontend = process.env.FRONTEND_URL || 'http://localhost:5173';
     const url = new URL('/lobby.html', frontend);
     url.searchParams.set('provider','tg');
@@ -165,7 +212,7 @@ router.all('/callback', async (req, res) => {
     if (data.username)   url.searchParams.set('username',   safe(data.username));
     if (data.photo_url)  url.searchParams.set('photo_url',  safe(data.photo_url));
 
-    // 8) ЛОГ: auth_success — строго от лица TG-актёра (users.vk_id='tg:<id>')
+    // 9) ЛОГ: auth_success — строго от лица TG-актёра (users.vk_id='tg:<id>')
     try {
       await logEvent({
         user_id: actorUid || null,
