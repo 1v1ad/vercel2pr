@@ -87,6 +87,112 @@ router.get('/users', adminGuard, async (req,res)=>{
   }
 });
 
+
+// ---- HUM CLUSTER + UNMERGE ----
+
+// GET /api/admin/cluster?hum_id=123
+router.get('/cluster', adminGuard, async (req,res)=>{
+  try{
+    const humId = toInt(req.query.hum_id, 0);
+    if (!humId) return res.status(400).json({ ok:false, error:'bad_hum_id' });
+    if (!await tableExists('users')) return res.json({ ok:true, hum_id:humId, users:[] });
+
+    const uRes = await db.query(`
+      select id, first_name, last_name, country_code, balance, hum_id
+        from users
+       where coalesce(hum_id, id) = $1
+       order by id
+    `,[humId]);
+    const users = uRes.rows || [];
+
+    let accountsByUser = {};
+    if (users.length && await tableExists('auth_accounts')) {
+      const ids = users.map(u=>u.id);
+      const aRes = await db.query(`
+        select user_id, provider, provider_user_id
+          from auth_accounts
+         where user_id = any($1)
+         order by user_id, provider
+      `,[ids]);
+      accountsByUser = (aRes.rows || []).reduce((acc,row)=>{
+        (acc[row.user_id] = acc[row.user_id] || []).push({
+          provider: row.provider,
+          provider_user_id: row.provider_user_id
+        });
+        return acc;
+      },{});
+    }
+
+    const list = users.map(u=>({
+      id: u.id,
+      first_name: u.first_name,
+      last_name: u.last_name,
+      country_code: u.country_code,
+      balance: u.balance,
+      hum_id: u.hum_id,
+      accounts: accountsByUser[u.id] || []
+    }));
+
+    res.json({ ok:true, hum_id: humId, users: list });
+  }catch(e){
+    console.error('admin /cluster error:', e);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+});
+
+// POST /api/admin/unmerge  { hum_id, user_ids:[...], reason }
+router.post('/unmerge', adminGuard, async (req,res)=>{
+  const humId = toInt(req.body?.hum_id, 0);
+  const rawIds = Array.isArray(req.body?.user_ids) ? req.body.user_ids : [];
+  const ids = rawIds.map(v=>toInt(v,0)).filter(Boolean);
+  const reason = (req.body?.reason ?? '').toString().slice(0, 512);
+
+  if (!humId || !ids.length){
+    return res.status(400).json({ ok:false, error:'bad_params' });
+  }
+
+  try{
+    await db.query('begin');
+
+    const upd = await db.query(
+      `update users
+          set hum_id = null,
+              updated_at = now()
+        where id = any($1)
+          and coalesce(hum_id, id) = $2
+        returning id`,
+      [ids, humId]
+    );
+    const affected = (upd.rows || []).map(r=>r.id);
+
+    const ipHeader = (req.headers['x-forwarded-for'] || req.ip || '').toString();
+    const ip = ipHeader.split(',')[0].trim();
+    const ua = (req.headers['user-agent'] || '').slice(0,256);
+
+    if (await tableExists('events')){
+      const payload = {
+        hum_id: humId,
+        user_ids: affected,
+        requested_ids: ids,
+        reason
+      };
+      await db.query(
+        `insert into events (event_type, user_id, hum_id, amount, payload, ip, ua, created_at)
+         values ('admin_unmerge_manual', $1, $2, 0, $3, $4, $5, now())`,
+        [affected[0] || null, humId, payload, ip, ua]
+      );
+    }
+
+    await db.query('commit');
+
+    res.json({ ok:true, hum_id: humId, user_ids: affected, requested_ids: ids });
+  }catch(e){
+    await db.query('rollback').catch(()=>{});
+    console.error('admin /unmerge error:', e);
+    res.status(500).json({ ok:false, error:'server_error', detail:String(e?.message || e) });
+  }
+});
+
 // ---- EVENTS ----
 // ---- EVENTS ----
 router.get('/events', adminGuard, async (req,res)=>{
