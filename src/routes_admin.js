@@ -425,37 +425,42 @@ router.get('/daily', adminGuard, async (req,res)=>{
 
 // ---- RANGE ----
 router.get('/range', adminGuard, async (req,res)=>{
-  try{
+  try {
     if (!await tableExists('events')) {
       return res.json({ ok:true, from:null, to:null, days:[] });
     }
 
     const tz   = tzOf(req);
     const incl = wantHum(req);
+
     let fromStr = (req.query.from || '').toString().trim();
     let toStr   = (req.query.to   || '').toString().trim();
 
     const hasEventType = await hasCol('events','event_type');
     const hasType      = await hasCol('events','type');
-    const etExpr = hasEventType ? 'e.event_type::text'
-                                : (hasType ? 'e."type"::text' : 'NULL::text');
+    const etExpr = hasEventType
+      ? 'e.event_type::text'
+      : (hasType ? 'e."type"::text' : 'NULL::text');
 
-    // Кнопка "Все": если обе даты пустые — берём полный диапазон по событиям
+    // Кнопка "Все": обе даты пустые → пробуем взять мин/макс из events
     if (!fromStr && !toStr) {
-      const b = await db.query(
-        `select
-           min((created_at at time zone $1)::date) as d1,
-           max((created_at at time zone $1)::date) as d2
-         from events`,
-        [tz]
-      );
-      const row = (b.rows || [])[0];
-      if (!row || !row.d1 || !row.d2) {
-        return res.json({ ok:true, from:null, to:null, days:[] });
+      try {
+        const b = await db.query(
+          `select
+             min((created_at at time zone $1)::date) as d1,
+             max((created_at at time zone $1)::date) as d2
+           from events
+           where created_at is not null`,
+          [tz]
+        );
+        const row = (b.rows || [])[0] || {};
+        if (row.d1 && row.d2) {
+          fromStr = String(row.d1).slice(0, 10);
+          toStr   = String(row.d2).slice(0, 10);
+        }
+      } catch (e) {
+        console.error('admin /range bounds error', e);
       }
-      // row.d1 / d2 обычно уже "YYYY-MM-DD", но на всякий случай режем строку
-      fromStr = String(row.d1).slice(0, 10);
-      toStr   = String(row.d2).slice(0, 10);
     }
 
     const sql = `
@@ -520,13 +525,12 @@ router.get('/range', adminGuard, async (req,res)=>{
     const fromDate = rows.length ? rows[0].date : (fromStr || null);
     const toDate   = rows.length ? rows[rows.length - 1].date : (toStr   || null);
 
-    res.json({ ok:true, from: fromDate, to: toDate, days: rows });
-  } catch(e) {
+    return res.json({ ok:true, from: fromDate, to: toDate, days: rows });
+  } catch (e) {
     console.error('admin /range error', e);
-    res.json({ ok:true, from:null, to:null, days:[] });
+    return res.json({ ok:true, from:null, to:null, days:[] });
   }
 });
-
      
 // ---- SCHEMA dump ----
 router.get('/schema', adminGuard, async (_req,res)=>{
