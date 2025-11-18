@@ -426,46 +426,108 @@ router.get('/daily', adminGuard, async (req,res)=>{
 // ---- RANGE ----
 router.get('/range', adminGuard, async (req,res)=>{
   try{
-    if (!await tableExists('events')) return res.json({ ok:true, from:null, to:null, days:[] });
-    const tz = tzOf(req);
+    if (!await tableExists('events')) {
+      return res.json({ ok:true, from:null, to:null, days:[] });
+    }
+
+    const tz   = tzOf(req);
     const incl = wantHum(req);
-    const fromStr = (req.query.from || '').toString().trim();
-    const toStr   = (req.query.to   || '').toString().trim();
+    let fromStr = (req.query.from || '').toString().trim();
+    let toStr   = (req.query.to   || '').toString().trim();
 
     const hasEventType = await hasCol('events','event_type');
     const hasType      = await hasCol('events','type');
-    const etExpr = hasEventType ? 'e.event_type::text' : (hasType ? 'e."type"::text' : 'NULL::text');
+    const etExpr = hasEventType ? 'e.event_type::text'
+                                : (hasType ? 'e."type"::text' : 'NULL::text');
+
+    // Кнопка "Все": если обе даты пустые — берём полный диапазон по событиям
+    if (!fromStr && !toStr) {
+      const b = await db.query(
+        `select
+           min((created_at at time zone $1)::date) as d1,
+           max((created_at at time zone $1)::date) as d2
+         from events`,
+        [tz]
+      );
+      const row = (b.rows || [])[0];
+      if (!row || !row.d1 || !row.d2) {
+        return res.json({ ok:true, from:null, to:null, days:[] });
+      }
+      // row.d1 / d2 обычно уже "YYYY-MM-DD", но на всякий случай режем строку
+      fromStr = String(row.d1).slice(0, 10);
+      toStr   = String(row.d2).slice(0, 10);
+    }
 
     const sql = `
       with bounds as (
-        select coalesce(nullif($2,''), to_char((now() at time zone $1)::date - 30, 'YYYY-MM-DD'))::date as d1,
-               coalesce(nullif($3,''), to_char((now() at time zone $1)::date,       'YYYY-MM-DD'))::date as d2
+        select
+          coalesce(nullif($2,''), to_char((now() at time zone $1)::date - 30, 'YYYY-MM-DD'))::date as d1,
+          coalesce(nullif($3,''), to_char((now() at time zone $1)::date,       'YYYY-MM-DD'))::date as d2
       ),
-      days as ( select generate_series((select d1 from bounds), (select d2 from bounds), '1 day')::date as d ),
+      days as (
+        select generate_series(
+          (select d1 from bounds),
+          (select d2 from bounds),
+          '1 day'
+        )::date as d
+      ),
       canon as (
-        select (e.created_at at time zone $1)::date as d,
-               case when $4::boolean then coalesce(u.hum_id,u.id) else u.id end as cluster_id,
-               ${etExpr} as et
-        from events e join users u on u.id=e.user_id
-        where (e.created_at at time zone $1)::date between (select d1 from bounds) and (select d2 from bounds)
+        select
+          (e.created_at at time zone $1)::date as d,
+          case when $4::boolean then coalesce(u.hum_id,u.id) else u.id end as cluster_id,
+          ${etExpr} as et
+        from events e
+        join users u on u.id = e.user_id
+        where (e.created_at at time zone $1)::date
+              between (select d1 from bounds) and (select d2 from bounds)
       ),
-      auths  as ( select * from canon where (et is null) or et ilike '%login%success%' or et ilike '%auth%success%' or et ilike '%auth%' ),
-      totals as ( select d, count(*) c from auths group by 1 ),
-      uniq   as ( select d, count(distinct cluster_id) c from auths group by 1 )
-      select to_char(days.d,'YYYY-MM-DD') as day, coalesce(t.c,0) as auth_total, coalesce(u.c,0) as auth_unique
-       from days left join totals t on t.d=days.d left join uniq u on u.d=days.d order by days.d asc
+      auths as (
+        select *
+        from canon
+        where (et is null)
+           or et ilike 'auth%'
+           or et ilike '%login%success%'
+           or et ilike '%auth%success%'
+           or et ilike '%auth%'
+      ),
+      totals as (
+        select d, count(*) as c
+        from auths
+        group by 1
+      ),
+      uniq as (
+        select d, count(distinct cluster_id) as c
+        from auths
+        group by 1
+      )
+      select
+        to_char(days.d,'YYYY-MM-DD') as day,
+        coalesce(t.c,0) as auth_total,
+        coalesce(u.c,0) as auth_unique
+      from days
+      left join totals t on t.d = days.d
+      left join uniq   u on u.d = days.d
+      order by days.d asc
     `;
-    const r = await db.query(sql, [tz, fromStr, toStr, incl]);
-    const rows = (r.rows||[]).map(x=>({ date:x.day, auth_total:Number(x.auth_total||0), auth_unique:Number(x.auth_unique||0) }));
+
+    const q = await db.query(sql, [tz, fromStr, toStr, incl]);
+    const rows = (q.rows || []).map(x => ({
+      date: x.day,
+      auth_total: Number(x.auth_total || 0),
+      auth_unique: Number(x.auth_unique || 0)
+    }));
+
     const fromDate = rows.length ? rows[0].date : (fromStr || null);
-    const toDate   = rows.length ? rows[rows.length-1].date : (toStr   || null);
+    const toDate   = rows.length ? rows[rows.length - 1].date : (toStr   || null);
+
     res.json({ ok:true, from: fromDate, to: toDate, days: rows });
-  }catch(e){
+  } catch(e) {
     console.error('admin /range error', e);
     res.json({ ok:true, from:null, to:null, days:[] });
   }
 });
 
+     
 // ---- SCHEMA dump ----
 router.get('/schema', adminGuard, async (_req,res)=>{
   try{
