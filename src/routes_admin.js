@@ -433,8 +433,8 @@ router.get('/range', adminGuard, async (req,res)=>{
     const tz   = tzOf(req);
     const incl = wantHum(req);
 
-    let fromStr = (req.query.from || '').toString().trim();
-    let toStr   = (req.query.to   || '').toString().trim();
+    const fromStr = (req.query.from || '').toString().trim();
+    const toStr   = (req.query.to   || '').toString().trim();
 
     const hasEventType = await hasCol('events','event_type');
     const hasType      = await hasCol('events','type');
@@ -442,32 +442,36 @@ router.get('/range', adminGuard, async (req,res)=>{
       ? 'e.event_type::text'
       : (hasType ? 'e."type"::text' : 'NULL::text');
 
-    // Кнопка "Все": обе даты пустые → пробуем взять мин/макс из events
-    if (!fromStr && !toStr) {
-      try {
-        const b = await db.query(
-          `select
-             min((created_at at time zone $1)::date) as d1,
-             max((created_at at time zone $1)::date) as d2
-           from events
-           where created_at is not null`,
-          [tz]
-        );
-        const row = (b.rows || [])[0] || {};
-        if (row.d1 && row.d2) {
-          fromStr = String(row.d1).slice(0, 10);
-          toStr   = String(row.d2).slice(0, 10);
-        }
-      } catch (e) {
-        console.error('admin /range bounds error', e);
-      }
-    }
-
     const sql = `
-      with bounds as (
+      with raw_bounds as (
         select
-          coalesce(nullif($2,''), to_char((now() at time zone $1)::date - 30, 'YYYY-MM-DD'))::date as d1,
-          coalesce(nullif($3,''), to_char((now() at time zone $1)::date,       'YYYY-MM-DD'))::date as d2
+          min((created_at at time zone $1)::date) as min_d,
+          max((created_at at time zone $1)::date) as max_d
+        from events
+      ),
+      bounds as (
+        select
+          case
+            -- Кнопка "Все": обе даты пустые → берём мин дату, а если событий нет — now()-30
+            when $2 = '' and $3 = '' then
+              coalesce(min_d, (now() at time zone $1)::date - 30)
+            else
+              coalesce(
+                nullif($2,''),
+                to_char((now() at time zone $1)::date - 30, 'YYYY-MM-DD')
+              )::date
+          end as d1,
+          case
+            -- Кнопка "Все": обе даты пустые → берём макс дату, а если событий нет — сегодня
+            when $2 = '' and $3 = '' then
+              coalesce(max_d, (now() at time zone $1)::date)
+            else
+              coalesce(
+                nullif($3,''),
+                to_char((now() at time zone $1)::date, 'YYYY-MM-DD')
+              )::date
+          end as d2
+        from raw_bounds
       ),
       days as (
         select generate_series(
@@ -516,9 +520,10 @@ router.get('/range', adminGuard, async (req,res)=>{
     `;
 
     const q = await db.query(sql, [tz, fromStr, toStr, incl]);
+
     const rows = (q.rows || []).map(x => ({
       date: x.day,
-      auth_total: Number(x.auth_total || 0),
+      auth_total:  Number(x.auth_total  || 0),
       auth_unique: Number(x.auth_unique || 0)
     }));
 
