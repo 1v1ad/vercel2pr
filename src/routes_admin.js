@@ -1,8 +1,10 @@
 // src/routes_admin.js — consolidated admin API + manual topup
 import express from 'express';
 import { db } from './db.js';
+import { mergeSuggestions } from './merge.js';
 
 const router = express.Router();
+
 router.use(express.json());
 
 // ---- Guard (per-route) ----
@@ -189,6 +191,55 @@ router.post('/unmerge', adminGuard, async (req,res)=>{
   }catch(e){
     await db.query('rollback').catch(()=>{});
     console.error('admin /unmerge error:', e);
+    res.status(500).json({ ok:false, error:'server_error', detail:String(e?.message || e) });
+  }
+});
+// ---- MERGE SUGGESTIONS (теневая склейка по девайсу) ----
+// GET /api/admin/merge-suggestions?limit=200
+router.get('/merge-suggestions', adminGuard, async (req,res)=>{
+  try{
+    // Без auth_accounts анализировать нечего
+    if (!await tableExists('auth_accounts')) {
+      return res.json({ ok:true, items:[] });
+    }
+
+    const limitRaw = req.query.limit ?? req.query.take ?? 200;
+    const limit = Math.min(Math.max(toInt(limitRaw, 200), 1), 500);
+
+    const rows = await mergeSuggestions(limit);
+    if (!rows || !rows.length) {
+      return res.json({ ok:true, items:[] });
+    }
+
+    // Собираем id пользователей из пар
+    const ids = [];
+    for (const r of rows) {
+      if (r.primary_id && !ids.includes(r.primary_id)) ids.push(r.primary_id);
+      if (r.secondary_id && !ids.includes(r.secondary_id)) ids.push(r.secondary_id);
+    }
+
+    let usersById = {};
+    if (ids.length && await tableExists('users')) {
+      const uRes = await db.query(`
+        select id, vk_id, first_name, last_name, avatar, country_code, balance, hum_id
+          from users
+         where id = any($1)
+      `,[ids]);
+      for (const u of (uRes.rows || [])) {
+        usersById[u.id] = u;
+      }
+    }
+
+    const items = rows.map(r => ({
+      primary_id: r.primary_id,
+      secondary_id: r.secondary_id,
+      primary: r.primary_id ? (usersById[r.primary_id] || null) : null,
+      secondary: r.secondary_id ? (usersById[r.secondary_id] || null) : null,
+    }));
+
+    res.json({ ok:true, items });
+  }catch(e){
+    console.error('admin /merge-suggestions error', e);
     res.status(500).json({ ok:false, error:'server_error', detail:String(e?.message || e) });
   }
 });
