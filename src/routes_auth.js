@@ -5,6 +5,7 @@ import crypto from 'crypto';
 import { createCodeVerifier, createCodeChallenge } from './pkce.js';
 import { signSession } from './jwt.js';
 import { upsertUser, logEvent, db } from './db.js';
+import { getDeviceId, upsertAuthAccount, linkPendingsToUser } from './linking.js';
 
 const router = express.Router();
 
@@ -114,6 +115,7 @@ router.get('/vk/start', async (req, res) => {
 // общий обработчик колбэка (для /vk/cb и /vk/callback)
 async function vkCallbackHandler(req, res) {
   const { code, state, device_id } = req.query;
+  const deviceId = getDeviceId(req); // наш внутренний device_id (cookie/query/header)
   try {
     const savedState   = req.cookies['vk_state'];
     const codeVerifier = req.cookies['vk_code_verifier'];
@@ -240,21 +242,27 @@ async function vkCallbackHandler(req, res) {
               [vk_id, firstIp(req), userAgent(req)]
             );
           } catch {}
-        } else {
+               } else {
           // VK ещё ни к кому не привязан — первая привязка к master (это ок)
           try {
             await db.query(
               `insert into auth_accounts (user_id, provider, provider_user_id, meta)
-               values ($1,'vk',$2, jsonb_build_object('linked_at',now(),'ip',$3,'ua',$4))
+               values ($1,'vk',$2, jsonb_build_object(
+                 'linked_at', now(),
+                 'ip',        $3,
+                 'ua',        $4,
+                 'device_id', $5
+               ))
                on conflict (provider, provider_user_id)
                do update set
                  user_id = coalesce(auth_accounts.user_id, excluded.user_id),
                  meta    = jsonb_strip_nulls(coalesce(auth_accounts.meta,'{}') || excluded.meta),
                  updated_at=now()`,
-              [humId, vk_id, firstIp(req), userAgent(req)]
+              [humId, vk_id, firstIp(req), userAgent(req), deviceId || null]
             );
           } catch(e){ console.warn('vk link: initial bind failed', e?.message); }
         }
+
 
         await logEvent({ user_id:humId, event_type:'link_success',
           payload:{ provider:'vk', pid: vk_id }, ip:firstIp(req), ua:userAgent(req) });
@@ -276,6 +284,36 @@ async function vkCallbackHandler(req, res) {
     // обычный логин
     const user = await upsertUser({ vk_id, first_name, last_name, avatar });
     await logEvent({ user_id:user.id, event_type:'auth_success', payload:{ provider:'vk', vk_id }, ip:firstIp(req), ua:userAgent(req) });
+    // записываем VK-аккаунт в auth_accounts и пытаемся фоном подтянуть висящие учётки по device_id
+    try {
+      const did = deviceId || null;
+
+      await upsertAuthAccount({
+        userId: user.id,
+        provider: 'vk',
+        providerUserId: vk_id,
+        username: null,
+        phoneHash: null,
+        meta: did ? { device_id: did } : {}
+      });
+
+      if (did) {
+        try {
+          await linkPendingsToUser({
+            userId: user.id,
+            provider: 'vk',
+            deviceId: did,
+            phoneHash: null,
+            ip: firstIp(req),
+            ua: userAgent(req)
+          });
+        } catch (e) {
+          console.warn('vk auth: linkPendingsToUser failed', e?.message || e);
+        }
+      }
+    } catch (e) {
+      console.warn('vk auth: upsertAuthAccount failed', e?.message || e);
+    }
 
     const sessionJwt = signSession({ uid: user.id, vk_id: user.vk_id });
     res.cookie('sid', sessionJwt, {
