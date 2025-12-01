@@ -245,26 +245,29 @@ router.get('/merge-suggestions', adminGuard, async (req,res)=>{
 });
 
 // ---- EVENTS ----
-router.get('/events', adminGuard, async (req,res)=>{
-  try{
+// ---- EVENTS LIST ----
+router.get('/events', adminGuard, async (req, res) => {
+  try {
     if (!await tableExists('events')) {
-      return res.json({ ok:true, events:[], rows:[] });
+      return res.json({ ok: true, events: [], rows: [] });
     }
 
+    const tz     = tzOf(req); // Europe/Moscow по умолчанию
     const take   = Math.min(Math.max(toInt(req.query.take, 50), 1), 500);
     const skip   = Math.max(toInt(req.query.skip, 0), 0);
     const userId = toInt(req.query.user_id, 0);
     const type   = (req.query.type  || req.query.event_type || '').toString().trim();
     const term   = (req.query.term  || req.query.search     || '').toString().trim();
-    const tz     = tzOf(req); // <= ВСЕГДА работаем в одной зоне (по умолчанию Europe/Moscow)
 
-    const hasEventType = await hasCol('events','event_type');
-    const hasType      = await hasCol('events','type');
+    const hasEventType = await hasCol('events', 'event_type');
+    const hasType      = await hasCol('events', 'type');
     const etExpr = hasEventType
       ? 'e.event_type::text'
       : (hasType ? 'e."type"::text' : 'NULL::text');
 
-    // created_at сразу переводим в заданный часовой пояс
+    // ВАЖНО:
+    // created_at хранится как UTC (timestamp without time zone, now() на сервере в UTC).
+    // Схема: UTC -> timestamptz -> локальное время tz (Europe/Moscow).
     const base = `with canon as (
       select
         e.id,
@@ -275,14 +278,14 @@ router.get('/events', adminGuard, async (req,res)=>{
         ${etExpr} as event_type,
         e.amount,
         e.payload,
-        (e.created_at at time zone $1) as created_at
+        (e.created_at at time zone 'UTC' at time zone $1) as created_at
       from events e
       left join users u on u.id = e.user_id
     )`;
 
     let sql, params;
 
-    if (userId){
+    if (userId) {
       sql = base + `
         select * from canon
          where user_id = $2
@@ -290,7 +293,7 @@ router.get('/events', adminGuard, async (req,res)=>{
          limit $3 offset $4
       `;
       params = [tz, userId, take, skip];
-    } else if (type){
+    } else if (type) {
       sql = base + `
         select * from canon
          where coalesce(event_type,'') = $2
@@ -298,7 +301,7 @@ router.get('/events', adminGuard, async (req,res)=>{
          limit $3 offset $4
       `;
       params = [tz, type, take, skip];
-    } else if (term){
+    } else if (term) {
       sql = base + `
         select * from canon
          where cast(user_id as text) ilike $2
@@ -307,7 +310,7 @@ router.get('/events', adminGuard, async (req,res)=>{
          order by id desc
          limit $3 offset $4
       `;
-      params = [tz, '%'+term+'%', take, skip];
+      params = [tz, `%${term}%`, take, skip];
     } else {
       sql = base + `
         select * from canon
@@ -318,10 +321,10 @@ router.get('/events', adminGuard, async (req,res)=>{
     }
 
     const rows = (await db.query(sql, params)).rows;
-    res.json({ ok:true, events: rows, rows });
-  }catch(e){
+    res.json({ ok: true, events: rows, rows });
+  } catch (e) {
     console.error('admin /events error:', e);
-    res.json({ ok:true, events:[], rows:[] });
+    res.json({ ok: true, events: [], rows: [] });
   }
 });
 
