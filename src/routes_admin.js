@@ -245,17 +245,18 @@ router.get('/merge-suggestions', adminGuard, async (req,res)=>{
 });
 
 // ---- EVENTS ----
-// ---- EVENTS ----
 router.get('/events', adminGuard, async (req,res)=>{
   try{
     if (!await tableExists('events')) {
       return res.json({ ok:true, events:[], rows:[] });
     }
-    const take = Math.min(Math.max(toInt(req.query.take,50),1),500);
-    const skip = Math.max(toInt(req.query.skip,0),0);
+
+    const take   = Math.min(Math.max(toInt(req.query.take, 50), 1), 500);
+    const skip   = Math.max(toInt(req.query.skip, 0), 0);
     const userId = toInt(req.query.user_id, 0);
-    const type = (req.query.type || req.query.event_type || '').toString().trim();
-    const term = (req.query.term || req.query.search || '').toString().trim();
+    const type   = (req.query.type  || req.query.event_type || '').toString().trim();
+    const term   = (req.query.term  || req.query.search     || '').toString().trim();
+    const tz     = tzOf(req); // <= ВСЕГДА работаем в одной зоне (по умолчанию Europe/Moscow)
 
     const hasEventType = await hasCol('events','event_type');
     const hasType      = await hasCol('events','type');
@@ -263,6 +264,7 @@ router.get('/events', adminGuard, async (req,res)=>{
       ? 'e.event_type::text'
       : (hasType ? 'e."type"::text' : 'NULL::text');
 
+    // created_at сразу переводим в заданный часовой пояс
     const base = `with canon as (
       select
         e.id,
@@ -273,45 +275,46 @@ router.get('/events', adminGuard, async (req,res)=>{
         ${etExpr} as event_type,
         e.amount,
         e.payload,
-        e.created_at
+        (e.created_at at time zone $1) as created_at
       from events e
       left join users u on u.id = e.user_id
     )`;
 
     let sql, params;
+
     if (userId){
       sql = base + `
         select * from canon
-         where user_id = $1
+         where user_id = $2
          order by id desc
-         limit $2 offset $3
+         limit $3 offset $4
       `;
-      params = [userId, take, skip];
+      params = [tz, userId, take, skip];
     } else if (type){
       sql = base + `
         select * from canon
-         where coalesce(event_type,'') = $1
+         where coalesce(event_type,'') = $2
          order by id desc
-         limit $2 offset $3
+         limit $3 offset $4
       `;
-      params = [type, take, skip];
+      params = [tz, type, take, skip];
     } else if (term){
       sql = base + `
         select * from canon
-         where cast(user_id as text) ilike $1
-            or cast(hum_id as text) ilike $1
-            or coalesce(event_type,'') ilike $1
+         where cast(user_id as text) ilike $2
+            or cast(hum_id  as text) ilike $2
+            or coalesce(event_type,'') ilike $2
          order by id desc
-         limit $2 offset $3
+         limit $3 offset $4
       `;
-      params = ['%'+term+'%', take, skip];
+      params = [tz, '%'+term+'%', take, skip];
     } else {
       sql = base + `
         select * from canon
          order by id desc
-         limit $1 offset $2
+         limit $2 offset $3
       `;
-      params = [take, skip];
+      params = [tz, take, skip];
     }
 
     const rows = (await db.query(sql, params)).rows;
