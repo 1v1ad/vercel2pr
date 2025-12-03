@@ -11,11 +11,12 @@ function ipOf(req){
 }
 
 export function getDeviceId(req){
-  const q = (req.query?.device_id || '').toString().trim();
-  const h = (req.headers[DEVICE_ID_HEADER] || '').toString().trim();
   const c = (req.cookies?.device_id || '').toString().trim();
-  return q || h || c || null;
+  const h = (req.headers[DEVICE_ID_HEADER] || '').toString().trim();
+  const q = (req.query?.device_id || '').toString().trim();
+  return c || h || q || null;
 }
+
 
 export function decodeSid(req){
   try{
