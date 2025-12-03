@@ -77,6 +77,18 @@ router.get('/vk/start', async (req, res) => {
   try {
     const { clientId, redirectUri } = envVK();
 
+    // ⬇️ НОВЫЙ БЛОК
+    const deviceIdFromQuery = (req.query.device_id || '').toString().trim();
+    if (deviceIdFromQuery) {
+      res.cookie('device_id', deviceIdFromQuery, {
+        httpOnly: true,          // JS его не читает, он нужен только бэку
+        sameSite: 'lax',
+        secure: true,            // на onrender всё по https
+        path: '/',
+        maxAge: 365 * 24 * 60 * 60 * 1000
+      });
+    }
+
     // режим привязки — кладём cookie link_state (не требуем state от фронта)
     if (req.query.mode === 'link') {
       const st = {
@@ -90,7 +102,7 @@ router.get('/vk/start', async (req, res) => {
     const state         = crypto.randomBytes(16).toString('hex'); // свой state для VK (CSRF)
     const codeVerifier  = createCodeVerifier();
     const codeChallenge = createCodeChallenge(codeVerifier);
-
+    
     res.cookie('vk_state', state,                 { httpOnly:true, sameSite:'lax', secure:true, path:'/', maxAge:10*60*1000 });
     res.cookie('vk_code_verifier', codeVerifier,  { httpOnly:true, sameSite:'lax', secure:true, path:'/', maxAge:10*60*1000 });
 
@@ -283,10 +295,27 @@ async function vkCallbackHandler(req, res) {
 
     // обычный логин
     const user = await upsertUser({ vk_id, first_name, last_name, avatar });
-    await logEvent({ user_id:user.id, event_type:'auth_success', payload:{ provider:'vk', vk_id }, ip:firstIp(req), ua:userAgent(req) });
+    await logEvent({
+      user_id: user.id,
+      event_type: 'auth_success',
+      payload: { provider: 'vk', vk_id },
+      ip: firstIp(req),
+      ua: userAgent(req)
+    });
+
     // записываем VK-аккаунт в auth_accounts и пытаемся фоном подтянуть висящие учётки по device_id
     try {
+      // raw device_id, который VK прокинул нам в query (если вообще прокинул)
+      const vkDeviceIdRaw = (device_id || '').toString().trim();
+      // наш нормализованный device_id (cookie / header / query)
       const did = deviceId || null;
+
+      const meta = {
+        ip: firstIp(req),
+        ua: userAgent(req)
+      };
+      if (did)          meta.device_id     = did;
+      if (vkDeviceIdRaw) meta.vk_device_id = vkDeviceIdRaw;
 
       await upsertAuthAccount({
         userId: user.id,
@@ -294,7 +323,7 @@ async function vkCallbackHandler(req, res) {
         providerUserId: vk_id,
         username: null,
         phoneHash: null,
-        meta: did ? { device_id: did } : {}
+        meta
       });
 
       if (did) {
@@ -314,6 +343,7 @@ async function vkCallbackHandler(req, res) {
     } catch (e) {
       console.warn('vk auth: upsertAuthAccount failed', e?.message || e);
     }
+
 
     const sessionJwt = signSession({ uid: user.id, vk_id: user.vk_id });
     res.cookie('sid', sessionJwt, {
