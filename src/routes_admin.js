@@ -44,28 +44,48 @@ router.get('/ping', adminGuard, (_req,res)=>res.json({ ok:true, now:new Date().t
 router.get('/users', adminGuard, async (req,res)=>{
   try{
     if (!await tableExists('users')) return res.json({ ok:true, users:[], rows:[] });
+
+    const tz   = tzOf(req); // таймзона админки, по умолчанию Europe/Moscow
     const take = Math.min(Math.max(toInt(req.query.take,50),1),200);
     const skip = Math.max(toInt(req.query.skip,0),0);
-    const q = (req.query.search || req.query.q || '').toString().trim();
+    const q    = (req.query.search || req.query.q || '').toString().trim();
 
     let users;
     if (q) {
       users = (await db.query(`
-        select id, hum_id, vk_id, first_name, last_name, avatar, balance, country_code, created_at
+        select
+          id,
+          hum_id,
+          vk_id,
+          first_name,
+          last_name,
+          avatar,
+          balance,
+          country_code,
+          (created_at at time zone 'UTC' at time zone $2) as created_at
         from users
         where cast(id as text) ilike $1
            or coalesce(first_name,'') ilike $1
            or coalesce(last_name,'') ilike $1
         order by id desc
-        limit $2 offset $3
-      `, ['%'+q+'%', take, skip])).rows;
+        limit $3 offset $4
+      `, ['%'+q+'%', tz, take, skip])).rows;
     } else {
       users = (await db.query(`
-        select id, hum_id, vk_id, first_name, last_name, avatar, balance, country_code, created_at
+        select
+          id,
+          hum_id,
+          vk_id,
+          first_name,
+          last_name,
+          avatar,
+          balance,
+          country_code,
+          (created_at at time zone 'UTC' at time zone $1) as created_at
         from users
         order by id desc
-        limit $1 offset $2
-      `,[take, skip])).rows;
+        limit $2 offset $3
+      `, [tz, take, skip])).rows;
     }
 
     // providers (optional)
@@ -88,6 +108,7 @@ router.get('/users', adminGuard, async (req,res)=>{
     res.json({ ok:true, users:[], rows:[] });
   }
 });
+
 
 
 // ---- HUM CLUSTER + UNMERGE ----
