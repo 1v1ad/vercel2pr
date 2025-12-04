@@ -11,12 +11,11 @@ function ipOf(req){
 }
 
 export function getDeviceId(req){
-  const c = (req.cookies?.device_id || '').toString().trim();
-  const h = (req.headers[DEVICE_ID_HEADER] || '').toString().trim();
-  const q = (req.query?.device_id || '').toString().trim();
+  const c = (req.cookies?.device_id || '').toString().trim();           // 1) наш браузерный id
+  const h = (req.headers[DEVICE_ID_HEADER] || '').toString().trim();    // 2) если вдруг шлём заголовком
+  const q = (req.query?.device_id || '').toString().trim();             // 3) всё остальное (VK и прочие)
   return c || h || q || null;
 }
-
 
 export function decodeSid(req){
   try{
