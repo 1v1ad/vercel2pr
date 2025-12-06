@@ -1,11 +1,12 @@
 // src/routes_admin.js — consolidated admin API + manual topup
+
 import express from 'express';
 import { db } from './db.js';
-import { mergeSuggestions } from './merge.js';
+import { mergeSuggestions, ensureMetaColumns } from './merge.js';
 
 const router = express.Router();
-
 router.use(express.json());
+
 
 // ---- Guard (per-route) ----
 const adminGuard = (req,res,next)=>{
