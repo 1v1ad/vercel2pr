@@ -412,100 +412,323 @@ router.post('/users/:id/topup', adminGuard, async (req,res)=>{
 });
 
 // ---- SUMMARY ----
-router.get('/summary', adminGuard, async (req,res)=>{
-  try{
+router.get('/summary', adminGuard, async (req, res) => {
+  try {
     const tz = tzOf(req);
     const incl = wantHum(req);
+
+    // общее количество пользователей
     let users = 0;
-    try{ const r = await db.query('select count(*)::int as c from users'); users = r.rows?.[0]?.c ?? 0; }catch{}
+    try {
+      const r = await db.query('select count(*)::int as c from users');
+      users = r.rows?.[0]?.c ?? 0;
+    } catch {}
 
-    if (!await tableExists('events')) return res.json({ ok:true, users, events:0, auth7:0, auth7_total:0, unique7:0 });
+    if (!await tableExists('events')) {
+      return res.json({ ok: true, users, events: 0, auth7: 0, auth7_total: 0, unique7: 0 });
+    }
 
-    const hasEventType = await hasCol('events','event_type');
-    const hasType      = await hasCol('events','type');
-    const etExpr = hasEventType ? 'e.event_type::text' : (hasType ? 'e."type"::text' : 'NULL::text');
+    const hasEventType = await hasCol('events', 'event_type');
+    const hasType = await hasCol('events', 'type');
+    const etExpr = hasEventType
+      ? 'e.event_type::text'
+      : (hasType ? 'e."type"::text' : 'NULL::text');
 
-    const sql = `
-      with b as (
-        select (now() at time zone $1)::date as d2, ((now() at time zone $1)::date - 6) as d1
-      ),
-      canon as (
-        select 
-          e.user_id,
-          case when $2::boolean then coalesce(u.hum_id,u.id) else u.id end as cluster_id,
-          (e.created_at at time zone $1) as ts_msk,
-          ${etExpr} as et
-        from events e 
-        join users u on u.id = e.user_id
-        where (e.created_at at time zone $1)::date between (select d1 from b) and (select d2 from b)
-      ),
-      auths as (
-        select * from canon 
-        where (et is null) 
-           or et ilike '%login%success%' 
-           or et ilike '%auth%success%' 
-           or et ilike '%auth%'
-      ),
-      t_events as (select count(*)::int as c from events),
-      t_total  as (select count(*)::int as c from auths),
-      t_unique as (select count(distinct cluster_id)::int as c from auths)
-      select 
-        (select c from t_events) as events,
-        (select c from t_total)  as auth7_total,
-        (select c from t_unique) as unique7
-    `;
+    const hasAuthAccounts = await tableExists('auth_accounts');
+    if (hasAuthAccounts) {
+      await ensureMetaColumns();
+    }
+
+    const sql = hasAuthAccounts
+      ? `
+        with b as (
+          select
+            (now() at time zone $1)::date as d2,
+            ((now() at time zone $1)::date - 6) as d1
+        ),
+        shadow_pairs as (
+          select *
+          from (
+            select
+              u.id as secondary_id,
+              (
+                select a.user_id
+                from auth_accounts a
+                where a.user_id is not null
+                  and (a.meta->>'device_id') = tg.did
+                  and a.provider = 'vk'
+                order by a.updated_at desc
+                limit 1
+              ) as primary_id
+            from users u
+            join (
+              select
+                aa.user_id,
+                max(aa.meta->>'device_id') as did
+              from auth_accounts aa
+              where aa.provider = 'tg'
+                and aa.meta->>'device_id' is not null
+              group by aa.user_id
+            ) as tg on tg.user_id = u.id
+            where coalesce(u.meta->>'merged_into','') = ''
+          ) s
+          where primary_id is not null
+        ),
+        shadow_map as (
+          select primary_id as user_id, primary_id as cluster_id from shadow_pairs
+          union
+          select secondary_id as user_id, primary_id as cluster_id from shadow_pairs
+        ),
+        canon as (
+          select
+            e.user_id,
+            case
+              when $2::boolean then coalesce(u.hum_id, shadow_map.cluster_id, u.id)
+              else u.id
+            end as cluster_id,
+            (e.created_at at time zone $1) as ts_msk,
+            ${etExpr} as et
+          from events e
+          join users u on u.id = e.user_id
+          left join shadow_map on shadow_map.user_id = u.id
+          where (e.created_at at time zone $1)::date between (select d1 from b) and (select d2 from b)
+        ),
+        auths as (
+          select *
+          from canon
+          where (et is null)
+             or et ilike '%login%success%'
+             or et ilike '%auth%success%'
+             or et ilike '%auth%'
+        ),
+        t_events as (select count(*)::int as c from events),
+        t_total  as (select count(*)::int as c from auths),
+        t_unique as (select count(distinct cluster_id)::int as c from auths)
+        select
+          (select c from t_events) as events,
+          (select c from t_total)  as auth7_total,
+          (select c from t_unique) as unique7
+      `
+      : `
+        with b as (
+          select
+            (now() at time zone $1)::date as d2,
+            ((now() at time zone $1)::date - 6) as d1
+        ),
+        canon as (
+          select
+            e.user_id,
+            case
+              when $2::boolean then coalesce(u.hum_id, u.id)
+              else u.id
+            end as cluster_id,
+            (e.created_at at time zone $1) as ts_msk,
+            ${etExpr} as et
+          from events e
+          join users u on u.id = e.user_id
+          where (e.created_at at time zone $1)::date between (select d1 from b) and (select d2 from b)
+        ),
+        auths as (
+          select *
+          from canon
+          where (et is null)
+             or et ilike '%login%success%'
+             or et ilike '%auth%success%'
+             or et ilike '%auth%'
+        ),
+        t_events as (select count(*)::int as c from events),
+        t_total  as (select count(*)::int as c from auths),
+        t_unique as (select count(distinct cluster_id)::int as c from auths)
+        select
+          (select c from t_events) as events,
+          (select c from t_total)  as auth7_total,
+          (select c from t_unique) as unique7
+      `;
+
     const q = await db.query(sql, [tz, incl]);
-    const events   = q.rows?.[0]?.events   ?? 0;
+    const events   = q.rows?.[0]?.events      ?? 0;
     const auth7tot = q.rows?.[0]?.auth7_total ?? 0;
-    const unique7  = q.rows?.[0]?.unique7  ?? 0;
-    return res.json({ ok:true, users, events, auth7:unique7, auth7_total:auth7tot, unique7 });
-  }catch(e){
+    const unique7  = q.rows?.[0]?.unique7     ?? 0;
+
+    return res.json({
+      ok: true,
+      users,
+      events,
+      auth7: unique7,
+      auth7_total: auth7tot,
+      unique7,
+    });
+  } catch (e) {
     console.error('admin /summary error', e);
-    return res.json({ ok:true, users:0, events:0, auth7:0, auth7_total:0, unique7:0 });
+    return res.json({ ok: true, users: 0, events: 0, auth7: 0, auth7_total: 0, unique7: 0 });
   }
 });
+
 
 // ---- DAILY ----
-router.get('/daily', adminGuard, async (req,res)=>{
-  try{
-    if (!await tableExists('events')) return res.json({ ok:true, days:[] });
-    const tz = tzOf(req);
-    const days = Math.max(1, Math.min(31, toInt(req.query.days||'7',10)));
+router.get('/daily', adminGuard, async (req, res) => {
+  try {
+    if (!await tableExists('events')) {
+      return res.json({ ok: true, days: [] });
+    }
+
+    const tz   = tzOf(req);
+    const days = Math.max(1, Math.min(31, toInt(req.query.days || '7', 10)));
     const incl = wantHum(req);
 
-    const hasEventType = await hasCol('events','event_type');
-    const hasType      = await hasCol('events','type');
-    const etExpr = hasEventType ? 'e.event_type::text' : (hasType ? 'e."type"::text' : 'NULL::text');
+    const hasEventType = await hasCol('events', 'event_type');
+    const hasType = await hasCol('events', 'type');
+    const etExpr = hasEventType
+      ? 'e.event_type::text'
+      : (hasType ? 'e."type"::text' : 'NULL::text');
 
-    const sql = `
-      with b as ( select generate_series( (now() at time zone $1)::date - ($2::int-1), (now() at time zone $1)::date, '1 day') as d ),
-      canon as (
-        select (e.created_at at time zone $1)::date as d,
-               case when $3::boolean then coalesce(u.hum_id,u.id) else u.id end as cluster_id,
-               ${etExpr} as et
-        from events e join users u on u.id=e.user_id
-        where (e.created_at at time zone $1)::date >= (select min(d) from b)
-      ),
-      auths  as ( select * from canon where (et is null) or et ilike '%login%success%' or et ilike '%auth%success%' or et ilike '%auth%' ),
-      totals as ( select d, count(*) c from auths group by 1 ),
-      uniq   as ( select d, count(distinct cluster_id) c from auths group by 1 )
-      select to_char(b.d,'YYYY-MM-DD') as day, coalesce(t.c,0) as auth_total, coalesce(u.c,0) as auth_unique
-        from b left join totals t on t.d=b.d left join uniq u on u.d=b.d order by b.d asc
-    `;
+    const hasAuthAccounts = await tableExists('auth_accounts');
+    if (hasAuthAccounts) {
+      await ensureMetaColumns();
+    }
+
+    const sql = hasAuthAccounts
+      ? `
+        with b as (
+          select generate_series(
+            (now() at time zone $1)::date - ($2::int - 1),
+            (now() at time zone $1)::date,
+            '1 day'
+          ) as d
+        ),
+        shadow_pairs as (
+          select *
+          from (
+            select
+              u.id as secondary_id,
+              (
+                select a.user_id
+                from auth_accounts a
+                where a.user_id is not null
+                  and (a.meta->>'device_id') = tg.did
+                  and a.provider = 'vk'
+                order by a.updated_at desc
+                limit 1
+              ) as primary_id
+            from users u
+            join (
+              select
+                aa.user_id,
+                max(aa.meta->>'device_id') as did
+              from auth_accounts aa
+              where aa.provider = 'tg'
+                and aa.meta->>'device_id' is not null
+              group by aa.user_id
+            ) as tg on tg.user_id = u.id
+            where coalesce(u.meta->>'merged_into','') = ''
+          ) s
+          where primary_id is not null
+        ),
+        shadow_map as (
+          select primary_id as user_id, primary_id as cluster_id from shadow_pairs
+          union
+          select secondary_id as user_id, primary_id as cluster_id from shadow_pairs
+        ),
+        canon as (
+          select
+            (e.created_at at time zone $1)::date as d,
+            case
+              when $3::boolean then coalesce(u.hum_id, shadow_map.cluster_id, u.id)
+              else u.id
+            end as cluster_id,
+            ${etExpr} as et
+          from events e
+          join users u on u.id = e.user_id
+          left join shadow_map on shadow_map.user_id = u.id
+          where (e.created_at at time zone $1)::date >= (select min(d) from b)
+        ),
+        auths as (
+          select *
+          from canon
+          where (et is null)
+             or et ilike '%login%success%'
+             or et ilike '%auth%success%'
+             or et ilike '%auth%'
+        ),
+        totals as (
+          select d, count(*) as c from auths group by 1
+        ),
+        uniq as (
+          select d, count(distinct cluster_id) as c from auths group by 1
+        )
+        select
+          to_char(b.d, 'YYYY-MM-DD') as day,
+          coalesce(t.c, 0) as auth_total,
+          coalesce(u.c, 0) as auth_unique
+        from b
+        left join totals t on t.d = b.d
+        left join uniq   u on u.d = b.d
+        order by b.d asc
+      `
+      : `
+        with b as (
+          select generate_series(
+            (now() at time zone $1)::date - ($2::int - 1),
+            (now() at time zone $1)::date,
+            '1 day'
+          ) as d
+        ),
+        canon as (
+          select
+            (e.created_at at time zone $1)::date as d,
+            case
+              when $3::boolean then coalesce(u.hum_id, u.id)
+              else u.id
+            end as cluster_id,
+            ${etExpr} as et
+          from events e
+          join users u on u.id = e.user_id
+          where (e.created_at at time zone $1)::date >= (select min(d) from b)
+        ),
+        auths as (
+          select *
+          from canon
+          where (et is null)
+             or et ilike '%login%success%'
+             or et ilike '%auth%success%'
+             or et ilike '%auth%'
+        ),
+        totals as (
+          select d, count(*) as c from auths group by 1
+        ),
+        uniq as (
+          select d, count(distinct cluster_id) as c from auths group by 1
+        )
+        select
+          to_char(b.d, 'YYYY-MM-DD') as day,
+          coalesce(t.c, 0) as auth_total,
+          coalesce(u.c, 0) as auth_unique
+        from b
+        left join totals t on t.d = b.d
+        left join uniq   u on u.d = b.d
+        order by b.d asc
+      `;
+
     const r = await db.query(sql, [tz, days, incl]);
-    const rows = (r.rows||[]).map(x=>({ date:x.day, auth_total:Number(x.auth_total||0), auth_unique:Number(x.auth_unique||0) }));
-    res.json({ ok:true, days: rows });
-  }catch(e){
+    const rows = (r.rows || []).map(x => ({
+      date: x.day,
+      auth_total: Number(x.auth_total || 0),
+      auth_unique: Number(x.auth_unique || 0),
+    }));
+
+    return res.json({ ok: true, days: rows });
+  } catch (e) {
     console.error('admin /daily error', e);
-    res.json({ ok:true, days:[] });
+    res.json({ ok: true, days: [] });
   }
 });
 
+
 // ---- RANGE ----
-router.get('/range', adminGuard, async (req,res)=>{
+router.get('/range', adminGuard, async (req, res) => {
   try {
     if (!await tableExists('events')) {
-      return res.json({ ok:true, from:null, to:null, days:[] });
+      return res.json({ ok: true, from: null, to: null, days: [] });
     }
 
     const tz   = tzOf(req);
@@ -514,106 +737,208 @@ router.get('/range', adminGuard, async (req,res)=>{
     const fromStr = (req.query.from || '').toString().trim();
     const toStr   = (req.query.to   || '').toString().trim();
 
-    const hasEventType = await hasCol('events','event_type');
-    const hasType      = await hasCol('events','type');
+    const hasEventType = await hasCol('events', 'event_type');
+    const hasType = await hasCol('events', 'type');
     const etExpr = hasEventType
       ? 'e.event_type::text'
       : (hasType ? 'e."type"::text' : 'NULL::text');
 
-    const sql = `
-      with raw_bounds as (
-        select
-          min((created_at at time zone $1)::date) as min_d,
-          max((created_at at time zone $1)::date) as max_d
-        from events
-      ),
-      bounds as (
-        select
-          case
-            -- Кнопка "Все": обе даты пустые → берём мин дату, а если событий нет — now()-30
-            when $2 = '' and $3 = '' then
-              coalesce(min_d, (now() at time zone $1)::date - 30)
-            else
-              coalesce(
-                nullif($2,''),
+    const hasAuthAccounts = await tableExists('auth_accounts');
+    if (hasAuthAccounts) {
+      await ensureMetaColumns();
+    }
+
+    const sql = hasAuthAccounts
+      ? `
+        with raw_bounds as (
+          select
+            min((created_at at time zone $1)::date) as min_d,
+            max((created_at at time zone $1)::date) as max_d
+          from events
+        ),
+        bounds as (
+          select
+            case
+              when $2 = '' and $3 = '' then coalesce(min_d, (now() at time zone $1)::date - 30)
+              else coalesce(
+                nullif($2, ''),
                 to_char((now() at time zone $1)::date - 30, 'YYYY-MM-DD')
               )::date
-          end as d1,
-          case
-            -- Кнопка "Все": обе даты пустые → берём макс дату, а если событий нет — сегодня
-            when $2 = '' and $3 = '' then
-              coalesce(max_d, (now() at time zone $1)::date)
-            else
-              coalesce(
-                nullif($3,''),
+            end as d1,
+            case
+              when $2 = '' and $3 = '' then coalesce(max_d, (now() at time zone $1)::date)
+              else coalesce(
+                nullif($3, ''),
                 to_char((now() at time zone $1)::date, 'YYYY-MM-DD')
               )::date
-          end as d2
-        from raw_bounds
-      ),
-      days as (
-        select generate_series(
-          (select d1 from bounds),
-          (select d2 from bounds),
-          '1 day'
-        )::date as d
-      ),
-      canon as (
+            end as d2
+          from raw_bounds
+        ),
+        days as (
+          select generate_series(
+            (select d1 from bounds),
+            (select d2 from bounds),
+            '1 day'
+          )::date as d
+        ),
+        shadow_pairs as (
+          select *
+          from (
+            select
+              u.id as secondary_id,
+              (
+                select a.user_id
+                from auth_accounts a
+                where a.user_id is not null
+                  and (a.meta->>'device_id') = tg.did
+                  and a.provider = 'vk'
+                order by a.updated_at desc
+                limit 1
+              ) as primary_id
+            from users u
+            join (
+              select
+                aa.user_id,
+                max(aa.meta->>'device_id') as did
+              from auth_accounts aa
+              where aa.provider = 'tg'
+                and aa.meta->>'device_id' is not null
+              group by aa.user_id
+            ) as tg on tg.user_id = u.id
+            where coalesce(u.meta->>'merged_into','') = ''
+          ) s
+          where primary_id is not null
+        ),
+        shadow_map as (
+          select primary_id as user_id, primary_id as cluster_id from shadow_pairs
+          union
+          select secondary_id as user_id, primary_id as cluster_id from shadow_pairs
+        ),
+        canon as (
+          select
+            (e.created_at at time zone $1)::date as d,
+            case
+              when $4::boolean then coalesce(u.hum_id, shadow_map.cluster_id, u.id)
+              else u.id
+            end as cluster_id,
+            ${etExpr} as et
+          from events e
+          join users u on u.id = e.user_id
+          left join shadow_map on shadow_map.user_id = u.id
+          where (e.created_at at time zone $1)::date
+                between (select d1 from bounds) and (select d2 from bounds)
+        ),
+        auths as (
+          select *
+          from canon
+          where (et is null)
+             or et ilike 'auth%'
+             or et ilike '%login%success%'
+             or et ilike '%auth%success%'
+             or et ilike '%auth%'
+        ),
+        totals as (
+          select d, count(*) as c from auths group by 1
+        ),
+        uniq as (
+          select d, count(distinct cluster_id) as c from auths group by 1
+        )
         select
-          (e.created_at at time zone $1)::date as d,
-          case when $4::boolean then coalesce(u.hum_id,u.id) else u.id end as cluster_id,
-          ${etExpr} as et
-        from events e
-        join users u on u.id = e.user_id
-        where (e.created_at at time zone $1)::date
-              between (select d1 from bounds) and (select d2 from bounds)
-      ),
-      auths as (
-        select *
-        from canon
-        where (et is null)
-           or et ilike 'auth%'
-           or et ilike '%login%success%'
-           or et ilike '%auth%success%'
-           or et ilike '%auth%'
-      ),
-      totals as (
-        select d, count(*) as c
-        from auths
-        group by 1
-      ),
-      uniq as (
-        select d, count(distinct cluster_id) as c
-        from auths
-        group by 1
-      )
-      select
-        to_char(days.d,'YYYY-MM-DD') as day,
-        coalesce(t.c,0) as auth_total,
-        coalesce(u.c,0) as auth_unique
-      from days
-      left join totals t on t.d = days.d
-      left join uniq   u on u.d = days.d
-      order by days.d asc
-    `;
+          to_char(days.d, 'YYYY-MM-DD') as day,
+          coalesce(t.c, 0) as auth_total,
+          coalesce(u.c, 0) as auth_unique
+        from days
+        left join totals t on t.d = days.d
+        left join uniq   u on u.d = days.d
+        order by days.d asc
+      `
+      : `
+        with raw_bounds as (
+          select
+            min((created_at at time zone $1)::date) as min_d,
+            max((created_at at time zone $1)::date) as max_d
+          from events
+        ),
+        bounds as (
+          select
+            case
+              when $2 = '' and $3 = '' then coalesce(min_d, (now() at time zone $1)::date - 30)
+              else coalesce(
+                nullif($2, ''),
+                to_char((now() at time zone $1)::date - 30, 'YYYY-MM-DD')
+              )::date
+            end as d1,
+            case
+              when $2 = '' and $3 = '' then coalesce(max_d, (now() at time zone $1)::date)
+              else coalesce(
+                nullif($3, ''),
+                to_char((now() at time zone $1)::date, 'YYYY-MM-DD')
+              )::date
+            end as d2
+          from raw_bounds
+        ),
+        days as (
+          select generate_series(
+            (select d1 from bounds),
+            (select d2 from bounds),
+            '1 day'
+          )::date as d
+        ),
+        canon as (
+          select
+            (e.created_at at time zone $1)::date as d,
+            case
+              when $4::boolean then coalesce(u.hum_id, u.id)
+              else u.id
+            end as cluster_id,
+            ${etExpr} as et
+          from events e
+          join users u on u.id = e.user_id
+          where (e.created_at at time zone $1)::date
+                between (select d1 from bounds) and (select d2 from bounds)
+        ),
+        auths as (
+          select *
+          from canon
+          where (et is null)
+             or et ilike 'auth%'
+             or et ilike '%login%success%'
+             or et ilike '%auth%success%'
+             or et ilike '%auth%'
+        ),
+        totals as (
+          select d, count(*) as c from auths group by 1
+        ),
+        uniq as (
+          select d, count(distinct cluster_id) as c from auths group by 1
+        )
+        select
+          to_char(days.d, 'YYYY-MM-DD') as day,
+          coalesce(t.c, 0) as auth_total,
+          coalesce(u.c, 0) as auth_unique
+        from days
+        left join totals t on t.d = days.d
+        left join uniq   u on u.d = days.d
+        order by days.d asc
+      `;
 
     const q = await db.query(sql, [tz, fromStr, toStr, incl]);
-
     const rows = (q.rows || []).map(x => ({
       date: x.day,
-      auth_total:  Number(x.auth_total  || 0),
-      auth_unique: Number(x.auth_unique || 0)
+      auth_total: Number(x.auth_total || 0),
+      auth_unique: Number(x.auth_unique || 0),
     }));
 
     const fromDate = rows.length ? rows[0].date : (fromStr || null);
-    const toDate   = rows.length ? rows[rows.length - 1].date : (toStr   || null);
+    const toDate   = rows.length ? rows[rows.length - 1].date : (toStr || null);
 
-    return res.json({ ok:true, from: fromDate, to: toDate, days: rows });
+    return res.json({ ok: true, from: fromDate, to: toDate, days: rows });
   } catch (e) {
     console.error('admin /range error', e);
-    return res.json({ ok:true, from:null, to:null, days:[] });
+    return res.json({ ok: true, from: null, to: null, days: [] });
   }
 });
+
      
 // ---- SCHEMA dump ----
 router.get('/schema', adminGuard, async (_req,res)=>{
