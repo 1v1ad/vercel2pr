@@ -447,7 +447,7 @@ router.get('/summary', adminGuard, async (req, res) => {
             (now() at time zone $1)::date as d2,
             ((now() at time zone $1)::date - 6) as d1
         ),
-        shadow_pairs as (
+          shadow_pairs as (
           select *
           from (
             select
@@ -471,10 +471,11 @@ router.get('/summary', adminGuard, async (req, res) => {
                 and aa.meta->>'device_id' is not null
               group by aa.user_id
             ) as tg on tg.user_id = u.id
-            where coalesce(u.meta->>'merged_into','') = ''
+            -- В аналитике не фильтруем по meta->>'merged_into'
           ) s
           where primary_id is not null
         ),
+
         shadow_map as (
           select primary_id as user_id, primary_id as cluster_id from shadow_pairs
           union
@@ -597,7 +598,7 @@ router.get('/daily', adminGuard, async (req, res) => {
             '1 day'
           ) as d
         ),
-        shadow_pairs as (
+                shadow_pairs as (
           select *
           from (
             select
@@ -621,10 +622,11 @@ router.get('/daily', adminGuard, async (req, res) => {
                 and aa.meta->>'device_id' is not null
               group by aa.user_id
             ) as tg on tg.user_id = u.id
-            where coalesce(u.meta->>'merged_into','') = ''
+            -- В аналитике не фильтруем по meta->>'merged_into'
           ) s
           where primary_id is not null
         ),
+
         shadow_map as (
           select primary_id as user_id, primary_id as cluster_id from shadow_pairs
           union
@@ -782,7 +784,7 @@ router.get('/range', adminGuard, async (req, res) => {
             '1 day'
           )::date as d
         ),
-        shadow_pairs as (
+                shadow_pairs as (
           select *
           from (
             select
@@ -806,10 +808,11 @@ router.get('/range', adminGuard, async (req, res) => {
                 and aa.meta->>'device_id' is not null
               group by aa.user_id
             ) as tg on tg.user_id = u.id
-            where coalesce(u.meta->>'merged_into','') = ''
+            -- В аналитике не фильтруем по meta->>'merged_into'
           ) s
           where primary_id is not null
         ),
+
         shadow_map as (
           select primary_id as user_id, primary_id as cluster_id from shadow_pairs
           union
