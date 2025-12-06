@@ -2,7 +2,6 @@
 import express from 'express';
 import axios from 'axios';
 import crypto from 'crypto';
-import { createCodeVerifier, createCodeChallenge } from './pkce.js';
 import { signSession } from './jwt.js';
 import { upsertUser, logEvent, db, updateUserCountryIfNull } from './db.js';
 import { getDeviceId, upsertAuthAccount, linkPendingsToUser } from './linking.js';
@@ -15,7 +14,11 @@ function envVK() {
   const clientSecret = e.VK_CLIENT_SECRET;
   const redirectUri  = e.VK_REDIRECT_URI || e.REDIRECT_URI || `${e.API_BASE || ''}/api/auth/vk/cb`;
   const frontendUrl  = e.FRONTEND_URL  || e.CLIENT_URL || 'https://sweet-twilight-63a9b6.netlify.app';
-  for (const [k,v] of Object.entries({ VK_CLIENT_ID:clientId, VK_CLIENT_SECRET:clientSecret, VK_REDIRECT_URI:redirectUri })) {
+  for (const [k,v] of Object.entries({
+    VK_CLIENT_ID: clientId,
+    VK_CLIENT_SECRET: clientSecret,
+    VK_REDIRECT_URI: redirectUri,
+  })) {
     if (!v) throw new Error(`env ${k} is required`);
   }
   return { clientId, clientSecret, redirectUri, frontendUrl };
@@ -25,38 +28,41 @@ function firstIp(req) {
   const h = (req.headers['x-forwarded-for'] || req.ip || '').toString();
   return h.split(',')[0].trim();
 }
-function userAgent(req) { return (req.headers['user-agent'] || '').slice(0,256); }
+function userAgent(req) {
+  return (req.headers['user-agent'] || '').slice(0, 256);
+}
 
-// GeoIP по IP: ipwho.is, заполняем users.country_code / country_name (только если ещё не заполнено)
-async function geoipCountryFromReq(req){
+// ---- GeoIP по IP (ipwho.is) ----
+async function geoipCountryFromReq(req) {
   const ip = firstIp(req);
   if (!ip || ip === '127.0.0.1' || ip === '::1') return null;
-  try{
-    const url = 'https://ipwho.is/' + encodeURIComponent(ip) + '?fields=success,country,country_code';
-    const r = await fetch(url);
-    if (!r.ok) return null;
-    const j = await r.json();
+  try {
+    const url = 'https://ipwho.is/' + encodeURIComponent(ip);
+    const { data: j } = await axios.get(url, {
+      params: { fields: 'success,country,country_code' },
+      timeout: 1500,
+    });
     if (!j || j.success === false || !j.country_code) return null;
     return {
       code: String(j.country_code).toUpperCase(),
-      name: j.country || null
+      name: j.country || null,
     };
-  }catch(e){
+  } catch (e) {
     console.warn('vk geoip lookup failed', e?.message || e);
     return null;
   }
 }
 
-async function ensureCountryFromIp(userId, req){
+async function ensureCountryFromIp(userId, req) {
   if (!userId) return;
   const geo = await geoipCountryFromReq(req);
   if (!geo) return;
-  try{
+  try {
     await updateUserCountryIfNull(userId, {
       country_code: geo.code,
-      country_name: geo.name
+      country_name: geo.name,
     });
-  }catch(e){
+  } catch (e) {
     console.warn('vk ensureCountryFromIp failed', e?.message || e);
   }
 }
@@ -119,19 +125,19 @@ router.get('/vk/start', async (req, res) => {
   try {
     const { clientId, redirectUri } = envVK();
 
-    // ⬇️ НОВЫЙ БЛОК
+    // device_id из query — в httpOnly-cookie
     const deviceIdFromQuery = (req.query.device_id || '').toString().trim();
     if (deviceIdFromQuery) {
       res.cookie('device_id', deviceIdFromQuery, {
-        httpOnly: true,          // JS его не читает, он нужен только бэку
+        httpOnly: true,
         sameSite: 'lax',
-        secure: true,            // на onrender всё по https
+        secure: true,
         path: '/',
-        maxAge: 365 * 24 * 60 * 60 * 1000
+        maxAge: 365 * 24 * 60 * 60 * 1000,
       });
     }
 
-    // режим привязки — кладём cookie link_state (не требуем state от фронта)
+    // режим привязки — кладём cookie link_state
     if (req.query.mode === 'link') {
       const st = {
         target: 'vk',
@@ -148,19 +154,13 @@ router.get('/vk/start', async (req, res) => {
       });
     }
 
-    const verifier = createCodeVerifier();
-    req.session = req.session || {};
-    req.session.vk_code_verifier = verifier;
-
-    const challenge = await createCodeChallenge(verifier);
+    // 🔹 БЕЗ PKCE: обычный VK OAuth
     const params = new URLSearchParams({
       client_id: clientId,
       redirect_uri: redirectUri,
       response_type: 'code',
       scope: 'email',
-      code_challenge: challenge,
-      code_challenge_method: 'S256',
-      state: 'vk_oauth'
+      state: 'vk_oauth',
     });
 
     const vkAuthUrl = `https://oauth.vk.com/authorize?${params.toString()}`;
@@ -171,7 +171,7 @@ router.get('/vk/start', async (req, res) => {
         event_type: 'auth_start',
         payload: { provider: 'vk' },
         ip: firstIp(req),
-        ua: userAgent(req)
+        ua: userAgent(req),
       });
     } catch {}
 
@@ -193,23 +193,16 @@ router.get('/vk/cb', async (req, res) => {
   }
 
   try {
-    const verifier = req.session?.vk_code_verifier;
-    if (!verifier) {
-      return res.status(400).send('Missing PKCE verifier');
-    }
-
-    const tokenResponse = await axios.post(
+    // 🔹 Тоже без PKCE: стандартный обмен code -> access_token
+    const tokenResponse = await axios.get(
       'https://oauth.vk.com/access_token',
-      new URLSearchParams({
-        client_id: clientId,
-        client_secret: clientSecret,
-        redirect_uri: redirectUri,
-        code: code.toString(),
-        grant_type: 'authorization_code',
-        code_verifier: verifier,
-      }).toString(),
       {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+        params: {
+          client_id: clientId,
+          client_secret: clientSecret,
+          redirect_uri: redirectUri,
+          code: code.toString(),
+        },
       }
     );
 
@@ -225,12 +218,15 @@ router.get('/vk/cb', async (req, res) => {
           user_ids: vkUserId,
           fields: 'photo_100,first_name,last_name',
           access_token,
-          v: '5.131'
-        }
+          v: '5.131',
+        },
       }
     );
 
-    const vkUser = (userInfoResponse.data && userInfoResponse.data.response && userInfoResponse.data.response[0]) || null;
+    const vkUser = (userInfoResponse.data &&
+      userInfoResponse.data.response &&
+      userInfoResponse.data.response[0]) || null;
+
     if (!vkUser) {
       return res.status(400).send('Failed to fetch VK user');
     }
@@ -257,6 +253,7 @@ router.get('/vk/cb', async (req, res) => {
       } catch {}
     }
 
+    // ===== ВЕТКА: привязка VK к существующему HUM через link_token =====
     if (linkAttempt && linkTokenRow && linkTokenRow.user_id) {
       const primaryUserId = Number(linkTokenRow.user_id);
       try {
@@ -286,7 +283,7 @@ router.get('/vk/cb', async (req, res) => {
             event_type: 'link_error',
             payload: { provider: 'vk', vk_id, error: e?.message || String(e) },
             ip: firstIp(req),
-            ua: userAgent(req)
+            ua: userAgent(req),
           });
           throw e;
         }
@@ -297,7 +294,7 @@ router.get('/vk/cb', async (req, res) => {
             event_type: 'link_success',
             payload: { provider: 'vk', vk_id, device_id: deviceId || null },
             ip: firstIp(req),
-            ua: userAgent(req)
+            ua: userAgent(req),
           });
         } catch {}
 
@@ -308,7 +305,7 @@ router.get('/vk/cb', async (req, res) => {
             sameSite: 'none',
             secure: true,
             path: '/',
-            maxAge: 30 * 24 * 3600 * 1000
+            maxAge: 30 * 24 * 3600 * 1000,
           });
         } catch (e) {
           console.warn('sid cookie set failed', e?.message || e);
@@ -321,7 +318,12 @@ router.get('/vk/cb', async (req, res) => {
         }
 
         try {
-          res.clearCookie('link_state', { httpOnly:true, sameSite:'lax', secure:true, path:'/' });
+          res.clearCookie('link_state', {
+            httpOnly: true,
+            sameSite: 'lax',
+            secure: true,
+            path: '/',
+          });
           if (linkTokenRow) await markLinkTokenDone(linkTokenRow.token);
         } catch {}
 
@@ -334,13 +336,14 @@ router.get('/vk/cb', async (req, res) => {
               event_type: 'link_error',
               payload: { provider: 'vk', vk_id, error: e?.message || String(e) },
               ip: firstIp(req),
-              ua: userAgent(req)
+              ua: userAgent(req),
             });
           } catch {}
         }
       }
     }
 
+    // ===== ВЕТКА: привязка через уже существующую sid (uid в JWT) =====
     const uidFromSid = decodeUidFromSid(req);
     if (uidFromSid && linkAttempt && linkTokenRow && linkTokenRow.user_id && uidFromSid === linkTokenRow.user_id) {
       try {
@@ -367,7 +370,7 @@ router.get('/vk/cb', async (req, res) => {
               event_type: 'link_error',
               payload: { provider: 'vk', vk_id, error: e?.message || String(e) },
               ip: firstIp(req),
-              ua: userAgent(req)
+              ua: userAgent(req),
             });
             throw e;
           }
@@ -378,7 +381,7 @@ router.get('/vk/cb', async (req, res) => {
               event_type: 'link_success',
               payload: { provider: 'vk', vk_id, device_id: deviceId || null },
               ip: firstIp(req),
-              ua: userAgent(req)
+              ua: userAgent(req),
             });
           } catch {}
 
@@ -389,7 +392,12 @@ router.get('/vk/cb', async (req, res) => {
           }
 
           try {
-            res.clearCookie('link_state', { httpOnly:true, sameSite:'lax', secure:true, path:'/' });
+            res.clearCookie('link_state', {
+              httpOnly: true,
+              sameSite: 'lax',
+              secure: true,
+              path: '/',
+            });
             const token = linkTokenRow?.token;
             if (token) await markLinkTokenDone(token);
           } catch {}
@@ -404,15 +412,18 @@ router.get('/vk/cb', async (req, res) => {
               event_type: 'link_error',
               payload: { provider: 'vk', vk_id, error: e?.message || String(e) },
               ip: firstIp(req),
-              ua: userAgent(req)
+              ua: userAgent(req),
             });
           } catch {}
         }
       }
     }
 
+    // ===== Обычная VK-авторизация (новый / существующий пользователь) =====
+
     const user = await upsertUser({ vk_id, first_name, last_name, avatar });
-    // 7) GeoIP: пробуем определить страну по IP (только если ещё не заполнена)
+
+    // GeoIP-обновление страны (если ещё не заполнена)
     try {
       await ensureCountryFromIp(user.id, req);
     } catch (_) {}
@@ -422,7 +433,7 @@ router.get('/vk/cb', async (req, res) => {
       event_type: 'auth_success',
       payload: { provider: 'vk', vk_id },
       ip: firstIp(req),
-      ua: userAgent(req)
+      ua: userAgent(req),
     });
 
     try {
@@ -430,7 +441,7 @@ router.get('/vk/cb', async (req, res) => {
         provider: 'vk',
         provider_user_id: vk_id,
         user_id: user.id,
-        meta: { device_id: deviceId || null }
+        meta: { device_id: deviceId || null },
       });
     } catch (e) {
       console.warn('upsertAuthAccount vk failed', e?.message || e);
@@ -448,7 +459,7 @@ router.get('/vk/cb', async (req, res) => {
       sameSite: 'none',
       secure: true,
       path: '/',
-      maxAge: 30 * 24 * 3600 * 1000
+      maxAge: 30 * 24 * 3600 * 1000,
     });
 
     res.redirect(`${frontendUrl}/lobby.html`);
