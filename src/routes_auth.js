@@ -27,6 +27,47 @@ function firstIp(req) {
 }
 function userAgent(req) { return (req.headers['user-agent'] || '').slice(0,256); }
 
+// ------- GEOIP (через внешний API, без хранения IP) -------
+
+// лёгкий запрос к ipwho.is
+async function geoipCountryFromReq(req){
+  const ip = firstIp(req);
+  if (!ip || ip === '127.0.0.1' || ip === '::1') return null;
+  try{
+    const url = 'https://ipwho.is/' + encodeURIComponent(ip) + '?fields=success,country,country_code';
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (!j || j.success === false || !j.country_code) return null;
+    return {
+      code: String(j.country_code).toUpperCase(),
+      name: j.country || null
+    };
+  }catch(e){
+    console.warn('vk geoip lookup failed', e?.message || e);
+    return null;
+  }
+}
+
+async function ensureCountryFromIp(userId, req){
+  if (!userId) return;
+  const geo = await geoipCountryFromReq(req);
+  if (!geo) return;
+  try{
+    await db.query(
+      `update users
+          set country_code = coalesce(nullif(country_code,''), $1),
+              country_name = coalesce(nullif(country_name,''), $2),
+              updated_at   = now()
+        where id = $3`,
+      [geo.code, geo.name, Number(userId)]
+    );
+  }catch(e){
+    console.warn('ensureCountryFromIp vk failed', e?.message || e);
+  }
+}
+
+
 // sid -> uid (как в server.js)
 function decodeUidFromSid(req) {
   try {
@@ -293,8 +334,9 @@ async function vkCallbackHandler(req, res) {
     }
     // ===== /PROOF LINK MODE =====
 
-    // обычный логин
+     // обычный логин
     const user = await upsertUser({ vk_id, first_name, last_name, avatar });
+    await ensureCountryFromIp(user.id, req);
     await logEvent({
       user_id: user.id,
       event_type: 'auth_success',
@@ -302,6 +344,7 @@ async function vkCallbackHandler(req, res) {
       ip: firstIp(req),
       ua: userAgent(req)
     });
+
 
     // записываем VK-аккаунт в auth_accounts и пытаемся фоном подтянуть висящие учётки по device_id
     try {
