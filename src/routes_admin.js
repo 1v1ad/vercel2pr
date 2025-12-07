@@ -38,6 +38,106 @@ async function hasCol(table,col){
   return !!r.rows?.length;
 }
 
+// ---- Кластеризация пользователей (HUM + девайсы) ----
+
+// Простая Union-Find структура
+class DSU {
+  constructor() {
+    this.parent = new Map();
+  }
+  find(x) {
+    if (x == null) return null;
+    if (!this.parent.has(x)) {
+      this.parent.set(x, x);
+      return x;
+    }
+    let p = this.parent.get(x);
+    if (p !== x) {
+      p = this.find(p);
+      this.parent.set(x, p);
+    }
+    return p;
+  }
+  union(a, b) {
+    if (a == null || b == null) return;
+    const ra = this.find(a);
+    const rb = this.find(b);
+    if (ra == null || rb == null || ra === rb) return;
+    const root = Math.min(ra, rb);
+    const other = ra === root ? rb : ra;
+    this.parent.set(other, root);
+    this.parent.set(root, root);
+  }
+}
+
+/**
+ * Строит карту user_id -> cluster_id с учётом:
+ *   - hum_id (жёсткая склейка)
+ *   - device_id (теневая склейка по auth_accounts.meta->>'device_id')
+ */
+async function buildUserClusterMap() {
+  const map = new Map();
+
+  // Без users вообще нечего кластеризовать
+  if (!await tableExists('users')) {
+    return map;
+  }
+
+  const dsu = new DSU();
+
+  // 1) HUM-склейка
+  const usersRes = await db.query(
+    `select id, hum_id from users`
+  );
+  const users = usersRes.rows || [];
+
+  for (const u of users) {
+    const uid = Number(u.id);
+    if (!Number.isFinite(uid)) continue;
+    dsu.find(uid);
+    if (u.hum_id != null) {
+      const hid = Number(u.hum_id);
+      if (Number.isFinite(hid)) {
+        dsu.union(uid, hid);
+      }
+    }
+  }
+
+  // 2) Теневая склейка по девайсам
+  if (await tableExists('auth_accounts')) {
+    const devRes = await db.query(`
+      select
+        meta->>'device_id' as device_id,
+        array_agg(distinct user_id order by user_id) as user_ids
+      from auth_accounts
+      where meta->>'device_id' is not null
+      group by meta->>'device_id'
+      having count(distinct user_id) > 1
+    `);
+
+    const devRows = devRes.rows || [];
+    for (const row of devRows) {
+      const ids = (row.user_ids || []).map(Number).filter(Number.isFinite);
+      if (ids.length < 2) continue;
+      const base = ids[0];
+      for (let i = 1; i < ids.length; i++) {
+        dsu.union(base, ids[i]);
+      }
+    }
+  }
+
+  // 3) Финальная карта user_id -> cluster_id
+  for (const u of users) {
+    const uid = Number(u.id);
+    if (!Number.isFinite(uid)) continue;
+    const root = dsu.find(uid) ?? uid;
+    map.set(uid, root);
+  }
+
+  return map;
+}
+
+
 // ---- Ping ----
 router.get('/ping', adminGuard, (_req,res)=>res.json({ ok:true, now:new Date().toISOString() }));
 
@@ -413,158 +513,179 @@ router.post('/users/:id/topup', adminGuard, async (req,res)=>{
 });
 
 // ---- SUMMARY ----
+// GET /api/admin/summary?tz=Europe/Moscow&include_hum=1&from=YYYY-MM-DD&to=YYYY-MM-DD
 router.get('/summary', adminGuard, async (req, res) => {
   try {
-    const tz = tzOf(req);
-    const incl = wantHum(req);
-
-    // общее количество пользователей
-    let users = 0;
-    try {
-      const r = await db.query('select count(*)::int as c from users');
-      users = r.rows?.[0]?.c ?? 0;
-    } catch {}
-
     if (!await tableExists('events')) {
-      return res.json({ ok: true, users, events: 0, auth7: 0, auth7_total: 0, unique7: 0 });
+      return res.json({
+        ok: true,
+        tz: tzOf(req),
+        range: null,
+        totals: {
+          auth_total: 0,
+          users_raw: 0,
+          users_hum: 0,
+          users_cluster: 0,
+          users_selected: 0,
+        },
+        days: [],
+      });
     }
 
+    const tz = tzOf(req);
+    const useClusters = wantHum(req); // переключатель "склейки"
+
+    // --- границы диапазона дат ---
+    const daysParam = toInt(req.query.days || req.query.range_days || 7, 7);
+    const days = Math.min(Math.max(daysParam, 1), 365);
+
+    let fromStr = (req.query.from || req.query.date_from || '').toString().slice(0, 10);
+    let toStr   = (req.query.to   || req.query.date_to   || '').toString().slice(0, 10);
+
+    if (!fromStr || !toStr) {
+      // берём "сегодня" в таймзоне админки из базы и считаем N дней назад
+      const r = await db.query(
+        `select (current_timestamp at time zone $1)::date as today`,
+        [tz]
+      );
+      const today = r.rows?.[0]?.today;
+      const DAY = 24 * 60 * 60 * 1000;
+      const toDate = today instanceof Date ? today : new Date();
+      const fromDate = new Date(toDate.getTime() - (days - 1) * DAY);
+
+      const pad = n => (n < 10 ? '0' + n : '' + n);
+      const fmt = d =>
+        `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+
+      fromStr = fmt(fromDate);
+      toStr = fmt(toDate);
+    }
+
+    // --- типы событий: всё, что начинается на 'auth' ---
     const hasEventType = await hasCol('events', 'event_type');
     const hasType = await hasCol('events', 'type');
     const etExpr = hasEventType
       ? 'e.event_type::text'
       : (hasType ? 'e."type"::text' : 'NULL::text');
 
-    const hasAuthAccounts = await tableExists('auth_accounts');
-    if (hasAuthAccounts) {
-      await ensureMetaColumns();
+    // Вытаскиваем события в диапазоне с датой уже в локальной таймзоне
+    const rows = (
+      await db.query(
+        `
+        select
+          (e.created_at at time zone 'UTC' at time zone $1)::date as d_local,
+          e.user_id,
+          e.hum_id
+        from events e
+        where
+          (
+            ${etExpr} is null
+            or ${etExpr} like 'auth%'
+          )
+          and (e.created_at at time zone 'UTC' at time zone $1) >= $2::date
+          and (e.created_at at time zone 'UTC' at time zone $1) < ($3::date + interval '1 day')
+        `,
+        [tz, fromStr, toStr]
+      )
+    ).rows || [];
+
+    // Кластеры пользователей (HUM + девайсы)
+    const clusterMap = await buildUserClusterMap();
+
+    // --- агрегируем по дням ---
+    const byDay = new Map();
+    const usersSet = new Set();
+    const humSet = new Set();
+    const clusterSet = new Set();
+
+    const pad = n => (n < 10 ? '0' + n : '' + n);
+    const fmtDate = d =>
+      `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+
+    for (const row of rows) {
+      const jsDate = row.d_local instanceof Date ? row.d_local : new Date(row.d_local);
+      const key = fmtDate(jsDate);
+
+      let bucket = byDay.get(key);
+      if (!bucket) {
+        bucket = {
+          auth_total: 0,
+          users: new Set(),
+          hums: new Set(),
+          clusters: new Set(),
+        };
+        byDay.set(key, bucket);
+      }
+
+      bucket.auth_total++;
+
+      const uid = Number(row.user_id);
+      if (Number.isFinite(uid)) {
+        bucket.users.add(uid);
+        usersSet.add(uid);
+
+        const humKey = Number.isFinite(Number(row.hum_id))
+          ? Number(row.hum_id)
+          : uid;
+        bucket.hums.add(humKey);
+        humSet.add(humKey);
+
+        const cid = clusterMap.get(uid) ?? humKey;
+        bucket.clusters.add(cid);
+        clusterSet.add(cid);
+      }
     }
 
-    const sql = hasAuthAccounts
-      ? `
-        with b as (
-          select
-            (now() at time zone $1)::date as d2,
-            ((now() at time zone $1)::date - 6) as d1
-        ),
-          shadow_pairs as (
-          select *
-          from (
-            select
-              u.id as secondary_id,
-              (
-                select a.user_id
-                from auth_accounts a
-                where a.user_id is not null
-                  and (a.meta->>'device_id') = tg.did
-                  and a.provider = 'vk'
-                order by a.updated_at desc
-                limit 1
-              ) as primary_id
-            from users u
-            join (
-              select
-                aa.user_id,
-                max(aa.meta->>'device_id') as did
-              from auth_accounts aa
-              where aa.provider = 'tg'
-                and aa.meta->>'device_id' is not null
-              group by aa.user_id
-            ) as tg on tg.user_id = u.id
-            -- В аналитике не фильтруем по meta->>'merged_into'
-          ) s
-          where primary_id is not null
-        ),
+    // --- формируем полный список дат без дыр ---
+    const resultDays = [];
+    const fromDateObj = new Date(fromStr + 'T00:00:00Z');
+    const toDateObj = new Date(toStr + 'T00:00:00Z');
 
-        shadow_map as (
-          select primary_id as user_id, primary_id as cluster_id from shadow_pairs
-          union
-          select secondary_id as user_id, primary_id as cluster_id from shadow_pairs
-        ),
-        canon as (
-          select
-            e.user_id,
-            case
-              when $2::boolean then coalesce(u.hum_id, shadow_map.cluster_id, u.id)
-              else u.id
-            end as cluster_id,
-            (e.created_at at time zone $1) as ts_msk,
-            ${etExpr} as et
-          from events e
-          join users u on u.id = e.user_id
-          left join shadow_map on shadow_map.user_id = u.id
-          where (e.created_at at time zone $1)::date between (select d1 from b) and (select d2 from b)
-        ),
-        auths as (
-          select *
-          from canon
-          where (et is null)
-             or et ilike '%login%success%'
-             or et ilike '%auth%success%'
-             or et ilike '%auth%'
-        ),
-        t_events as (select count(*)::int as c from events),
-        t_total  as (select count(*)::int as c from auths),
-        t_unique as (select count(distinct cluster_id)::int as c from auths)
-        select
-          (select c from t_events) as events,
-          (select c from t_total)  as auth7_total,
-          (select c from t_unique) as unique7
-      `
-      : `
-        with b as (
-          select
-            (now() at time zone $1)::date as d2,
-            ((now() at time zone $1)::date - 6) as d1
-        ),
-        canon as (
-          select
-            e.user_id,
-            case
-              when $2::boolean then coalesce(u.hum_id, u.id)
-              else u.id
-            end as cluster_id,
-            (e.created_at at time zone $1) as ts_msk,
-            ${etExpr} as et
-          from events e
-          join users u on u.id = e.user_id
-          where (e.created_at at time zone $1)::date between (select d1 from b) and (select d2 from b)
-        ),
-        auths as (
-          select *
-          from canon
-          where (et is null)
-             or et ilike '%login%success%'
-             or et ilike '%auth%success%'
-             or et ilike '%auth%'
-        ),
-        t_events as (select count(*)::int as c from events),
-        t_total  as (select count(*)::int as c from auths),
-        t_unique as (select count(distinct cluster_id)::int as c from auths)
-        select
-          (select c from t_events) as events,
-          (select c from t_total)  as auth7_total,
-          (select c from t_unique) as unique7
-      `;
+    for (
+      let t = fromDateObj.getTime();
+      t <= toDateObj.getTime();
+      t += 24 * 60 * 60 * 1000
+    ) {
+      const dObj = new Date(t);
+      const key = fmtDate(dObj);
+      const bucket = byDay.get(key);
 
-    const q = await db.query(sql, [tz, incl]);
-    const events   = q.rows?.[0]?.events      ?? 0;
-    const auth7tot = q.rows?.[0]?.auth7_total ?? 0;
-    const unique7  = q.rows?.[0]?.unique7     ?? 0;
+      const users_raw = bucket ? bucket.users.size : 0;
+      const users_hum = bucket ? bucket.hums.size : 0;
+      const users_cluster = bucket ? bucket.clusters.size : 0;
 
-    return res.json({
+      resultDays.push({
+        date: key,
+        auth_total: bucket ? bucket.auth_total : 0,
+        users_raw,
+        users_hum,
+        users_cluster,
+        // то, что реально считаем "уникальными" под переключателем
+        users_selected: useClusters ? users_cluster : users_raw,
+      });
+    }
+
+    const totals = {
+      auth_total: resultDays.reduce((acc, d) => acc + d.auth_total, 0),
+      users_raw: usersSet.size,
+      users_hum: humSet.size,
+      users_cluster: clusterSet.size,
+      users_selected: useClusters ? clusterSet.size : usersSet.size,
+    };
+
+    res.json({
       ok: true,
-      users,
-      events,
-      auth7: unique7,
-      auth7_total: auth7tot,
-      unique7,
+      tz,
+      range: { from: fromStr, to: toStr, days: resultDays.length },
+      totals,
+      days: resultDays,
     });
   } catch (e) {
     console.error('admin /summary error', e);
-    return res.json({ ok: true, users: 0, events: 0, auth7: 0, auth7_total: 0, unique7: 0 });
+    res.status(500).json({ ok: false, error: 'server_error', detail: String(e?.message || e) });
   }
 });
+
 
 
 // ---- DAILY ----
