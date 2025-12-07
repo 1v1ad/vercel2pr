@@ -55,8 +55,6 @@ async function hasCol(table,col){
     where table_schema='public' and table_name=$1 and column_name=$2`,[table,col]);
   return !!r.rows?.length;
 }
-
-
 // ---- Кластеризация пользователей (HUM + девайсы) ----
 
 // Простая Union-Find структура
