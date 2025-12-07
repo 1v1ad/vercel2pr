@@ -19,24 +19,43 @@ const adminGuard = (req,res,next)=>{
 
 // ---- Helpers ----
 const tzOf = (req)=> (req.query.tz || process.env.ADMIN_TZ || 'Europe/Moscow').toString();
-function wantHum(req){
-  const v = (req.query.include_hum ?? req.query.cluster ?? req.query.hum ?? '').toString().toLowerCase();
-  if (v === '0' || v === 'false' || v === 'no') return false;
+
+function wantHum(req) {
+  // поддерживаем и snake_case, и camelCase, и старые имена
+  const src =
+    req.query.include_hum ??   // старый вариант
+    req.query.includeHum ??    // camelCase с фронта
+    req.query.cluster ??
+    req.query.hum;
+
+  // если параметр вообще не передали — ведём себя по-старому: "со склейкой"
+  if (src === undefined) return true;
+
+  const v = String(src).toLowerCase().trim();
+
+  // явное выключение склейки
+  if (!v || v === '0' || v === 'false' || v === 'no') return false;
+
+  // всё остальное — включить склейку
   return true;
 }
+
 const toInt = (v,def=0)=>{
   const n = parseInt(v,10);
   return Number.isFinite(n)?n:def;
 };
+
 async function tableExists(name){
   const r = await db.query("select to_regclass('public.'||$1) as r",[name]);
   return !!r.rows?.[0]?.r;
 }
+
 async function hasCol(table,col){
   const r = await db.query(`select 1 from information_schema.columns
     where table_schema='public' and table_name=$1 and column_name=$2`,[table,col]);
   return !!r.rows?.length;
 }
+
 
 // ---- Кластеризация пользователей (HUM + девайсы) ----
 
