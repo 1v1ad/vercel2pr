@@ -682,7 +682,7 @@ router.get('/summary', adminGuard, async (req, res) => {
       });
     }
 
-    const totals = {
+        const totals = {
       auth_total: resultDays.reduce((acc, d) => acc + d.auth_total, 0),
       users_raw: usersSet.size,
       users_hum: humSet.size,
@@ -690,13 +690,24 @@ router.get('/summary', adminGuard, async (req, res) => {
       users_selected: useClusters ? clusterSet.size : usersSet.size,
     };
 
+    // Плоские поля для совместимости с текущей админкой (index.html)
+    const auth7_total = totals.auth_total;
+    const unique7 = totals.users_selected;
+
     res.json({
       ok: true,
       tz,
       range: { from: fromStr, to: toStr, days: resultDays.length },
       totals,
       days: resultDays,
+
+      // legacy summary fields, которые читает frontend
+      users: totals.users_selected, // "Пользователи" в текущем режиме (со склейкой / без)
+      events: totals.auth_total,    // пока считаем событиями все auth-события
+      auth7_total,
+      unique7,
     });
+
   } catch (e) {
     console.error('admin /summary error', e);
     res.status(500).json({ ok: false, error: 'server_error', detail: String(e?.message || e) });
