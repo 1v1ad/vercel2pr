@@ -93,6 +93,15 @@ class DSU {
  *   - device_id (теневая склейка по auth_accounts.meta->>'device_id')
  */
 async function buildUserClusterMap() {
+  // Map<user_id:number, cluster_key:string>
+  //
+  // cluster_key — строка с префиксом, чтобы НИКОГДА не было коллизий:
+  //   h:<hum_id>     — ручная HUM-склейка
+  //   d:<device_id>  — теневая склейка по девайсу (device_id/did/vk_device_id)
+  //   u:<user_id>    — просто учётка
+  //
+  // Важно: склейка транзитивная (HUM <-> user <-> device). Если у девайса есть хоть
+  // один user с hum_id — весь девайс "подтягивается" к этому HUM.
   const map = new Map();
 
   // Без users вообще нечего кластеризовать
@@ -102,53 +111,119 @@ async function buildUserClusterMap() {
 
   const dsu = new DSU();
 
-  // 1) HUM-склейка
-  const usersRes = await db.query(
-    `select id, hum_id from users`
-  );
+  // --- 1) Узлы пользователей + HUM-ребра ---
+  const usersRes = await db.query(`select id, hum_id from users`);
   const users = usersRes.rows || [];
 
   for (const u of users) {
     const uid = Number(u.id);
     if (!Number.isFinite(uid)) continue;
-    dsu.find(uid);
+
+    const uKey = `u:${uid}`;
+    dsu.find(uKey);
+
     if (u.hum_id != null) {
       const hid = Number(u.hum_id);
       if (Number.isFinite(hid)) {
-        dsu.union(uid, hid);
+        dsu.union(uKey, `h:${hid}`);
       }
     }
   }
 
-  // 2) Теневая склейка по девайсам
+  // --- 2) Ребра по девайсам (теневая склейка) ---
+  const deviceNodes = new Set();
+
   if (await tableExists('auth_accounts')) {
+    // Собираем ключи девайса из нескольких мест на случай исторических записей:
+    // meta.device_id (основной), meta.did (если где-то писалось иначе),
+    // meta.vk_device_id (сырой device_id от VK).
     const devRes = await db.query(`
+      with k as (
+        select user_id, nullif(trim(meta->>'device_id'), '') as k from auth_accounts
+        union all
+        select user_id, nullif(trim(meta->>'did'), '') as k from auth_accounts
+        union all
+        select user_id, nullif(trim(meta->>'vk_device_id'), '') as k from auth_accounts
+      )
       select
-        meta->>'device_id' as device_id,
+        k as device_id,
         array_agg(distinct user_id order by user_id) as user_ids
-      from auth_accounts
-      where meta->>'device_id' is not null
-      group by meta->>'device_id'
+      from k
+      where user_id is not null
+        and k is not null
+        and lower(k) not in ('null','undefined')
+      group by k
       having count(distinct user_id) > 1
     `);
 
-    const devRows = devRes.rows || [];
-    for (const row of devRows) {
+    for (const row of (devRes.rows || [])) {
+      const did = String(row.device_id || '').trim();
+      if (!did) continue;
+
+      const dKey = `d:${did}`;
+      deviceNodes.add(dKey);
+
       const ids = (row.user_ids || []).map(Number).filter(Number.isFinite);
-      if (ids.length < 2) continue;
-      const base = ids[0];
-      for (let i = 1; i < ids.length; i++) {
-        dsu.union(base, ids[i]);
+      for (const uid of ids) {
+        dsu.union(`u:${uid}`, dKey);
       }
     }
   }
 
-  // 3) Финальная карта user_id -> cluster_id
+  // --- 3) Канонизация компоненты: HUM > device > user ---
+  const comp = new Map(); // root -> { humMin:number|null, deviceMin:string|null, userMin:number|null }
+
+  function ensure(root) {
+    let c = comp.get(root);
+    if (!c) {
+      c = { humMin: null, deviceMin: null, userMin: null };
+      comp.set(root, c);
+    }
+    return c;
+  }
+
+  // users/hum
   for (const u of users) {
     const uid = Number(u.id);
     if (!Number.isFinite(uid)) continue;
-    const root = dsu.find(uid) ?? uid;
-    map.set(uid, root);
+
+    const root = dsu.find(`u:${uid}`) || `u:${uid}`;
+    const c = ensure(root);
+
+    c.userMin = (c.userMin == null) ? uid : Math.min(c.userMin, uid);
+
+    if (u.hum_id != null) {
+      const hid = Number(u.hum_id);
+      if (Number.isFinite(hid)) {
+        c.humMin = (c.humMin == null) ? hid : Math.min(c.humMin, hid);
+      }
+    }
+  }
+
+  // devices
+  for (const dKey of deviceNodes) {
+    const root = dsu.find(dKey);
+    if (!root) continue;
+
+    const c = ensure(root);
+    const did = dKey.slice(2); // "d:"
+    if (c.deviceMin == null || did < c.deviceMin) c.deviceMin = did;
+  }
+
+  // финальная карта user_id -> cluster_key
+  for (const u of users) {
+    const uid = Number(u.id);
+    if (!Number.isFinite(uid)) continue;
+
+    const root = dsu.find(`u:${uid}`) || `u:${uid}`;
+    const c = comp.get(root) || { humMin: null, deviceMin: null, userMin: uid };
+
+    const key =
+      (c.humMin != null) ? `h:${c.humMin}` :
+      (c.deviceMin != null) ? `d:${c.deviceMin}` :
+      `u:${(c.userMin ?? uid)}`;
+
+    map.set(uid, key);
   }
 
   return map;
@@ -641,9 +716,9 @@ router.get('/summary', adminGuard, async (req, res) => {
         bucket.users.add(uid);
         usersSet.add(uid);
 
-        const humKey = Number.isFinite(Number(row.hum_id))
-          ? Number(row.hum_id)
-          : uid;
+        const humKey = (row.hum_id != null && String(row.hum_id) !== '' && Number.isFinite(Number(row.hum_id)))
+          ? `h:${Number(row.hum_id)}`
+          : `u:${uid}`;
         bucket.hums.add(humKey);
         humSet.add(humKey);
 
@@ -785,13 +860,21 @@ router.get('/daily', adminGuard, async (req, res) => {
           select
             (e.created_at at time zone $1)::date as d,
             case
-              when $3::boolean then coalesce(u.hum_id, shadow_map.cluster_id, u.id)
-              else u.id
+              when $3::boolean then (
+                case
+                  when u.hum_id is not null then 'h:'||u.hum_id::text
+                  when pu.hum_id is not null then 'h:'||pu.hum_id::text
+                  when shadow_map.cluster_id is not null then 'u:'||shadow_map.cluster_id::text
+                  else 'u:'||u.id::text
+                end
+              )
+              else 'u:'||u.id::text
             end as cluster_id,
             ${etExpr} as et
           from events e
           join users u on u.id = e.user_id
           left join shadow_map on shadow_map.user_id = u.id
+          left join users pu on pu.id = shadow_map.cluster_id
           where (e.created_at at time zone $1)::date >= (select min(d) from b)
         ),
         auths as (
@@ -829,8 +912,13 @@ router.get('/daily', adminGuard, async (req, res) => {
           select
             (e.created_at at time zone $1)::date as d,
             case
-              when $3::boolean then coalesce(u.hum_id, u.id)
-              else u.id
+              when $3::boolean then (
+                case
+                  when u.hum_id is not null then 'h:'||u.hum_id::text
+                  else 'u:'||u.id::text
+                end
+              )
+              else 'u:'||u.id::text
             end as cluster_id,
             ${etExpr} as et
           from events e
@@ -971,13 +1059,21 @@ router.get('/range', adminGuard, async (req, res) => {
           select
             (e.created_at at time zone $1)::date as d,
             case
-              when $4::boolean then coalesce(u.hum_id, shadow_map.cluster_id, u.id)
-              else u.id
+              when $4::boolean then (
+                case
+                  when u.hum_id is not null then 'h:'||u.hum_id::text
+                  when pu.hum_id is not null then 'h:'||pu.hum_id::text
+                  when shadow_map.cluster_id is not null then 'u:'||shadow_map.cluster_id::text
+                  else 'u:'||u.id::text
+                end
+              )
+              else 'u:'||u.id::text
             end as cluster_id,
             ${etExpr} as et
           from events e
           join users u on u.id = e.user_id
           left join shadow_map on shadow_map.user_id = u.id
+          left join users pu on pu.id = shadow_map.cluster_id
           where (e.created_at at time zone $1)::date
                 between (select d1 from bounds) and (select d2 from bounds)
         ),
@@ -1041,8 +1137,13 @@ router.get('/range', adminGuard, async (req, res) => {
           select
             (e.created_at at time zone $1)::date as d,
             case
-              when $4::boolean then coalesce(u.hum_id, u.id)
-              else u.id
+              when $4::boolean then (
+                case
+                  when u.hum_id is not null then 'h:'||u.hum_id::text
+                  else 'u:'||u.id::text
+                end
+              )
+              else 'u:'||u.id::text
             end as cluster_id,
             ${etExpr} as et
           from events e
