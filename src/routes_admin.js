@@ -674,6 +674,7 @@ router.get('/summary', adminGuard, async (req, res) => {
             ${etExpr} is null
             or ${etExpr} like 'auth%'
           )
+          and e.user_id is not null
           and (e.created_at at time zone 'UTC' at time zone $1) >= $2::date
           and (e.created_at at time zone 'UTC' at time zone $1) < ($3::date + interval '1 day')
         `,
@@ -711,8 +712,10 @@ router.get('/summary', adminGuard, async (req, res) => {
 
       bucket.auth_total++;
 
-      const uid = Number(row.user_id);
-      if (Number.isFinite(uid)) {
+      const uidRaw = row.user_id;
+      if (uidRaw === null || uidRaw === undefined || uidRaw === '') continue;
+      const uid = Number(uidRaw);
+      if (Number.isFinite(uid) && uid > 0) {
         bucket.users.add(uid);
         usersSet.add(uid);
 
