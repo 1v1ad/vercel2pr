@@ -69,7 +69,7 @@ class DSU {
       return x;
     }
     let p = this.parent.get(x);
-    if (p !== x) {
+    if (!Object.is(p, x)) {
       p = this.find(p);
       this.parent.set(x, p);
     }
@@ -80,8 +80,8 @@ class DSU {
     const ra = this.find(a);
     const rb = this.find(b);
     if (ra == null || rb == null || ra === rb) return;
-    const root = Math.min(ra, rb);
-    const other = ra === root ? rb : ra;
+    const root = (String(ra) < String(rb)) ? ra : rb;
+    const other = (root === ra) ? rb : ra;
     this.parent.set(other, root);
     this.parent.set(root, root);
   }
